@@ -43,6 +43,12 @@ class _KernelLoader:
     
     def _compile(self, kernel_dir: str) -> bool:
         """Compile kernels using make."""
+        # Check if THUNDERKITTENS_ROOT is set
+        if 'THUNDERKITTENS_ROOT' not in os.environ:
+            print("ERROR: THUNDERKITTENS_ROOT environment variable not set")
+            print("Please run: source env.src")
+            return False
+        
         try:
             result = subprocess.run(
                 ['make', '-C', kernel_dir],
@@ -50,8 +56,13 @@ class _KernelLoader:
                 text=True,
                 timeout=600
             )
+            if result.returncode != 0:
+                print(f"Kernel compilation failed in {kernel_dir}")
+                print(f"STDOUT:\n{result.stdout}")
+                print(f"STDERR:\n{result.stderr}")
             return result.returncode == 0
-        except Exception:
+        except Exception as e:
+            print(f"Exception during compilation: {e}")
             return False
     
     def _load_modules(self, kernel_dir: str, training: bool):
@@ -63,6 +74,9 @@ class _KernelLoader:
                 fwd = importlib.import_module("tk_kernel_fwd")
                 bwd = importlib.import_module("tk_kernel_bkwd")
                 prep = importlib.import_module("tk_kernel_bkwd_prep")
+                # Validate all modules have same config
+                if fwd.ATTN_N != bwd.ATTN_N or fwd.ATTN_N != prep.ATTN_N:
+                    raise RuntimeError(f"Kernel config mismatch: fwd.N={fwd.ATTN_N}, bwd.N={bwd.ATTN_N}, prep.N={prep.ATTN_N}")
                 return fwd, bwd, prep
             else:
                 fwd = importlib.import_module("tk_kernel")
@@ -212,6 +226,13 @@ def flash_attn_func(
     
     # Get kernels
     fwd_kernel, bwd_kernel, prep_kernel = _KERNEL_LOADER.get_kernels(causal, training)
+    
+    # Validate sequence length matches compiled kernel
+    if N != fwd_kernel.ATTN_N:
+        raise ValueError(
+            f"Sequence length mismatch: input N={N}, but kernel compiled for N={fwd_kernel.ATTN_N}. "
+            f"Please recompile kernels with: make ATTN_N={N}"
+        )
     
     # Forward-only path
     if not training:

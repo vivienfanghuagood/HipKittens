@@ -3170,6 +3170,11 @@ void dispatch_bwd_combined(attn_bwd_combined_globals<D> g) {
 
 PYBIND11_MODULE(tk_kernel_bkwd, m) {
   m.doc() = "tk_kernel python module";
+  m.attr("ATTN_B") = ATTN_B;
+  m.attr("ATTN_H") = ATTN_H;
+  m.attr("ATTN_H_KV") = ATTN_H_KV;
+  m.attr("ATTN_N") = ATTN_N;
+  m.attr("ATTN_D") = ATTN_D;
 
   py::bind_function<dispatch_bwd_combined<ATTN_D>>(m, "dispatch_bwd_combined", 
       &attn_bwd_combined_globals<ATTN_D>::Q, 

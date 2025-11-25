@@ -516,6 +516,12 @@ void dispatch_fwd(attn_globals<D> g) {
 
 PYBIND11_MODULE(tk_kernel_fwd, m) {
     m.doc() = "tk_kernel_fwd python module";
+    m.attr("ATTN_B") = ATTN_B;
+    m.attr("ATTN_H") = ATTN_H;
+    m.attr("ATTN_H_KV") = ATTN_H_KV;
+    m.attr("ATTN_N") = ATTN_N;
+    m.attr("ATTN_D") = ATTN_D;
+    
     py::bind_function<dispatch_fwd<ATTN_D>>(m, "dispatch_fwd", 
         &attn_globals<ATTN_D>::Qg, 
         &attn_globals<ATTN_D>::Kg, 

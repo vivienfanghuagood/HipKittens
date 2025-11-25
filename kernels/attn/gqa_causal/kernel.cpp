@@ -699,6 +699,12 @@ void dispatch_micro(attn_globals<D> g) {
 
 PYBIND11_MODULE(tk_kernel, m) {
     m.doc() = "tk_kernel python module";
+    m.attr("ATTN_B") = ATTN_B;
+    m.attr("ATTN_H") = ATTN_H;
+    m.attr("ATTN_H_KV") = ATTN_H_KV;
+    m.attr("ATTN_N") = ATTN_N;
+    m.attr("ATTN_D") = ATTN_D;
+    
     py::bind_function<dispatch_micro<ATTN_D>>(m, "dispatch_micro", 
         &attn_globals<ATTN_D>::Qg, 
         &attn_globals<ATTN_D>::Kg, 

@@ -225,6 +225,11 @@ void dispatch_dq_shuffle(attn_dq_shuffle_globals<D> g) {
 
 PYBIND11_MODULE(tk_kernel_bkwd_prep, m) {
     m.doc() = "tk_kernel python module";
+    m.attr("ATTN_B") = ATTN_B;
+    m.attr("ATTN_H") = ATTN_H;
+    m.attr("ATTN_H_KV") = ATTN_H_KV;
+    m.attr("ATTN_N") = ATTN_N;
+    m.attr("ATTN_D") = ATTN_D;
 
     py::bind_function<dispatch_prep<ATTN_D>>(m, "dispatch_prep", 
         &attn_prep_globals<ATTN_D>::Og, 
