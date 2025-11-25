@@ -22,14 +22,20 @@ class _KernelLoader:
         self.cache = {}
         self.base_dir = os.path.dirname(os.path.abspath(__file__))
     
-    def _get_kernel_dir(self, causal: bool, training: bool) -> str:
-        """Get kernel directory based on configuration."""
+    def _get_kernel_dir(self, causal: bool, training: bool, n: int) -> Tuple[str, str]:
+        """Get kernel source directory and JIT build directory."""
         if training:
-            return os.path.join(self.base_dir, "gqa_causal_backwards" if causal else "gqa_backwards")
+            base = "gqa_causal_backwards" if causal else "gqa_backwards"
         else:
-            return os.path.join(self.base_dir, "gqa_causal" if causal else "gqa")
+            base = "gqa_causal" if causal else "gqa"
+        
+        kernel_dir = os.path.join(self.base_dir, base)
+        jit_dir = os.path.join(kernel_dir, f"build_N{n}")
+        os.makedirs(jit_dir, exist_ok=True)
+        
+        return kernel_dir, jit_dir
     
-    def _check_compiled(self, kernel_dir: str, training: bool) -> bool:
+    def _check_compiled(self, jit_dir: str, training: bool) -> bool:
         """Check if required kernels are compiled."""
         if training:
             required = ['tk_kernel_fwd', 'tk_kernel_bkwd', 'tk_kernel_bkwd_prep']
@@ -37,68 +43,82 @@ class _KernelLoader:
             required = ['tk_kernel']
         
         for name in required:
-            if not glob.glob(os.path.join(kernel_dir, f"{name}*.so")):
+            if not glob.glob(os.path.join(jit_dir, f"{name}*.so")):
                 return False
         return True
     
-    def _compile(self, kernel_dir: str) -> bool:
-        """Compile kernels using make."""
+    def _compile(self, kernel_dir: str, jit_dir: str, n: int) -> bool:
+        """JIT compile kernels for specific sequence length."""
         # Check if THUNDERKITTENS_ROOT is set
         if 'THUNDERKITTENS_ROOT' not in os.environ:
             print("ERROR: THUNDERKITTENS_ROOT environment variable not set")
             print("Please run: source env.src")
             return False
         
+        print(f"JIT compiling kernels for N={n}... (this may take 1-2 minutes)")
+        
         try:
             result = subprocess.run(
-                ['make', '-C', kernel_dir],
+                ['make', '-C', kernel_dir, f'ATTN_N={n}'],
                 capture_output=True,
                 text=True,
-                timeout=600
+                timeout=600,
+                env=os.environ.copy()
             )
+            
             if result.returncode != 0:
-                print(f"Kernel compilation failed in {kernel_dir}")
+                print(f"Kernel compilation failed for N={n}")
                 print(f"STDOUT:\n{result.stdout}")
                 print(f"STDERR:\n{result.stderr}")
-            return result.returncode == 0
+                return False
+            
+            # Move compiled .so files to jit_dir
+            for so_file in glob.glob(os.path.join(kernel_dir, "*.so")):
+                basename = os.path.basename(so_file)
+                dest = os.path.join(jit_dir, basename)
+                import shutil
+                shutil.move(so_file, dest)
+            
+            print(f"✓ Successfully compiled kernels for N={n}")
+            return True
+            
         except Exception as e:
             print(f"Exception during compilation: {e}")
+            import traceback
+            traceback.print_exc()
             return False
     
-    def _load_modules(self, kernel_dir: str, training: bool):
+    def _load_modules(self, jit_dir: str, training: bool):
         """Load compiled kernel modules."""
         import sys
-        sys.path.insert(0, kernel_dir)
+        sys.path.insert(0, jit_dir)
         try:
             if training:
                 fwd = importlib.import_module("tk_kernel_fwd")
                 bwd = importlib.import_module("tk_kernel_bkwd")
                 prep = importlib.import_module("tk_kernel_bkwd_prep")
-                # Validate all modules have same config
-                if fwd.ATTN_N != bwd.ATTN_N or fwd.ATTN_N != prep.ATTN_N:
-                    raise RuntimeError(f"Kernel config mismatch: fwd.N={fwd.ATTN_N}, bwd.N={bwd.ATTN_N}, prep.N={prep.ATTN_N}")
                 return fwd, bwd, prep
             else:
                 fwd = importlib.import_module("tk_kernel")
                 return fwd, None, None
         finally:
-            sys.path.remove(kernel_dir)
+            sys.path.remove(jit_dir)
     
-    def get_kernels(self, causal: bool, training: bool):
-        """Get or load kernels for configuration."""
-        key = (causal, training)
+    def get_kernels(self, causal: bool, training: bool, n: int):
+        """Get or JIT compile kernels for configuration."""
+        key = (causal, training, n)
         if key in self.cache:
             return self.cache[key]
         
-        kernel_dir = self._get_kernel_dir(causal, training)
+        kernel_dir, jit_dir = self._get_kernel_dir(causal, training, n)
         
-        # Auto-compile if needed
-        if not self._check_compiled(kernel_dir, training):
-            if not self._compile(kernel_dir):
-                raise RuntimeError(f"Failed to compile kernels in {kernel_dir}")
+        # Auto-compile if needed (JIT compilation)
+        if not self._check_compiled(jit_dir, training):
+            if not self._compile(kernel_dir, jit_dir, n):
+                raise RuntimeError(f"Failed to JIT compile kernels for N={n}")
         
         # Load modules
-        kernels = self._load_modules(kernel_dir, training)
+        kernels = self._load_modules(jit_dir, training)
         self.cache[key] = kernels
         return kernels
 
@@ -224,15 +244,8 @@ def flash_attn_func(
     # Auto-detect training mode
     training = q.requires_grad or k.requires_grad or v.requires_grad
     
-    # Get kernels
-    fwd_kernel, bwd_kernel, prep_kernel = _KERNEL_LOADER.get_kernels(causal, training)
-    
-    # Validate sequence length matches compiled kernel
-    if N != fwd_kernel.ATTN_N:
-        raise ValueError(
-            f"Sequence length mismatch: input N={N}, but kernel compiled for N={fwd_kernel.ATTN_N}. "
-            f"Please recompile kernels with: make ATTN_N={N}"
-        )
+    # Get kernels (JIT compile if needed for this N)
+    fwd_kernel, bwd_kernel, prep_kernel = _KERNEL_LOADER.get_kernels(causal, training, N)
     
     # Forward-only path
     if not training:
