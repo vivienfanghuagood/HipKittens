@@ -60,22 +60,36 @@ class HipKittensAttention(nn.Module):
     def _compile_kernel(self, kernel_dir):
         """Auto-compile kernel if not already compiled."""
         import subprocess
+        import glob
         
-        # Check if kernel is already compiled by looking for .so files
-        so_files = [f for f in os.listdir(kernel_dir) if f.endswith('.so')]
-        if so_files:
+        # Check if kernels are already compiled
+        # For training mode, need 3 kernel modules
+        if self.training_mode:
+            required_kernels = ['tk_kernel_fwd', 'tk_kernel_bkwd', 'tk_kernel_bkwd_prep']
+        else:
+            required_kernels = ['tk_kernel']
+        
+        # Check if all required .so files exist
+        all_compiled = True
+        for kernel_name in required_kernels:
+            pattern = os.path.join(kernel_dir, f"{kernel_name}*.so")
+            if not glob.glob(pattern):
+                all_compiled = False
+                break
+        
+        if all_compiled:
             return True
         
-        print(f"Compiling kernel in {kernel_dir}...")
+        print(f"Compiling kernels in {kernel_dir}...")
         try:
             result = subprocess.run(
                 ['make', '-C', kernel_dir],
                 capture_output=True,
                 text=True,
-                timeout=300
+                timeout=600
             )
             if result.returncode == 0:
-                print(f"✓ Kernel compiled successfully")
+                print(f"✓ Kernels compiled successfully")
                 return True
             else:
                 print(f"✗ Compilation failed:\n{result.stderr}")
