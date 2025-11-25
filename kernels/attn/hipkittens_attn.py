@@ -252,12 +252,12 @@ class HipKittensAttentionFunction(torch.autograd.Function):
         B, N, H, D = q.shape
         H_KV = k.shape[2]
         
-        # Allocate output tensors
+        # Allocate output tensors (BNHD format)
         out = torch.zeros(B, N, H, D, dtype=q.dtype, device=q.device)
-        lse = torch.zeros(B, H, N, 1, dtype=torch.float32, device=q.device)
+        lse = torch.zeros(B, H, 1, N, dtype=torch.float32, device=q.device)
         lse_transposed = lse.transpose(-1, -2).contiguous()
         
-        # Call forward kernel
+        # Call forward kernel (inputs are BNHD)
         fwd_kernel.dispatch_fwd(q, k, v, out, lse_transposed)
         
         # Save for backward
@@ -268,25 +268,26 @@ class HipKittensAttentionFunction(torch.autograd.Function):
         ctx.bwd_prep_kernel = bwd_prep_kernel
         
         if return_lse:
-            return out, lse_transposed
+            return out, lse
         else:
             return out, None
     
     @staticmethod
     def backward(ctx, grad_out, grad_lse):
         """Backward pass."""
-        q, k, v, out, lse = ctx.saved_tensors
+        q, k, v, out, lse_transposed = ctx.saved_tensors
         
         B, N, H, D = q.shape
         H_KV = k.shape[2]
         
         # Allocate gradient tensors
+        # dQ_intermediate is BHND format (will be shuffled to BNHD)
         dQ_intermediate = torch.zeros(B, H, N, D, dtype=q.dtype, device=q.device)
-        dQ = torch.zeros_like(q)
-        dK = torch.zeros_like(k)
-        dV = torch.zeros_like(v)
-        delta = torch.zeros(B, H, N, 1, dtype=torch.float32, device=q.device)
-        delta_transposed = delta.transpose(-1, -2).contiguous()
+        dQ = torch.zeros_like(q)  # BNHD
+        dK = torch.zeros_like(k)  # BNHD
+        dV = torch.zeros_like(v)  # BNHD
+        delta = torch.zeros(B, H, 1, N, dtype=torch.float32, device=q.device)
+        delta_transposed = delta.transpose(-1, -2).contiguous()  # (B, H, N, 1)
         
         # Prep kernel: compute delta = sum(out * grad_out, dim=-1)
         ctx.bwd_prep_kernel.dispatch_prep(out, grad_out, delta_transposed)
@@ -298,11 +299,11 @@ class HipKittensAttentionFunction(torch.autograd.Function):
             dQ_intermediate,
             dK,
             dV,
-            lse,
+            lse_transposed,
             delta_transposed
         )
         
-        # Shuffle dQ from intermediate format to final format
+        # Shuffle dQ from intermediate format (BHND) to final format (BNHD)
         ctx.bwd_prep_kernel.dispatch_dq_shuffle(dQ_intermediate, dQ)
         
         return dQ, dK, dV, None, None, None, None, None
