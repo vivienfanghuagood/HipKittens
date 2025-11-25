@@ -1,34 +1,30 @@
-"""最简单的演示 - 验证自动编译和基本功能"""
+"""Simple demo - Flash Attention interface"""
 import torch
+from hipkittens_attn import flash_attn_func
 
-print("HipKittens Attention - 快速演示\n")
+print("HipKittens Flash Attention - Quick Demo\n")
 
-# 导入（会在首次forward时自动编译）
-from hipkittens_attn import create_attention
-
-# 场景1: 推理
-print("1. 推理模式")
-attn = create_attention(causal=True, training=False)
+# Scenario 1: Inference (like aiter)
+print("1. Inference Mode")
 q = torch.randn(4, 512, 16, 128, dtype=torch.bfloat16, device='cuda')
 k = torch.randn(4, 512, 4, 128, dtype=torch.bfloat16, device='cuda')
 v = torch.randn(4, 512, 4, 128, dtype=torch.bfloat16, device='cuda')
 
 with torch.no_grad():
-    output, lse = attn(q, k, v)
-print(f"   输出: {output.shape} ✓\n")
+    out, lse = flash_attn_func(q, k, v, causal=True, return_lse=True)
+print(f"   Output: {out.shape} ✓\n")
 
-# 场景2: 训练
-print("2. 训练模式（带梯度）")
-attn_train = create_attention(causal=True, training=True)
-q = torch.randn(4, 512, 16, 128, dtype=torch.bfloat16, device='cuda', requires_grad=True)
-k = torch.randn(4, 512, 4, 128, dtype=torch.bfloat16, device='cuda', requires_grad=True)
-v = torch.randn(4, 512, 4, 128, dtype=torch.bfloat16, device='cuda', requires_grad=True)
+# Scenario 2: Training (auto-detect requires_grad)
+print("2. Training Mode (auto-detect)")
+q.requires_grad = True
+k.requires_grad = True
+v.requires_grad = True
 
-output, lse = attn_train(q, k, v)
-loss = output.sum()
+out, lse = flash_attn_func(q, k, v, causal=True, return_lse=True)
+loss = out.sum()
 loss.backward()
 
-print(f"   输出: {output.shape}")
-print(f"   Q梯度: {q.grad.shape} ✓\n")
+print(f"   Output: {out.shape}")
+print(f"   Q Grad: {q.grad.shape} ✓\n")
 
-print("✓ 所有功能正常！")
+print("✅ Flash interface working!")
