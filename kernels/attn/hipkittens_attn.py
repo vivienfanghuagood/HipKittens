@@ -106,13 +106,12 @@ class _FlashAttnFunc(torch.autograd.Function):
         # Allocate outputs
         out = torch.zeros(B, N, H, D, dtype=q.dtype, device=q.device)
         lse = torch.zeros(B, H, 1, N, dtype=torch.float32, device=q.device)
-        lse_transposed = lse.transpose(-1, -2).contiguous()
         
         # Forward
-        fwd_kernel.dispatch_fwd(q, k, v, out, lse_transposed)
+        fwd_kernel.dispatch_fwd(q, k, v, out, lse)
         
         # Save for backward
-        ctx.save_for_backward(q, k, v, out, lse_transposed)
+        ctx.save_for_backward(q, k, v, out, lse)
         ctx.bwd_kernel = bwd_kernel
         ctx.prep_kernel = prep_kernel
         
@@ -120,7 +119,7 @@ class _FlashAttnFunc(torch.autograd.Function):
     
     @staticmethod
     def backward(ctx, grad_out, grad_lse):
-        q, k, v, out, lse_transposed = ctx.saved_tensors
+        q, k, v, out, lse = ctx.saved_tensors
         B, N, H, D = q.shape
         
         # Allocate gradients
@@ -129,16 +128,15 @@ class _FlashAttnFunc(torch.autograd.Function):
         dK = torch.zeros_like(k)
         dV = torch.zeros_like(v)
         delta = torch.zeros(B, H, 1, N, dtype=torch.float32, device=q.device)
-        delta_transposed = delta.transpose(-1, -2).contiguous()
         
         # Backward prep
-        ctx.prep_kernel.dispatch_prep(out, grad_out, delta_transposed)
+        ctx.prep_kernel.dispatch_prep(out, grad_out, delta)
         
         # Backward combined
         ctx.bwd_kernel.dispatch_bwd_combined(
             q, k, v, grad_out,
             dQ_intermediate, dK, dV,
-            lse_transposed, delta_transposed
+            lse, delta
         )
         
         # Shuffle dQ
@@ -219,9 +217,8 @@ def flash_attn_func(
     if not training:
         out = torch.zeros(B, N, H, D, dtype=q.dtype, device=q.device)
         lse = torch.zeros(B, H, 1, N, dtype=torch.float32, device=q.device)
-        lse_transposed = lse.transpose(-1, -2).contiguous()
         
-        fwd_kernel.dispatch_micro(q, k, v, out, lse_transposed)
+        fwd_kernel.dispatch_micro(q, k, v, out, lse)
         
         return out, (lse if return_lse else None)
     

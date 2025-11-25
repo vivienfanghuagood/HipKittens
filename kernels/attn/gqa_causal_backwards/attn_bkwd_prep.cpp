@@ -16,7 +16,7 @@ constexpr int ATTN_H_KV = 8; // number of key/value heads (for GQA)
 constexpr int GROUP_SIZE = ATTN_H / ATTN_H_KV; // queries per KV head group
 
 #ifndef ATTN_N
-constexpr int ATTN_N = 1024; // sequence length
+constexpr int ATTN_N = 8192; // sequence length
 #endif
 
 constexpr int ATTN_D = 128; // dimension
