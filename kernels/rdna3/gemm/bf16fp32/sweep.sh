@@ -11,7 +11,10 @@ QB_ARGS="${QB_ARGS:-}"
 
 run() {
     local desc="$1"
-    local flags=""
+    # HK_MULTI_CONFIG=0 pins the kernel to exactly the tiling named here; the
+    # shipped dispatch picks between two of them by shape, which would make a
+    # sweep measure the selection rule instead of the configuration.
+    local flags="-DHK_MULTI_CONFIG=0"
     for kv in $desc; do flags="$flags -D${kv/=/=}"; done
     make clean >/dev/null 2>&1
     if ! make EXTRA_HIPFLAGS="$flags" >/tmp/build.log 2>&1; then

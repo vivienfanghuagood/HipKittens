@@ -11,7 +11,7 @@ the work here lives on the `rdna` branch, seven commits on top of `de0cddbd`.
 |---|---|---|
 | core library | `include/rdna3`, 68 files | `include/rdna4`, 68 files |
 | unit tests | **1659 passed, 0 failed** on a W7900D | compiles; **never executed** |
-| bf16 GEMM | **71 TFLOPs**, 71% of the measured WMMA ceiling, 80% of rocBLAS | compiles; never executed |
+| bf16 GEMM | **71.5 TFLOPs** peak, 71% of the measured WMMA ceiling, 76-82% of rocBLAS across shapes | compiles; never executed |
 | fp8 | not available in hardware | implemented, all four opcodes, untested |
 
 **Read the second column as "written, not verified."** No gfx12 part was
@@ -114,10 +114,13 @@ best-of-{NN,NT,TN,TT}; HipKittens implements one layout.
 
 | shape (M×N×K) | hipBLASLt | rocBLAS | HK | HK / best | HK / ceiling |
 |---|---|---|---|---|---|
-| 4096³ | 69.3 | **81.3** | 66.9 | 82% | 67% |
-| 8192×8192×4096 | 66.5 | **88.8** | 69.4 | 78% | 69% |
-| 8192×4096×2048 | 70.0 | **88.7** | 71.3 | 80% | 71% |
-| 2048³ | 60.1 | **69.4** | 47.6 | 69% | 47% |
+| 4096³ | 69.1 | **83.2** | 68.5 | 82% | 68% |
+| 8192×8192×4096 | 65.0 | **88.6** | 69.5 | 78% | 69% |
+| 4096×8192×2048 | 70.4 | **88.6** | 71.5 | 81% | 71% |
+| 8192×4096×2048 | 70.0 | **88.6** | 71.4 | 81% | 71% |
+| 2048×4096×4096 | 68.0 | **85.7** | 64.9 | 76% | 65% |
+| 2048×2048×4096 | 63.7 | **75.1** | 57.4 | 76% | 57% |
+| 2048³ | 60.3 | **69.5** | 55.3 | 80% | 55% |
 
 **Two corrections to numbers this file previously carried**, both of which made
 the kernel look better than it is:
@@ -136,13 +139,36 @@ memory at all measures **100.5 TFLOPs**
 the architectural issue rate, at 2.18 GHz and only 101 W. The reachable peak is
 ~104, so percentages against 122.6 understate by about 18%.
 
-The 20% behind rocBLAS is one identified thing: LDS reads per WMMA. A 32×64 warp
-tile does 8 WMMAs per 6 operand loads; rocBLAS's 64×64 does 16 per 8. Every
-attempt to adopt the wider tile here measures slower, because this kernel hides
+The 20% behind rocBLAS is one identified thing: **LDS bytes per WMMA**, which is
+arithmetic intensity, which is the warp tile. A 32×64 tile moves 1.5× the operand
+bytes per WMMA that rocBLAS's 64×64 does — `(M+N)/(M·N)`, exactly — and that puts
+this kernel at 48 bytes/clk/CU against a measured 64.8 ceiling, 74% utilised,
+where rocBLAS sits at 32.
+
+It is worth saying what it is *not*, because both alternatives look plausible
+from the disassembly and both were checked. It is not instruction count: rocBLAS
+issues 5.3× more LDS instructions (128 × `ds_load_u16` against 24 ×
+`ds_read_b128` per 16 WMMAs) and still wins. And it is not bank conflicts:
+[`tools/rdna-probes/lds_peak.hip`](tools/rdna-probes/lds_peak.hip) measures this
+tree's access pattern at 64.8 bytes/clk/CU, tied with a hand-built conflict-free
+reference and 4.1× the same read with the swizzle removed. The swizzle constant
+is right.
+
+Every attempt to adopt the wider tile measures slower, because this kernel hides
 LDS latency with occupancy and the wider tile costs occupancy — rocBLAS hides it
-with a software pipeline instead, which costs registers. The two changes only
-pay together. The full config sweep is in
+with a software pipeline (`PLR1`) instead, which costs registers. The two changes
+only pay together, and on gfx1100 they do not both fit: 64×64 needs 128 VGPRs of
+accumulator plus 64 of operands, and the operands are already 2× larger than they
+would be on CDNA because of the wave-half mirroring, so double-buffering them
+overruns the 256-VGPR file. **That is the wall, and it is an architectural one.**
+The full config sweep is in
 [`kernels/rdna3/gemm/bf16fp32/README.md`](kernels/rdna3/gemm/bf16fp32/README.md).
+
+Small shapes are a separate, fixed problem. They were bound by grid quantization
+— 2048² is 256 workgroups against 192 concurrent slots, so the second pass ran
+two thirds empty — and `dispatch_micro` now compiles two tilings and picks by
+workgroup count, worth 16% at 2048³ and nothing above the crossover. Split-K is
+still missing and is the next thing for that regime.
 
 RDNA4 has not been run. What is known is a register count: the operand tiles
 cost 24 VGPRs there against 48 on gfx1100, and the ported kernel sits at 128

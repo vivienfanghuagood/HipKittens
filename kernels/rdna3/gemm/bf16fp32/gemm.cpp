@@ -41,6 +41,11 @@ using namespace kittens;
 #ifndef MIN_BLOCKS_PER_CU
 #define MIN_BLOCKS_PER_CU 1
 #endif
+// How many block-rows the L2 swizzle walks before moving on. Only affects which
+// workgroups are co-resident, not what they compute.
+#ifndef WGM
+#define WGM 8
+#endif
 
 // Ablation switches for the inner loop. Setting any of these makes the result
 // numerically wrong on purpose -- they exist to time one stage of the pipeline
@@ -54,8 +59,6 @@ using namespace kittens;
 #ifndef ABLATE_MMA
 #define ABLATE_MMA 0
 #endif
-
-#define NUM_THREADS (kittens::WARP_THREADS * NUM_WARPS)
 
 // Pin a register tile's values as live without emitting an instruction. The
 // ablations below delete whichever stage they are measuring, and without this
@@ -71,38 +74,76 @@ template<typename RT> __device__ inline void keep_live(RT &t) {
                 asm volatile("" :: "v"(t.tiles[i][j].data[k]));
 }
 
-// Warps tile the block WARP_ROWS (M) by WARP_COLS (N).
-constexpr int WARP_COLS = NUM_WARPS / WARP_ROWS;
-static_assert(WARP_ROWS * WARP_COLS == NUM_WARPS, "warp grid must cover the block");
-constexpr int REG_BLOCK_M = BLOCK_M / WARP_ROWS;  // 32
-constexpr int REG_BLOCK_N = BLOCK_N / WARP_COLS;  // 64
-
-using st_a = st_bf<BLOCK_M, K_STEP>;
-using st_b = st_bf<BLOCK_N, K_STEP>;
-
 using _gl_A = gl<bf16, -1, -1, -1, -1>;
 using _gl_B = gl<bf16, -1, -1, -1, -1>;
 using _gl_C = gl<bf16, -1, -1, -1, -1>;
-
-using G = kittens::group<NUM_WARPS>;
-
-// 2 buffers each of A and B.
-constexpr size_t SHARED_BYTES = 2 * (sizeof(st_a) + sizeof(st_b));
-static_assert(SHARED_BYTES <= MAX_SHARED_MEMORY, "block does not fit in 64KB of LDS");
 
 struct micro_globals {
     _gl_A a;
     _gl_B b;
     _gl_C c;
-    hipStream_t stream;
-    // a: (m, k), b: (n, k), c: (m, n)
-    dim3 grid()  { return dim3((a.rows() / BLOCK_M) * (b.rows() / BLOCK_N)); }
-    dim3 block() { return dim3(NUM_THREADS); }
-    size_t dynamic_shared_memory() { return SHARED_BYTES; }
+    hipStream_t stream;   // a: (m, k), b: (n, k), c: (m, n)
 };
 
-__global__ __launch_bounds__(NUM_THREADS, MIN_BLOCKS_PER_CU)
+// The command line sets the tunables as macros, and the config struct below
+// wants the same names as members, so capture the values and then get the macros
+// out of the way.
+namespace cli {
+constexpr int block_m = BLOCK_M, block_n = BLOCK_N, k_step = K_STEP,
+              dot_slice = DOT_SLICE, num_warps = NUM_WARPS,
+              warp_rows = WARP_ROWS, wgm = WGM;
+}
+#undef BLOCK_M
+#undef BLOCK_N
+#undef K_STEP
+#undef DOT_SLICE
+#undef NUM_WARPS
+#undef WARP_ROWS
+#undef WGM
+
+// One tiling. The kernel is templated on this rather than compiled from the
+// macros directly, because no single tiling wins across shapes -- see the table
+// in README.md and the selection rule in dispatch_micro below.
+template<int _BLOCK_M, int _BLOCK_N, int _K_STEP, int _DOT_SLICE,
+         int _NUM_WARPS, int _WARP_ROWS, int _WGM>
+struct config {
+    static constexpr int BLOCK_M = _BLOCK_M, BLOCK_N = _BLOCK_N;
+    static constexpr int K_STEP  = _K_STEP,  DOT_SLICE = _DOT_SLICE;
+    static constexpr int NUM_WARPS = _NUM_WARPS, WARP_ROWS = _WARP_ROWS;
+    static constexpr int WGM = _WGM;
+
+    static constexpr int NUM_THREADS = kittens::WARP_THREADS * NUM_WARPS;
+    // Warps tile the block WARP_ROWS (M) by WARP_COLS (N).
+    static constexpr int WARP_COLS = NUM_WARPS / WARP_ROWS;
+    static_assert(WARP_ROWS * WARP_COLS == NUM_WARPS, "warp grid must cover the block");
+    static constexpr int REG_BLOCK_M = BLOCK_M / WARP_ROWS;
+    static constexpr int REG_BLOCK_N = BLOCK_N / WARP_COLS;
+
+    using st_a = st_bf<BLOCK_M, K_STEP>;
+    using st_b = st_bf<BLOCK_N, K_STEP>;
+    using G    = kittens::group<NUM_WARPS>;
+
+    // 2 buffers each of A and B.
+    static constexpr size_t SHARED_BYTES = 2 * (sizeof(st_a) + sizeof(st_b));
+    static_assert(SHARED_BYTES <= MAX_SHARED_MEMORY, "block does not fit in 64KB of LDS");
+};
+
+// What -DBLOCK_M=... on the command line selects. sweep.sh drives this one.
+using macro_config = config<cli::block_m, cli::block_n, cli::k_step, cli::dot_slice,
+                            cli::num_warps, cli::warp_rows, cli::wgm>;
+
+template<typename C>
+__global__ __launch_bounds__(C::NUM_THREADS, MIN_BLOCKS_PER_CU)
 void micro_tk(const micro_globals g) {
+    constexpr int BLOCK_M = C::BLOCK_M, BLOCK_N = C::BLOCK_N;
+    constexpr int K_STEP = C::K_STEP, DOT_SLICE = C::DOT_SLICE;
+    constexpr int WARP_ROWS = C::WARP_ROWS, WARP_COLS = C::WARP_COLS;
+    constexpr int REG_BLOCK_M = C::REG_BLOCK_M, REG_BLOCK_N = C::REG_BLOCK_N;
+    constexpr int WGM = C::WGM;
+    using st_a = typename C::st_a;
+    using st_b = typename C::st_b;
+    using G    = typename C::G;
+
     extern __shared__ alignment_dummy __shm[];
     shared_allocator al((int*)&__shm[0]);
     st_a (&As)[2] = al.allocate<st_a, 2>();
@@ -123,7 +164,6 @@ void micro_tk(const micro_globals g) {
     // L2 swizzle: walk WGM block-rows at a time so that the B panel a group of
     // workgroups reads stays resident. No chiplet term -- NUM_XCDS is 1 here.
     int wgid = blockIdx.x;
-    const int WGM = 8;
     const int wgs_per_group = WGM * n_blocks;
     const int group_id      = wgid / wgs_per_group;
     const int first_pid_m   = group_id * WGM;
@@ -139,8 +179,8 @@ void micro_tk(const micro_globals g) {
     // Prefetch staging. There is no global->LDS DMA on RDNA, so the "async
     // copy" is: buffer_load into these VGPRs on one iteration, ds_write them on
     // the next. A whole K-tile of math sits between the two halves.
-    constexpr int stage_a = G::stage_calls<st_a>;
-    constexpr int stage_b = G::stage_calls<st_b>;
+    constexpr int stage_a = G::template stage_calls<st_a>;
+    constexpr int stage_b = G::template stage_calls<st_b>;
     float4 buf_a[stage_a];
     float4 buf_b[stage_b];
 
@@ -221,10 +261,62 @@ void micro_tk(const micro_globals g) {
     store(g.c, C_accum, {0, 0, row * WARP_ROWS + warp_row, col * WARP_COLS + warp_col});
 }
 
+template<typename C>
+static void launch(const micro_globals &g) {
+    const unsigned long mem_size = C::SHARED_BYTES;
+    hipFuncSetAttribute((void*)micro_tk<C>, hipFuncAttributeMaxDynamicSharedMemorySize, mem_size);
+    micro_tk<C><<<dim3((g.a.rows() / C::BLOCK_M) * (g.b.rows() / C::BLOCK_N)),
+                  dim3(C::NUM_THREADS), mem_size, g.stream>>>(g);
+}
+
+// Two tilings, picked on the number of workgroups the M/N grid produces.
+//
+//   big    128x128, 8 warps, 32x64 per warp. 164 VGPRs, 9 waves/SIMD, 32 KB of
+//          LDS. The most arithmetic intensity that fits without spilling.
+//   small  128x64, 8 warps, 32x32 per warp. 103 VGPRs, 12 waves/SIMD, 24 KB.
+//          Half the intensity, but twice the workgroups and a third more waves.
+//
+// The crossover is sharp and it is a tail-quantization effect, not an inner-loop
+// one. `big` uses 32 KB of LDS, so four of its workgroups fit per WGP and 48
+// WGPs hold 192 at once. At 2048x2048 the grid is 16x16 = 256 workgroups: one
+// full pass plus a second pass that is two thirds empty, and the machine idles
+// through it. `small` has 512 workgroups of two thirds the cost, which lands
+// much closer to a whole number of passes.
+//
+// Measured, TFLOPs, best of each column in bold in README.md:
+//
+//   M,N       blocks | big | small
+//   1024^2        64 |  36 |  44
+//   2048^2       256 |  39 |  55      <- 2048x2048x2048
+//   2048^2       256 |  48 |  55      <- 2048x2048x4096
+//   2048x4096    512 |  63 |  61
+//   4096^2      1024 |  67 |  66
+//   4096x8192   2048 |  72 |  69
+//   8192^2      4096 |  71 |  59
+//
+// so the rule is `blocks <= 256`, i.e. up to about 1.3 machine-fulls of `big`.
+// A third variant with K_STEP=64 was also measured; it wins nothing anywhere
+// that `small` does not win by more, so it is not carried here.
+using big_config   = config<128, 128, 32, 16, 8, 4, 8>;
+using small_config = config<128,  64, 32, 16, 8, 4, 8>;
+
+#ifndef HK_MULTI_CONFIG
+#define HK_MULTI_CONFIG 1
+#endif
+
 void dispatch_micro(micro_globals g) {
-    unsigned long mem_size = g.dynamic_shared_memory();
-    hipFuncSetAttribute((void*)micro_tk, hipFuncAttributeMaxDynamicSharedMemorySize, mem_size);
-    micro_tk<<<g.grid(), g.block(), mem_size, g.stream>>>(g);
+#if HK_MULTI_CONFIG
+    const int blocks = (g.a.rows() / big_config::BLOCK_M) * (g.b.rows() / big_config::BLOCK_N);
+    // Fall back to `big` on shapes `small` cannot tile; its BLOCK_N is the
+    // smaller of the two, so this only triggers on N not divisible by 128.
+    if (blocks <= 256 && g.b.rows() % small_config::BLOCK_N == 0) {
+        launch<small_config>(g);
+        return;
+    }
+    launch<big_config>(g);
+#else
+    launch<macro_config>(g);   // -DBLOCK_M=... from sweep.sh
+#endif
 }
 
 PYBIND11_MODULE(tk_kernel, m) {

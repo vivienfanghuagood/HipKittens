@@ -1,5 +1,6 @@
 # One correctness check plus a couple of timings, small enough to sit inside a
 # tiling sweep. test.py / bench.py are the real harnesses.
+import os
 import sys
 import torch
 import tk_kernel
@@ -8,7 +9,14 @@ torch.manual_seed(0)
 dtype, device = torch.bfloat16, "cuda:0"
 
 CHECK = (1024, 1024, 512)
-SHAPES = [(4096, 4096, 4096), (8192, 8192, 4096)]
+# Override with QB_SHAPES="2048x2048x2048,4096x4096x4096" to point a sweep at a
+# different regime. The defaults are the two large shapes the tile was picked on;
+# small shapes are bound by grid quantization rather than by the inner loop, so
+# they want their own sweep.
+SHAPES = [
+    tuple(int(v) for v in s.split("x"))
+    for s in os.environ.get("QB_SHAPES", "4096x4096x4096,8192x8192x4096").split(",")
+]
 
 
 def run(m, n, k):

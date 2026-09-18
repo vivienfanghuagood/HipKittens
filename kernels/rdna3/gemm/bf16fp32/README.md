@@ -14,10 +14,13 @@ BLAS libraries, vendor columns taken as best-of-{NN,NT,TN,TT}:
 
 | shape (M×N×K) | hipBLASLt | rocBLAS | HK | HK / best | HK / WMMA ceiling |
 |---|---|---|---|---|---|
-| 4096³ | 69.3 | **81.3** | 66.9 | 82% | 67% |
-| 8192×8192×4096 | 66.5 | **88.8** | 69.4 | 78% | 69% |
-| 8192×4096×2048 | 70.0 | **88.7** | 71.3 | 80% | 71% |
-| 2048³ | 60.1 | **69.4** | 47.6 | 69% | 47% |
+| 4096³ | 69.1 | **83.2** | 68.5 | 82% | 68% |
+| 8192×8192×4096 | 65.0 | **88.6** | 69.5 | 78% | 69% |
+| 4096×8192×2048 | 70.4 | **88.6** | 71.5 | 81% | 71% |
+| 8192×4096×2048 | 70.0 | **88.6** | 71.4 | 81% | 71% |
+| 2048×4096×4096 | 68.0 | **85.7** | 64.9 | 76% | 65% |
+| 2048×2048×4096 | 63.7 | **75.1** | 57.4 | 76% | 57% |
+| 2048³ | 60.3 | **69.5** | 55.3 | 80% | 55% |
 
 **This kernel is 20-25% behind the best vendor library on every shape.** An
 earlier version of this table compared only against torch's default backend and
@@ -34,13 +37,40 @@ sampling `rocm-smi` during a GEMM shows this card at 2.0-2.1 GHz against its
 
 ### Where the 20% goes, and why the obvious fixes do not work
 
-The gap is LDS reads per WMMA, and it is a consequence of the tile shape. A warp
-tile of M×N issues (M/16)(N/16) WMMAs against (M/16)+(N/16) operand tile loads:
+It is LDS *bytes*, not LDS instructions and not bank conflicts. Both of those
+were checked and neither is the answer.
 
-| warp tile | WMMAs | operand loads | ratio |
-|---|---|---|---|
-| 32×64 (this kernel) | 8 | 6 | 1.33 |
-| 64×64 (rocBLAS) | 16 | 8 | **2.00** |
+Disassembling rocBLAS's kernel and histogramming the two inner loops, normalized
+so both do 16 WMMAs:
+
+| per 16 WMMAs | rocBLAS | this kernel |
+|---|---|---|
+| LDS read instructions | **128** × `ds_load_u16` (2 B) | 24 × `ds_read_b128` (16 B) |
+| LDS bytes read per lane | **256** | **384** |
+| non-WMMA VALU | **0** | 28 × `v_add_nc_u32` |
+| total instructions in the loop | 188 | 122 |
+
+rocBLAS issues 5.3× more LDS instructions and still wins, which invites a
+bank-conflict story. There is not one.
+[`tools/rdna-probes/lds_peak.hip`](../../../../tools/rdna-probes/lds_peak.hip)
+measures the delivered bandwidth of each access pattern at equal instruction
+count: the pattern this kernel uses reaches **64.8 bytes/clk/CU**, tied with a
+hand-built conflict-free reference and 4.1× the same tile read with the swizzle
+removed. rocBLAS's 2-byte pattern reaches 35.8. Both are conflict-free; the
+`swizzle_bytes` constant in `st.cuh` does not need retuning.
+
+What is left is arithmetic intensity. A warp tile of M×N needs `(M+N)·K` operand
+elements for `(M/16)(N/16)` WMMAs, so the bytes per WMMA go as `(M+N)/(M·N)`:
+
+| warp tile | intensity `(M·N)/(M+N)` | distinct bytes per 16 WMMAs |
+|---|---|---|
+| 32×64 (this kernel) | 21.3 | 6144 |
+| 64×64 (rocBLAS) | **32.0** | **4096** |
+
+1.5×, exactly. Converted to a rate: 16 WMMAs is 16 × 8192 FLOP, which at
+512 FLOP/clk/CU is 256 CU-cycles, and a CU retires two wave-iterations in that
+window — so this kernel asks LDS for 48 bytes/clk/CU against the 64.8 ceiling,
+**74% utilised**, where rocBLAS asks for 32.
 
 rocBLAS's Tensile kernel for this shape is
 `Cijk_..._MT128x128x16_MI16x16x16x1_..._PGR1_PLR1_..._WG32_4_1`: the same 128×128
@@ -71,8 +101,35 @@ measures slower, which is how this kernel ended up at a local optimum — see th
 first entry under "tried and did not work" below, which is that same experiment
 run at 32×64 and correctly concluded, for that shape only.
 
-Small shapes lose for a separate reason: 2048³ is 256 workgroups over 96 CUs,
-and there is no split-K.
+### Small shapes get their own tiling
+
+The inner loop above is not what bounds small shapes; grid quantization is. The
+128×128 block uses 32 KB of LDS, so four workgroups fit per WGP and 48 WGPs hold
+192 at once. At 2048×2048 the grid is 16×16 = 256 workgroups — one full pass plus
+a second that is two thirds empty, with the machine idling through it.
+
+So `dispatch_micro` compiles two tilings and picks by workgroup count:
+
+| M,N | blocks | 128×128, 32×64/warp | 128×64, 32×32/warp |
+|---|---|---|---|
+| 1024² | 64 | 36 | **44** |
+| 2048², K=2048 | 256 | 39 | **55** |
+| 2048², K=4096 | 256 | 48 | **55** |
+| 2048×4096 | 512 | **63** | 61 |
+| 4096² | 1024 | **67** | 66 |
+| 4096×8192 | 2048 | **72** | 69 |
+| 8192² | 4096 | **71** | 59 |
+
+The crossover at 256 blocks is sharp, and the rule is just `blocks <= 256`. The
+small tiling gives up half the arithmetic intensity and gets back twice the
+workgroups and a third more waves (103 VGPRs, 12 waves/SIMD against 164 and 9).
+This is worth 16% at 2048³ and costs nothing above the crossover.
+
+A third variant with `K_STEP=64` was measured too — it wins at small shapes for
+the unrelated reason that it halves the number of K-tiles and therefore the
+number of barriers, but it never beats the small tiling, so it is not carried.
+
+Split-K is still missing and is the next thing for this regime.
 
 How it got there, each step measured at 4096³ / 8192×8192×4096:
 
@@ -103,9 +160,11 @@ python bench.py      # the table above
 
 ## Tuning
 
-`BLOCK_M`, `BLOCK_N`, `K_STEP`, `DOT_SLICE`, `NUM_WARPS`, `WARP_ROWS` are
-`-D`-overridable; the defaults (128, 128, 32, 16, 8, 4) are what the sweep
-picked. `ABLATE_GLOBAL` / `ABLATE_LDS_READ` / `ABLATE_MMA` delete one pipeline
+`BLOCK_M`, `BLOCK_N`, `K_STEP`, `DOT_SLICE`, `NUM_WARPS`, `WARP_ROWS`, `WGM` are
+`-D`-overridable, but only take effect with `-DHK_MULTI_CONFIG=0`, which pins the
+build to exactly that tiling instead of the two-way selection above. `sweep.sh`
+passes it; without it a sweep would measure the selection rule rather than the
+configuration it names. `ABLATE_GLOBAL` / `ABLATE_LDS_READ` / `ABLATE_MMA` delete one pipeline
 stage each — they make the answer wrong on purpose, and they are what located
 the cost above.
 
