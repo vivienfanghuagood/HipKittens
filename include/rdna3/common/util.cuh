@@ -59,7 +59,7 @@ template<typename T> constexpr int TILE_ELEMENTS{TILE_COL_DIM<T>*TILE_ROW_DIM<T>
  *
  * This is the one place where RDNA3 diverges structurally from CDNA, so it is
  * worth stating precisely.  Measured on gfx1100 with a one-hot probe
- * (see hk-rdna/probe/wmma_layout.hip):
+ * (see tools/rdna-probes/wmma_layout.hip):
  *
  *   A operand (v16f16): lane l feeds row l%16, element i is k=i.  Lanes 0-15
  *       and 16-31 must carry *identical* data -- the hardware reads both halves

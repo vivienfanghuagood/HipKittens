@@ -80,7 +80,7 @@ __device__ inline buffer_resource make_buffer_resource(uint64_t ptr, uint32_t ra
  * gfx11 buffer resource descriptor (V#).
  *
  * Word 3 is *not* the gfx9 config word the CDNA tree uses. Measured on gfx1100
- * (see hk-rdna/probe/srsrc3.hip), a descriptor is only usable if both hold:
+ * (see tools/rdna-probes/srsrc3.hip), a descriptor is only usable if both hold:
  *
  *   OOB_SELECT (bits 29:28) == 3.  At any smaller value NumRecords is counted in
  *     units of STRIDE, and STRIDE is 0 for a raw buffer -- so *every* access is

@@ -36,7 +36,7 @@ another SKU.
 Do the correctness run first and take a failure as evidence about the fragment
 layout, not about the schedule. If `test.py` fails, run `tests/unit/rdna4` — it
 localizes the same bug far better than a GEMM does — and re-measure the layout
-with the `PROBE_GFX12_W32` variant of `hk-rdna/probe/wmma_layout.hip` before
+with the `PROBE_GFX12_W32` variant of `tools/rdna-probes/wmma_layout.hip` before
 changing anything here.
 
 ## Tuning

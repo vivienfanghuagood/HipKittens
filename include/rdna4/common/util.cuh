@@ -62,7 +62,7 @@ template<typename T> constexpr int TILE_ELEMENTS{TILE_COL_DIM<T>*TILE_ROW_DIM<T>
  * unambiguous about *size*, plus the RDNA4 ISA guide's description of how the
  * two wave halves split K, which is what fixes the *arrangement*.  Before
  * trusting a number out of this tree, run the PROBE_GFX12_W32 variant of
- * hk-rdna/probe/wmma_layout.hip, which tests exactly this table.
+ * tools/rdna-probes/wmma_layout.hip, which tests exactly this table.
  *
  * Where gfx12 differs from gfx11, and why every constant below is a separate
  * knob rather than the single `replication` RDNA3 needed:

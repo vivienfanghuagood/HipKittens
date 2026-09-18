@@ -19,7 +19,15 @@ We find that core tile and bulk compute interfaces carry over from TK to HK, but
 3. **Asynchronous loads/stores**: hide latencies and address generation using direct buffer loads to shared memory.
 4. **Scheduling and overlapping**: we show two core patterns for overlapping compute and memory, 8-wave ping pong and 4-wave interleave, that appear across kernels.
 
-We support CDNA3 and CDNA 4. 
+We support CDNA3 and CDNA 4.
+
+> **This fork adds RDNA3 and RDNA4.** `include/rdna3` is complete and green on a
+> W7900 (1659 unit tests, and a bf16 GEMM at 58% of peak that beats hipBLASLt on
+> large shapes); `include/rdna4` is written but has never run on hardware.
+> See **[RDNA.md](RDNA.md)** for the state of it, what is verified and what is
+> not, and the three hardware facts the whole port is derived from.
+
+
 
 **News**
 - [January 2026] HipKittens is accepted to [MLSys 2026 in Seattle]()!

@@ -35,7 +35,7 @@ if the fragment inference is wrong it is the thing that will say so. Expect
 to fail together if it is — they all derive from `rt_base_coord()`.
 
 Before trusting a fix, re-run the layout probe rather than guessing: the
-`PROBE_GFX12_W32` variant of `hk-rdna/probe/wmma_layout.hip` measures the
+`PROBE_GFX12_W32` variant of `tools/rdna-probes/wmma_layout.hip` measures the
 fragment directly, the same way the gfx1100 layout was established.
 
 One thing you will notice in a disassembly and should not chase: the test bodies
