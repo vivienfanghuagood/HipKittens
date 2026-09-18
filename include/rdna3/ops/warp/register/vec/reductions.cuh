@@ -40,22 +40,26 @@ __device__ static inline void reduce(
         static_assert(false, "align_l reduce is not currently supported");
     }
     else if constexpr (std::is_same_v<typename RV::layout, naive_l>) {
+        // A naive vector covers WARP_THREADS entries per outer step, so a lane
+        // holds an entry only while i*32 + laneid is in range. Lengths are
+        // multiples of 16, so the tail can leave the upper half of the wave with
+        // nothing; that is why the tree below is shfl_down rather than a
+        // butterfly. Converging on lane 0 keeps those lanes out of its cone.
         T accum = src[0][0];
         #pragma unroll
         for(int i = 1; i < src.outer_dim; i++) {
-            if (i < src.outer_dim-1 || i*64 + laneid < src.length) {  // Changed from TILE_ROW_DIM<T>*2 to 64
+            if (i*WARP_THREADS + laneid < src.length) {
                 accum = op::template op<T>(accum, src[i][0]);
             }
         }
-    
-        // Reduce across all 64 lanes
-        if (src.length > 32) accum = op::template op<T>(accum, packed_shfl_down(kittens::MASK_ALL, accum, 32));
-        if (src.length > 16) accum = op::template op<T>(accum, packed_shfl_down(kittens::MASK_ALL, accum, 16));
-        if (src.length > 8)  accum = op::template op<T>(accum, packed_shfl_down(kittens::MASK_ALL, accum, 8));
-        if (src.length > 4)  accum = op::template op<T>(accum, packed_shfl_down(kittens::MASK_ALL, accum, 4));
-        if (src.length > 2)  accum = op::template op<T>(accum, packed_shfl_down(kittens::MASK_ALL, accum, 2));
-        if (src.length > 1)  accum = op::template op<T>(accum, packed_shfl_down(kittens::MASK_ALL, accum, 1));
-        
+
+        #pragma unroll
+        for(int shift = WARP_THREADS/2; shift > 0; shift >>= 1) {
+            if (src.length > shift) {
+                accum = op::template op<T>(accum, packed_shfl_down(kittens::MASK_ALL, accum, shift));
+            }
+        }
+
         if constexpr (!reset) accum = op::template op<T>(accum, src_accum);
         dst_accum = packed_shfl(kittens::MASK_ALL, accum, 0);
     }

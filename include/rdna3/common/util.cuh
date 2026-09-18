@@ -286,6 +286,124 @@ __device__ inline bf16_2 packed_shfl_down(uint64_t mask, const bf16_2 &f, int de
      return r;
  }
 
+/* ----------  LANE EXCHANGE  ---------- */
+
+/*
+ * Butterfly exchange: every lane swaps with lane `laneid ^ lanemask`.
+ *
+ * This is the shape RDNA3 reductions want. The register layouts are replicated,
+ * so a butterfly leaves the answer in every lane and needs no broadcast
+ * afterwards, and a mask below 16 stays inside a wave half.
+ *
+ * The mask is a template parameter because gfx11 can encode all of these in the
+ * instruction rather than computing an address:
+ *
+ *   mask 1,2,4,8 : DPP16 ROW_XMASK, a free modifier on the consuming VALU op
+ *   mask 16      : v_permlanex16_b32, the cross-half exchange
+ *
+ * __shfl_xor would instead emit ds_bpermute_b32 for all of them, which runs on
+ * the LDS pipe and has to be waited on. In a softmax-shaped kernel that is the
+ * difference between a reduction that hides under the WMMA stream and one that
+ * does not.
+ *
+ * These read from the exchange partner unconditionally, so like any shuffle they
+ * are only meaningful with the whole wave active.
+ */
+static constexpr int HALF_WAVE_SWAP = 16;
+
+namespace detail {
+template<int lanemask>
+__device__ static inline int lane_xor_b32(int x) {
+    static_assert(lanemask > 0 && lanemask <= 16 && (lanemask & (lanemask-1)) == 0,
+                  "lane_xor mask must be a power of two no greater than 16");
+    if constexpr (lanemask == HALF_WAVE_SWAP) {
+        // Identity lane selects: a plain swap of the two halves.
+        return __builtin_amdgcn_permlanex16(x, x, 0x76543210u, 0xFEDCBA98u, true, false);
+    }
+    else {
+        constexpr int DPP_ROW_XMASK0 = 0x160;
+        return __builtin_amdgcn_update_dpp(0, x, DPP_ROW_XMASK0 | lanemask, 0xf, 0xf, true);
+    }
+}
+
+/// Exchange with lane `laneid ^ 17`: the other half, and the odd neighbour in it.
+/// permlanex16 already crosses the halves, so the selects only have to supply the
+/// ^1 within the row. Nibble i of (sel_lo, sel_hi) is the source index for the
+/// lane at position i, so the pair below spells out i -> i^1.
+__device__ static inline int lane_xor17_b32(int x) {
+    return __builtin_amdgcn_permlanex16(x, x, 0x67452301u, 0xEFCDAB89u, true, false);
+}
+
+/// Apply a 32-bit lane exchange to a value of any 2, 4 or 8 byte type.
+///
+/// The void* casts are deliberate: bf16_2 and friends have constructors, so the
+/// compiler warns about memcpy'ing them even though moving their bits between
+/// lanes is exactly what we mean.
+template<typename T, typename F>
+__device__ static inline T lane_apply_b32(const T &f, F &&op_b32) {
+    if constexpr (sizeof(T) == 8) {
+        int lo, hi;
+        __builtin_memcpy(&lo, (const void*)((const char*)&f),     4);
+        __builtin_memcpy(&hi, (const void*)((const char*)&f + 4), 4);
+        lo = op_b32(lo);
+        hi = op_b32(hi);
+        T r;
+        __builtin_memcpy((void*)((char*)&r),     &lo, 4);
+        __builtin_memcpy((void*)((char*)&r + 4), &hi, 4);
+        return r;
+    }
+    else {
+        static_assert(sizeof(T) == 4 || sizeof(T) == 2, "lane exchange supports 2, 4 and 8 byte values");
+        int x = 0;
+        __builtin_memcpy(&x, (const void*)&f, sizeof(T)); // 16-bit types ride in the low half
+        x = op_b32(x);
+        T r;
+        __builtin_memcpy((void*)&r, &x, sizeof(T));
+        return r;
+    }
+}
+} // namespace detail
+
+/**
+ * @brief Exchange a value with lane `laneid ^ lanemask`.
+ *
+ * Operates on raw bits, so a packed pair (bf16_2, half_2) moves as one dword
+ * rather than being unpacked to two floats the way packed_shfl has to.
+ */
+template<int lanemask, typename T>
+__device__ static inline T lane_xor(const T &f) {
+    return detail::lane_apply_b32(f, [](int v) { return detail::lane_xor_b32<lanemask>(v); });
+}
+
+/**
+ * @brief Exchange a value with lane `laneid ^ 17`.
+ *
+ * Not a power of two, so it is not a lane_xor. The accumulator layout needs it:
+ * bit 0 of an accumulator's row index is carried by the wave-half bit rather than
+ * by the element index, so the first stage of a transpose has to swap lane bit 0
+ * with lane bit 4 -- which is this exchange, applied to the lanes where those two
+ * bits disagree. See transpose() in ops/warp/register/tile/conversions.cuh.
+ */
+template<typename T>
+__device__ static inline T lane_xor17(const T &f) {
+    return detail::lane_apply_b32(f, [](int v) { return detail::lane_xor17_b32(v); });
+}
+
+/**
+ * @brief Reduce across the 16 lanes of a wave half, leaving the result in all of them.
+ *
+ * The masks stay below 16, so the two halves never mix and each ends up with its
+ * own copy -- which is what the replicated register layouts expect.
+ */
+template<typename op, typename T>
+__device__ static inline T half_wave_butterfly(T v) {
+    v = op::template op<T>(v, lane_xor<8>(v));
+    v = op::template op<T>(v, lane_xor<4>(v));
+    v = op::template op<T>(v, lane_xor<2>(v));
+    v = op::template op<T>(v, lane_xor<1>(v));
+    return v;
+}
+
 using bytes_4  = HIP_vector_type<float, 1>;
 using bytes_8  = HIP_vector_type<float, 2>;
 using bytes_16 = HIP_vector_type<float, 4>;
