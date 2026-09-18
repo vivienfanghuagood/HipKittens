@@ -28,6 +28,7 @@ the gfx12 claims were checked without a gfx12 card.
 | `red_gate.hip`, `conv_gate.hip` | Phase 5 gates: tile reductions, and the layout conversions that have to move data across the wave halves. |
 | `srsrc.hip`, `srsrc2.hip`, `srsrc3.hip` | How the gfx10+ buffer resource descriptor actually behaves. CDNA's `0x110000` config word is a gfx9 format; these sweep word 3 against in-bounds and out-of-bounds accesses and land on `0x31004000`, valid for gfx11 and gfx12 both. |
 | `wmma_peak.hip` | **The performance denominator.** Back-to-back `v_wmma_f32_16x16x16_bf16` with no memory access in the inner loop, over a sweep of independent accumulator chains. Measures 100.5 TFLOPs on a W7900D at a sampled 2.18 GHz, against a spec-sheet 122.6 that assumes 2.495 GHz boost. Flat from `ACC=2` to `ACC=16`, so it is an issue-rate ceiling, not a latency artifact. Every "% of peak" in this tree is taken against this number. |
+| `lds_peak.hip` | **The other denominator.** LDS delivered bandwidth under the exact access patterns a GEMM inner loop uses, reported in bytes/clk/CU so it can be compared directly against what a kernel's inner loop demands. Seven patterns, same instruction count each. The one that matters is `ST`, which reproduces `st<bf16,128,32>::idx()` addressing including the XOR swizzle: it measures 64.8 B/clk/CU, tied with a hand-constructed conflict-free reference and 4.1x an unswizzled tile read. That is the evidence that the rdna3 swizzle constant is right. |
 | `empty.hip` | The minimal "does the toolchain work for this target" file. |
 
 ## Do not measure against the spec sheet
@@ -60,3 +61,31 @@ operands from global memory so that dynamic `insertelement` codegen cannot
 confuse the picture either.
 
 If a probe result surprises you, suspect the probe first.
+
+## What LDS actually delivers
+
+Same instruction count in every row; `bytes/clk/CU` is the comparable column and
+`ms` is not, because `U16` moves 2 bytes per lane per instruction where the rest
+move 16.
+
+| pattern | bytes/clk/CU | what it is |
+|---|---|---|
+| `LINEAR` | 27.6 | `lane*16`, fully coalesced across 32 distinct lanes |
+| `TILE16` | 15.7 | 16 mirrored lanes at a 64 B row stride, no swizzle -- only banks 0-3 and 16-19 are ever touched, an 8-way conflict |
+| `TILE16X` | 15.6 | the same plus the *CDNA* swizzle, which flips address bit 3. A `ds_read_b128` ignores the low four address bits, so this is invisible to it and measures identical to `TILE16`, as it must |
+| `XOR4` | 37.7 | 16 B granules permuted within a 64 B row by `row&3`: four bank groups |
+| `K64` | 64.4 | the same with a 128 B row and `row&7`: eight bank groups, conflict-free by construction |
+| **`ST`** | **64.8** | **what this tree actually does.** `off ^= ((off % 1024) >> 7) << 4` over a 64 B row stride sends sixteen lanes to bank groups 0,16,4,20,8,24,12,28 and then the same eight again -- two lanes per group, the 2-cycle minimum for a 256 B request |
+| `U16` | 35.8 | one bf16 per instruction at `lane*2`, K strided 256 B apart. This is what rocBLAS/Tensile does, and it is conflict-free too |
+
+`ST` tying `K64` is the whole point of the table: the LDS reads in this tree are
+already conflict-free, and `swizzle_bytes` does not need retuning. Anything left
+on the table in the GEMM is bytes moved, not cycles lost to banking.
+
+Read the demand side like this. One HipKittens inner-loop iteration is 24
+`ds_read_b128` and 16 WMMAs per wave. The WMMAs are 16 x 8192 FLOP, which at
+512 FLOP/clk/CU is 256 CU-cycles, and a CU retires two wave-iterations in that
+window, so the LDS has to supply `2 * 24 * 32 * 16 / 512` = **48 bytes/clk/CU**
+against a 64.8 ceiling: 74% utilised. rocBLAS's 64x64 warp tile asks for 32 B/clk
+for the same 16 WMMAs. That 1.5x is not a banking problem and no swizzle fixes
+it; it is `(M*N)/(M+N)` for a 32x64 tile versus a 64x64 one, exactly 21.3 vs 32.
