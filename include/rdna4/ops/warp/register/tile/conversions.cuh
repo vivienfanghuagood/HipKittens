@@ -471,16 +471,16 @@ __device__ static inline void map_by_coord(RT &dst, const RT &src, F &&f) {
     for(int i = 0; i < RT::height; i++) {
         #pragma unroll
         for(int j = 0; j < RT::width; j++) {
+            // dtype packs 4 elements for fp8 and 2 for everything else, so
+            // index the unpacked type rather than through .x/.y.
+            const T* in  = reinterpret_cast<const T*>(&src.tiles[i][j].data[0]);
+            T*       out = reinterpret_cast<T*>(&dst.tiles[i][j].data[0]);
             #pragma unroll
             for(int e = 0; e < base::elements_per_thread; e++) {
                 const int2 c   = rt_base_coord<T, L>(e, lane);
                 const int  row = i * base::tile_size_row + c.x;
                 const int  col = j * base::tile_size_col + c.y;
-                const T    val = (e & 1) ? src.tiles[i][j].data[e>>1].y
-                                         : src.tiles[i][j].data[e>>1].x;
-                const T    out = f(row, col, val);
-                if(e & 1) dst.tiles[i][j].data[e>>1].y = out;
-                else      dst.tiles[i][j].data[e>>1].x = out;
+                out[e] = f(row, col, in[e]);
             }
         }
     }

@@ -59,3 +59,15 @@ move:
    instead of 48, which is one step, 10 to 9. The reasoning is written out at
    the `dot_tile` lambda in `gemm.cpp`. This is the single most likely place for
    RDNA4 to beat a straight port.
+
+Not on that list, and worth being explicit about: **fp8 will not make this
+kernel faster.** `include/rdna4` exposes fp8 operand tiles and all four gfx12
+fp8 WMMA opcodes, but the shape is 16x16x16 — the same as bf16, unlike CDNA
+where the fp8 MFMA doubles K. One WMMA is one WMMA, so the math rate is
+identical and the only wins are 12 VGPRs per operand tile instead of 24 and half
+the LDS bytes. That can buy an occupancy step or a bigger block, which is a real
+effect, but it is a second-order one; do not expect the 2x a CDNA fp8 kernel
+gets. And the LDS read does not halve either: the 16-byte swizzle granule is
+tuned for a `ds_load_b128`, and fp8's `ds_load_b64` reaches the same 4-cycle
+floor for half the data. The derivation is at the top of
+`include/rdna4/ops/warp/memory/tile/shared_to_register.cuh`.

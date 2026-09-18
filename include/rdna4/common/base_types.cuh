@@ -35,18 +35,49 @@ using bf16_2 = __hip_bfloat162;
  * @brief Packed word of two half-precision floating-point values.
  */
 using half_2 = __half2;
-/**
- * @brief float8 floating-point type.
+/*
+ * fp8 on gfx12 is OCP, not fnuz -- and this is not a style preference, it is
+ * the only spelling that compiles.  HIP gates the two encodings by target
+ * (amd_hip_fp8.h:41): gfx942 sets HIP_FP8_TYPE_FNUZ and clears
+ * HIP_FP8_TYPE_OCP, gfx1200/gfx1201/gfx950 do the reverse.  On gfx1201 the
+ * fnuz types are still *declared* -- so `using fp8e4m3 = __hip_fp8_e4m3_fnuz`
+ * inherited from the CDNA tree compiles for as long as nothing instantiates it
+ * -- but they have no __device__ constructor from float, so the first convertor
+ * that touches one fails.  Which is exactly why the inherited typedef survived
+ * unnoticed until fp8 was wired up.
+ *
+ * The difference is not only in the name.  fnuz has no infinities and one NaN
+ * (0x80, negative zero's slot); OCP e4m3 has no infinities either but reserves
+ * 0x7F/0xFF for NaN, and OCP e5m2 does have infinities.  The exponent bias
+ * differs too, fnuz e4m3 being 8 against OCP's 7, so the same byte means a
+ * different number.  Anything crossing between a gfx942 kernel and a gfx12 one
+ * has to convert, not reinterpret.
  */
-using fp8e4m3 = __hip_fp8_e4m3_fnuz;
+
 /**
- * @brief Packed word of two float8 floating-point values.
+ * @brief float8 E4M3 (OCP) floating-point type.
  */
-using fp8e4m3_2 = __hip_fp8x2_e4m3_fnuz;
+using fp8e4m3 = __hip_fp8_e4m3;
 /**
- * @brief Packed word of four float8 floating-point values.
+ * @brief Packed word of two E4M3 values.
  */
-using fp8e4m3_4 = __hip_fp8x4_e4m3_fnuz;
+using fp8e4m3_2 = __hip_fp8x2_e4m3;
+/**
+ * @brief Packed word of four E4M3 values.
+ */
+using fp8e4m3_4 = __hip_fp8x4_e4m3;
+/**
+ * @brief float8 E5M2 (OCP) floating-point type, AMD's "bf8".
+ */
+using fp8e5m2 = __hip_fp8_e5m2;
+/**
+ * @brief Packed word of two E5M2 values.
+ */
+using fp8e5m2_2 = __hip_fp8x2_e5m2;
+/**
+ * @brief Packed word of four E5M2 values.
+ */
+using fp8e5m2_4 = __hip_fp8x4_e5m2;
 
 namespace ducks {
 /**
@@ -57,9 +88,13 @@ namespace ducks {
 namespace base_types {
 
 template<typename T>
-concept T2 = std::is_same_v<T, float2> || std::is_same_v<T, bf16_2> || std::is_same_v<T, half_2> || std::is_same_v<T, fp8e4m3_4>;
+concept T2 = std::is_same_v<T, float2> || std::is_same_v<T, bf16_2> || std::is_same_v<T, half_2> || std::is_same_v<T, fp8e4m3_4> || std::is_same_v<T, fp8e5m2_4>;
 template<typename T>
-concept T1 = std::is_same_v<T, float>  || std::is_same_v<T, bf16  > || std::is_same_v<T, half> || std::is_same_v<T, fp8e4m3>;
+concept T1 = std::is_same_v<T, float>  || std::is_same_v<T, bf16  > || std::is_same_v<T, half> || std::is_same_v<T, fp8e4m3> || std::is_same_v<T, fp8e5m2>;
+
+/// The two 8-bit operand formats gfx12 WMMA accepts, in either A or B position.
+template<typename T>
+concept fp8 = std::is_same_v<T, fp8e4m3> || std::is_same_v<T, fp8e5m2>;
 
 } // namespace base_types
 } // namespace ducks
@@ -128,9 +163,15 @@ template<> struct constants<half_2> {
     static __device__ inline constexpr half_2 pos_infty() { return std::bit_cast<half_2>(uint32_t(0x7C007C00)); }
     static __device__ inline constexpr half_2 neg_infty() { return std::bit_cast<half_2>(uint32_t(0xFC00FC00)); }
 };
+// OCP e4m3 has no infinities -- the largest finite value is 0x7E (448) and
+// 0x7F/0xFF are NaN -- so pos_infty()/neg_infty() are deliberately absent
+// rather than approximated. A specialization replaces the primary template
+// whole, so asking for either is a compile error, which is the right answer:
+// fp8 is an operand format here, and a reduction that needs an identity should
+// be running on the f32 accumulator.
 template<> struct constants<fp8e4m3> {
     static __device__ inline constexpr fp8e4m3 zero() { return std::bit_cast<fp8e4m3>(uint8_t(0x00)); }
-    static __device__ inline constexpr fp8e4m3 one() { return std::bit_cast<fp8e4m3>(uint8_t(0x38)); }
+    static __device__ inline constexpr fp8e4m3 one() { return std::bit_cast<fp8e4m3>(uint8_t(0x38)); } // 0_0111_000, bias 7
 };
 template<> struct constants<fp8e4m3_2> {
     static __device__ inline constexpr fp8e4m3_2 zero() { return std::bit_cast<fp8e4m3_2>(uint16_t(0x0000)); }
@@ -139,6 +180,25 @@ template<> struct constants<fp8e4m3_2> {
 template<> struct constants<fp8e4m3_4> {
     static __device__ inline constexpr fp8e4m3_4 zero() { return std::bit_cast<fp8e4m3_4>(uint32_t(0x00000000)); }
     static __device__ inline constexpr fp8e4m3_4 one() { return std::bit_cast<fp8e4m3_4>(uint32_t(0x38383838)); }
+};
+// e5m2 does have infinities (0x7C / 0xFC), so unlike e4m3 it can supply them.
+template<> struct constants<fp8e5m2> {
+    static __device__ inline constexpr fp8e5m2 zero()      { return std::bit_cast<fp8e5m2>(uint8_t(0x00)); }
+    static __device__ inline constexpr fp8e5m2 one()       { return std::bit_cast<fp8e5m2>(uint8_t(0x3C)); } // 0_01111_00, bias 15
+    static __device__ inline constexpr fp8e5m2 pos_infty() { return std::bit_cast<fp8e5m2>(uint8_t(0x7C)); }
+    static __device__ inline constexpr fp8e5m2 neg_infty() { return std::bit_cast<fp8e5m2>(uint8_t(0xFC)); }
+};
+template<> struct constants<fp8e5m2_2> {
+    static __device__ inline constexpr fp8e5m2_2 zero()      { return std::bit_cast<fp8e5m2_2>(uint16_t(0x0000)); }
+    static __device__ inline constexpr fp8e5m2_2 one()       { return std::bit_cast<fp8e5m2_2>(uint16_t(0x3C3C)); }
+    static __device__ inline constexpr fp8e5m2_2 pos_infty() { return std::bit_cast<fp8e5m2_2>(uint16_t(0x7C7C)); }
+    static __device__ inline constexpr fp8e5m2_2 neg_infty() { return std::bit_cast<fp8e5m2_2>(uint16_t(0xFCFC)); }
+};
+template<> struct constants<fp8e5m2_4> {
+    static __device__ inline constexpr fp8e5m2_4 zero()      { return std::bit_cast<fp8e5m2_4>(uint32_t(0x00000000)); }
+    static __device__ inline constexpr fp8e5m2_4 one()       { return std::bit_cast<fp8e5m2_4>(uint32_t(0x3C3C3C3C)); }
+    static __device__ inline constexpr fp8e5m2_4 pos_infty() { return std::bit_cast<fp8e5m2_4>(uint32_t(0x7C7C7C7C)); }
+    static __device__ inline constexpr fp8e5m2_4 neg_infty() { return std::bit_cast<fp8e5m2_4>(uint32_t(0xFCFCFCFC)); }
 };
 template<> struct constants<int> {
     static __device__ inline constexpr int zero()      { return 0; }
@@ -232,6 +292,16 @@ template<> struct packing<fp8e4m3_4> {
     static __device__ inline constexpr int num() { return 4; }
     using unpacked_type = fp8e4m3;
     using packed_type = fp8e4m3_4;
+};
+template<> struct packing<fp8e5m2> {
+    static __device__ inline constexpr int num() { return 1; }
+    using unpacked_type = fp8e5m2;
+    using packed_type = fp8e5m2_4;
+};
+template<> struct packing<fp8e5m2_4> {
+    static __device__ inline constexpr int num() { return 4; }
+    using unpacked_type = fp8e5m2;
+    using packed_type = fp8e5m2_4;
 };
 
 /**
@@ -378,6 +448,41 @@ template<> struct convertor<fp8e4m3, float> {
 };
 template<> struct convertor<float, fp8e4m3> {
     static __host__ __device__ inline float convert(const fp8e4m3 & u) {
+        return float(u);
+    }
+};
+// Same six for e5m2. On gfx1200/gfx1201 HIP_FP8_CVT_FAST_PATH is set
+// (amd_hip_fp8.h:33), so these lower to v_cvt_pk_fp8_f32 / v_cvt_pk_f32_fp8
+// rather than the software fallback the host path uses.
+template<> struct convertor<fp8e5m2_4, float4> {
+    static __host__ __device__ inline fp8e5m2_4 convert(const float4& u) {
+        return fp8e5m2_4(u);
+    }
+};
+template<> struct convertor<float4, fp8e5m2_4> {
+    static __host__ __device__ inline float4 convert(const fp8e5m2_4& u) {
+        fp8e5m2 *vals = reinterpret_cast<fp8e5m2*>(const_cast<fp8e5m2_4*>(&u));
+        return make_float4(float(vals[0]), float(vals[1]), float(vals[2]), float(vals[3]));
+    }
+};
+template<> struct convertor<fp8e5m2_2, float2> {
+    static __host__ __device__ inline fp8e5m2_2 convert(const float2& u) {
+        return fp8e5m2_2(u);
+    }
+};
+template<> struct convertor<float2, fp8e5m2_2> {
+    static __host__ __device__ inline float2 convert(const fp8e5m2_2& u) {
+        fp8e5m2 *vals = reinterpret_cast<fp8e5m2*>(const_cast<fp8e5m2_2*>(&u));
+        return make_float2(float(vals[0]), float(vals[1]));
+    }
+};
+template<> struct convertor<fp8e5m2, float> {
+    static __host__ __device__ inline fp8e5m2 convert(const float & u) {
+        return fp8e5m2(u);
+    }
+};
+template<> struct convertor<float, fp8e5m2> {
+    static __host__ __device__ inline float convert(const fp8e5m2 & u) {
         return float(u);
     }
 };

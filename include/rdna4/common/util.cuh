@@ -39,9 +39,10 @@ template<all_layouts layout>
 constexpr bool is_col_lt = std::is_same_v<layout, ducks::rt_layout::col> || std::is_same_v<layout, ducks::st_layout::col>;
 
 // Like RDNA3, RDNA4 has exactly one matrix shape -- 16x16x16 WMMA -- for every
-// supported type.  gfx12 does add fp8 WMMA, but at the same 16x16x16 shape
-// rather than CDNA's 32-wide fp8 variant, so there is still nothing to
-// special-case here.
+// supported type.  gfx12 does add fp8 WMMA (wired up in
+// ops/warp/register/tile/mma.cuh), but at the same 16x16x16 shape rather than
+// CDNA's 32-wide fp8 variant, so unlike the CDNA trees there is nothing to
+// special-case here: fp8 is the bf16 fragment with narrower elements.
 template<typename T, all_layouts layout=ducks::st_layout::row>
 constexpr int TILE_ROW_DIM = 16;
 

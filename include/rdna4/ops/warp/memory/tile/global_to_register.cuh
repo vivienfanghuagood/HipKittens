@@ -51,26 +51,28 @@ __device__ inline static void load(RT &dst, const GL &src, const COORD &idx) {
     constexpr bool is_row = std::is_same_v<L, ducks::rt_layout::row>;
     constexpr int  E      = base::elements_per_thread;
     constexpr bool vectorizable = is_row && base::element_stride == 1
-                                         && std::is_same_v<T, U> && sizeof(U) == 2;
+                                         && std::is_same_v<T, U> && (sizeof(U) == 2 || sizeof(U) == 1);
+    /// A lane's whole fragment in one access: 16 bytes for a 2-byte type, 8 for fp8.
+    constexpr int  vec_bytes = E * sizeof(U);
 
     const U *src_ptr = (const U*)&src[(idx.template unit_coord<axis, 3>())];
     const int row_stride = src.template stride<axis>();
     const int lane = laneid();
-    const int l16  = lane & 15;
 
-    // 16-byte alignment of every row this warp will touch. Uniform across the
-    // warp, so the branch below is a scalar branch, not divergence.
+    // Alignment of every row this warp will touch. Uniform across the warp, so
+    // the branch below is a scalar branch, not divergence.
     const bool wide = vectorizable &&
-        ((reinterpret_cast<uintptr_t>(src_ptr) | (row_stride * sizeof(U))) & 15) == 0;
+        ((reinterpret_cast<uintptr_t>(src_ptr) | (row_stride * sizeof(U))) & (vec_bytes - 1)) == 0;
 
     auto elementwise = [&](int i, int j, int row_base, int col_base) {
+        // dtype packs 4 elements for fp8 and 2 otherwise, so index the unpacked
+        // type rather than through .x/.y.
+        T* elems = reinterpret_cast<T*>(&dst.tiles[i][j].data[0]);
         #pragma unroll
         for(int e = 0; e < E; e++) {
             const int2 c = rt_base_coord<T, L>(e, lane);
-            const T val = base_types::convertor<T, U>::convert(
+            elems[e] = base_types::convertor<T, U>::convert(
                 src_ptr[(row_base + c.x)*row_stride + col_base + c.y]);
-            if (e & 1) dst.tiles[i][j].data[e>>1].y = val;
-            else       dst.tiles[i][j].data[e>>1].x = val;
         }
     };
 
@@ -82,12 +84,15 @@ __device__ inline static void load(RT &dst, const GL &src, const COORD &idx) {
             const int col_base = j*dst.tile_size_col;
             if constexpr (vectorizable) {
                 if (wide) {
-                    const U *p = &src_ptr[(row_base + l16)*row_stride + col_base];
-                    #pragma unroll
-                    for(int h = 0; h < 2; h++) {
-                        const float4 v = *reinterpret_cast<const float4*>(p + 8*h);
-                        __builtin_memcpy((void*)&dst.tiles[i][j].data[4*h], &v, sizeof(v));
-                    }
+                    // One access, not two. The RDNA3 version of this loop ran
+                    // h over 0..1 and wrote data[0] and data[4], because there
+                    // a lane held all 16 of k in eight packed words; on gfx12
+                    // the halves split k, so a lane holds 8 elements in four
+                    // words (two for fp8) and its run starts at the column
+                    // rt_base_coord reports rather than at col_base.
+                    const int2 c0 = rt_base_coord<T, L>(0, lane);
+                    const U *p = &src_ptr[(row_base + c0.x)*row_stride + col_base + c0.y];
+                    __builtin_memcpy((void*)&dst.tiles[i][j].data[0], p, vec_bytes);
                 }
                 else elementwise(i, j, row_base, col_base);
             }
@@ -121,27 +126,27 @@ __device__ inline static void store(const GL &dst, const RT &src, const COORD &i
     constexpr bool is_row = std::is_same_v<L, ducks::rt_layout::row>;
     constexpr int  E      = base::elements_per_thread;
     constexpr bool vectorizable = is_row && base::element_stride == 1
-                                         && std::is_same_v<T, U> && sizeof(U) == 2;
+                                         && std::is_same_v<T, U> && (sizeof(U) == 2 || sizeof(U) == 1);
+    constexpr int  vec_bytes = E * sizeof(U);
 
     U *dst_ptr = (U*)&dst[(idx.template unit_coord<axis, 3>())];
     const int row_stride = dst.template stride<axis>();
     const int lane = laneid();
-    const int l16  = lane & 15;
 
     const bool wide = vectorizable &&
-        ((reinterpret_cast<uintptr_t>(dst_ptr) | (row_stride * sizeof(U))) & 15) == 0;
+        ((reinterpret_cast<uintptr_t>(dst_ptr) | (row_stride * sizeof(U))) & (vec_bytes - 1)) == 0;
 
-    // Lanes l and l+16 of an operand tile write the same bytes with the same
-    // values. That redundancy is exactly the WMMA mirroring invariant, so the
-    // write is benign whichever lane lands last.
+    // On gfx11 lanes l and l+16 of an operand tile wrote the same bytes with the
+    // same values, and the store relied on that mirroring being benign. gfx12
+    // has no mirroring: the halves hold disjoint k, so the 32 lanes partition
+    // the tile and every byte is written exactly once.
     auto elementwise = [&](int i, int j, int row_base, int col_base) {
+        const T* elems = reinterpret_cast<const T*>(&src.tiles[i][j].data[0]);
         #pragma unroll
         for(int e = 0; e < E; e++) {
             const int2 c = rt_base_coord<T, L>(e, lane);
-            const T val = (e & 1) ? src.tiles[i][j].data[e>>1].y
-                                  : src.tiles[i][j].data[e>>1].x;
             dst_ptr[(row_base + c.x)*row_stride + col_base + c.y] =
-                base_types::convertor<U, T>::convert(val);
+                base_types::convertor<U, T>::convert(elems[e]);
         }
     };
 
@@ -153,13 +158,11 @@ __device__ inline static void store(const GL &dst, const RT &src, const COORD &i
             const int col_base = j*src.tile_size_col;
             if constexpr (vectorizable) {
                 if (wide) {
-                    U *p = &dst_ptr[(row_base + l16)*row_stride + col_base];
-                    #pragma unroll
-                    for(int h = 0; h < 2; h++) {
-                        float4 v;
-                        __builtin_memcpy(&v, (const void*)&src.tiles[i][j].data[4*h], sizeof(v));
-                        *reinterpret_cast<float4*>(p + 8*h) = v;
-                    }
+                    // See the matching note in load(): one access at the lane's
+                    // own column, not two at col_base.
+                    const int2 c0 = rt_base_coord<T, L>(0, lane);
+                    U *p = &dst_ptr[(row_base + c0.x)*row_stride + col_base + c0.y];
+                    __builtin_memcpy((void*)p, (const void*)&src.tiles[i][j].data[0], vec_bytes);
                 }
                 else elementwise(i, j, row_base, col_base);
             }

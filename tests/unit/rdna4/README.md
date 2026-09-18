@@ -18,7 +18,11 @@ What that does and does not buy you:
   `v_wmma_f32_16x16x16_bf16`. The 64 KB per-workgroup LDS ceiling was confirmed
   by compiling a 65540-byte `__shared__` array and reading the error. The gfx12
   split wait counters (`s_wait_dscnt` / `s_wait_loadcnt` / `s_wait_storecnt`)
-  are what the tree emits, checked against the disassembly.
+  are what the tree emits, checked against the disassembly. All four fp8 WMMA
+  opcodes are reachable from the tile API and all four appear in this tree's
+  object code (`v_wmma_f32_16x16x16_{fp8_fp8,fp8_bf8,bf8_fp8,bf8_bf8}`), and the
+  fp8 LDS path emits `ds_load_b64` / `ds_store_b64` rather than the `b128` the
+  2-byte types get.
 - **Not verified.** Every claim about *where a value physically lives*. The
   operand fragment layout — that lane `l` holds `k = 8*(l/16) .. +7` of row
   `l%16` — is inferred from the builtin's `v8` operand width plus the shape of
@@ -33,6 +37,16 @@ to fail together if it is — they all derive from `rt_base_coord()`.
 Before trusting a fix, re-run the layout probe rather than guessing: the
 `PROBE_GFX12_W32` variant of `hk-rdna/probe/wmma_layout.hip` measures the
 fragment directly, the same way the gfx1100 layout was established.
+
+One thing you will notice in a disassembly and should not chase: the test bodies
+call `__builtin_amdgcn_s_waitcnt(0)`, which is the combined gfx11-style wait, so
+this binary contains a few hundred `s_waitcnt vmcnt(0) expcnt(0) lgkmcnt(0)`.
+That is not a leftover that will fault. GFX12 keeps the combined encoding
+(`BF89`) alongside the split counters and the assembler accepts it for gfx1201
+while rejecting genuinely gfx11-only forms like `s_waitcnt_vscnt` — checked both
+ways. LLVM's own codegen never emits it, and it is redundant next to the
+`s_wait_loadcnt` the compiler inserts anyway, but it is legal and harmless.
+`include/rdna4` itself contains none of them.
 
 ## Requirements
 
@@ -58,12 +72,17 @@ create first.
 
 ## How this tree differs from `tests/unit/rdna3`
 
-The test *sources* are nearly identical — this tree was forked from the RDNA3
-one and the arch difference lives entirely in `include/rdna4`. The Makefile's
-`GPU_TARGET` is the only edit. That is deliberate: the tests are written against
-the tile API, so if the RDNA4 fragment inference is right, the same tests pass
-unchanged, and if it is wrong, the diff between the two trees is not where you
-should be looking.
+The test *sources* are identical — `diff -r` the two trees and only this file
+and the Makefile come back. The arch difference lives entirely in
+`include/rdna4`, and the Makefile's `GPU_TARGET` is the only functional edit.
+That is deliberate: the tests are written against the tile API, so if the RDNA4
+fragment inference is right the same tests pass unchanged, and if it is wrong,
+the diff between the two trees is not where you should be looking.
+
+The one thing genuinely specific to gfx12 — the fp8 section of
+`warp/register/tile/mma.cu` — is behind `#ifdef KITTENS_RDNA4` and sits in both
+trees rather than only this one, which is what keeps that property true. Keep it
+that way if you add more.
 
 The library differences that these tests actually exercise:
 
@@ -81,6 +100,12 @@ everything. On gfx12 neither half holds everything, so *both* directions cross
 the wave halves, at 8 `permlanex16` each. `include/rdna4/ops/warp/register/tile/
 conversions.cuh` opens with the derivation; read it before touching
 `test_copy` or the `rv_layout::align` vector tests.
+
+**The mma tests count.** `mma_wrapper_2d` in `warp/register/tile/mma.cu` has its
+own copy of the harness wrapper, and the cdna4 original it was forked from sets
+`this_result` and then never pushes it, so an mma failure prints but is missing
+from the tally. Both RDNA trees push it. On a tree that has never run, the tally
+is the whole report.
 
 **Reductions along the element axis always exchange.** Same cause: on gfx11 the
 operand case was free. Here it is not, so `halves_interleave` is true for every
@@ -104,8 +129,26 @@ sweeps *shapes*, often with both layouts the same. Here the only thing
 `swap_layout` can change is the layout, and the destination layout is pinned to
 `transpose<L>`, so `test_swap_layout` sweeps row→col and col→row instead.
 
-**No fp8.** gfx12 does have `wmma_f32_16x16x16_fp8_fp8_w32_gfx12`, unlike gfx11,
-but `include/rdna4` does not expose fp8 tiles, so there is nothing to test yet.
+**fp8 exists here and does not exist there.** gfx12 has four fp8 WMMA opcodes
+that gfx11 has none of, so `include/rdna4` grows `rt_fp8e4m3` / `rt_fp8e5m2` and
+their shared counterparts, and `warp/register/tile/mma.cu` ends with a section
+testing them. It is behind `#ifdef KITTENS_RDNA4` and is byte-identical in
+`tests/unit/rdna3`, where it compiles away -- see the note on the fork below.
+
+Two things about that section are worth knowing before you extend it. It is
+hand-rolled rather than run through the sweep harness, because the harness types
+the input buffer, the output buffer and the reference off a single type and here
+A, B and C are three different ones. And it instantiates the full (e4m3, e5m2) x
+(e4m3, e5m2) cross product on purpose: A's and B's encodings are independent,
+there is no operand-select bit, so the four opcodes are four separate builtins
+and the only way to know the dispatch reaches all of them is to ask for all of
+them.
+
+What it does *not* cover: fp8 as anything but a WMMA operand. `include/rdna4`
+deliberately has no elementwise maps, reductions or vector ops on fp8 register
+tiles, and `constants<fp8e4m3>` deliberately has no infinity, so a reduction
+over an fp8 tile is a compile error rather than a silently wrong answer. If you
+want fp8 arithmetic, convert to `float` first; that path is tested.
 
 ## Adding a test
 

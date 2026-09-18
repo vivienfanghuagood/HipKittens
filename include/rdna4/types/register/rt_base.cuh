@@ -43,13 +43,19 @@ struct identifier {};
  *
  * In general, you probably want a row-major tile, unless you specifically want to call mma
  *
- * The four shapes that occur on gfx1200/gfx1201, with `l` the lane id and `e`
- * the element index within a lane (data[] is these packed in pairs):
+ * The shapes that occur on gfx1200/gfx1201, with `l` the lane id and `e` the
+ * element index within a lane (data[] is these packed two at a time for the
+ * 2- and 4-byte types, four at a time for fp8):
  *
  *   rt_base<bf16|half, row>  A operand   e -> (row l%16, col 8*(l/16) + e), e in 0..7
  *   rt_base<bf16|half, col>  B operand   e -> (row 8*(l/16) + e, col l%16), e in 0..7
+ *   rt_base<fp8e4m3|fp8e5m2, row|col>    same as the 2-byte operands
  *   rt_base<float, col>      accumulator e -> (row 2e + l/16, col l%16),    e in 0..7
  *   rt_base<float, row>      transposed  e -> (row l%16, col 2e + l/16),    e in 0..7
+ *
+ * fp8 shares the operand mapping exactly -- gfx12's fp8 WMMA is the same
+ * 16x16x16 shape as its bf16 one, not CDNA's K=32 variant, so the only thing
+ * that changes is that the lane's 8 elements are 8 bytes instead of 16.
  *
  * The convention matches CDNA's: `row` means the lane picks the row and the
  * elements run along the columns, `col` is the transpose.  Every shape here is
@@ -69,7 +75,8 @@ template<typename _T, ducks::rt_layout::all _layout> struct rt_base {
     using dtype = T2; ///< Data type of the matrix elements
 
     static_assert(
-        std::is_same_v<dtype, bf16_2> || std::is_same_v<dtype, float2> || std::is_same_v<dtype, half_2>,
+        std::is_same_v<dtype, bf16_2> || std::is_same_v<dtype, float2> || std::is_same_v<dtype, half_2>
+        || std::is_same_v<dtype, fp8e4m3_4> || std::is_same_v<dtype, fp8e5m2_4>,
         "rt_base was provided an unsupported type."
     );
 
@@ -87,11 +94,14 @@ template<typename _T, ducks::rt_layout::all _layout> struct rt_base {
     static constexpr int registers_per_thread = packed_per_thread * sizeof(dtype) / 4; // registers are 32-bit words
 
     // 8 elements per lane whatever the type, so the VGPR cost follows the width:
-    // 4 for a 2-byte operand, 8 for the f32 accumulator. This is the RDNA3 tree's
-    // static_assert(== 8) relaxed -- there, operand mirroring made every type
-    // cost 8, and here it is the halved operand that is the whole point.
+    // 2 for an fp8 operand, 4 for a 2-byte one, 8 for the f32 accumulator. This
+    // is the RDNA3 tree's static_assert(== 8) relaxed -- there, operand
+    // mirroring made every type cost 8, and here it is the halved operand that
+    // is the whole point. The three widths are exactly the three builtin
+    // operand types: v2i, v8f16/v8bf16, v8f32.
     static_assert(elements_per_thread == 8, "unexpected gfx12 WMMA fragment size");
-    static_assert(registers_per_thread == (std::is_same_v<T, float> ? 8 : 4),
+    static_assert(registers_per_thread == (std::is_same_v<T, float> ? 8
+                                          : ducks::base_types::fp8<T> ? 2 : 4),
                   "unexpected gfx12 WMMA fragment width");
 
     /// Distance along the element axis between element `e` and element `e+1` of
@@ -185,4 +195,6 @@ template<typename T> concept all = requires {
 template<ducks::rt_layout::all L=ducks::rt_layout::row> using rt_base_fl = rt_base<float, L>;
 template<ducks::rt_layout::all L=ducks::rt_layout::row> using rt_base_bf = rt_base<bf16, L>;
 template<ducks::rt_layout::all L=ducks::rt_layout::row> using rt_base_hf = rt_base<half, L>;
+template<ducks::rt_layout::all L=ducks::rt_layout::row> using rt_base_fp8e4m3 = rt_base<fp8e4m3, L>;
+template<ducks::rt_layout::all L=ducks::rt_layout::row> using rt_base_fp8e5m2 = rt_base<fp8e5m2, L>;
 }

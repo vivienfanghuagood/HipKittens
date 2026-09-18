@@ -19,14 +19,17 @@ namespace kittens {
  * base tile (i,j), lane l and h = l/16:
  *
  *   row layout, bf16/half operand : row l%16, cols 8h..8h+7        (16 B contiguous)
- *   col layout, bf16/half operand : col l%16, rows 8h..8h+7        (8 strided elements)
+ *   row layout, fp8 operand       : row l%16, cols 8h..8h+7        ( 8 B contiguous)
+ *   col layout, any operand       : col l%16, rows 8h..8h+7        (8 strided elements)
  *   col layout, f32 accumulator   : col l%16, rows {2e + h}        (8 strided elements)
  *   row layout, f32 accumulator   : row l%16, cols {2e + h}        (8 strided elements)
  *
- * Only the first is a vectorizable access, and only when the shared tile holds
- * the same 2-byte type.  That case is the A operand of a GEMM and is worth a
- * fast path; the rest fall back to elementwise accesses, which is what the CDNA
- * tree already does for its column-major path.
+ * Only the row-layout operands are vectorizable accesses, and only when the
+ * shared tile holds the same type.  That case is the A operand of a GEMM and is
+ * worth a fast path; the rest fall back to elementwise accesses, which is what
+ * the CDNA tree already does for its column-major path.  The fast path is one
+ * ds_load_b128 for a 2-byte operand and one ds_load_b64 for fp8 -- same eight
+ * elements, half the bytes.
  *
  * The difference from RDNA3 is that the fast path is ONE ds_load_b128, not two.
  * There a lane held all 16 of k and the two wave halves were mirrors, so 32
@@ -46,10 +49,20 @@ namespace kittens {
  * 8 granule positions comes up exactly 4 times, at 4 distinct 128-byte blocks:
  * 4 cycles, which is the floor set by the 512 bytes moved.  !! Hand-derived,
  * not measured -- no gfx12 part has run this. !!
+ *
+ * fp8 halves every byte count in that derivation: 32 x 8 B = 256 B, and with
+ * swizzle_bytes 128 the granule index becomes (cb/8 + h)/2, so pairs of lanes
+ * share a 16-byte granule and the 32 lanes cover 16 granules over 4 blocks.
+ * Still 4 cycles, now for half the data -- the swizzle is tuned for the 16-byte
+ * access and an 8-byte one cannot do better than break even against it.  Not a
+ * reason to avoid fp8; a reason not to expect the LDS read to get twice as fast.
  */
 
 /**
- * @brief Whether load()/store() for this pair take the vectorized ds_load_b128 path.
+ * @brief Whether load()/store() for this pair take the vectorized LDS path.
+ *
+ * ds_load_b128 for a 2-byte element type, ds_load_b64 for fp8: a lane always
+ * holds 8 elements, so the access width follows sizeof directly.
  */
 template<ducks::rt::all RT, ducks::st::all ST>
 static constexpr bool lds_vectorizable =
@@ -58,7 +71,7 @@ static constexpr bool lds_vectorizable =
                typename RT::layout>::element_stride == 1
     && std::is_same_v<typename base_types::packing<typename RT::dtype>::unpacked_type,
                       typename ST::dtype>
-    && sizeof(typename ST::dtype) == 2;
+    && (sizeof(typename ST::dtype) == 2 || sizeof(typename ST::dtype) == 1);
 
 /**
  * @brief How many LDS instructions load()/load_async() issues for this pair.
@@ -103,9 +116,11 @@ __device__ inline static void load(RT &dst, const ST &src) {
     constexpr bool is_row = std::is_same_v<L, ducks::rt_layout::row>;
     constexpr int  E      = base::elements_per_thread;
 
-    // A lane's half-row of k, same width in LDS as in registers: 1x ds_load_b128.
+    // A lane's half-row of k, same width in LDS as in registers: one ds_load of
+    // E*sizeof(U) bytes, which is 16 for a 2-byte type and 8 for fp8.
     constexpr bool vectorizable = is_row && base::element_stride == 1
-                                         && std::is_same_v<T, U> && sizeof(U) == 2;
+                                         && std::is_same_v<T, U> && (sizeof(U) == 2 || sizeof(U) == 1);
+    constexpr int  vec_bytes    = E * sizeof(U);
 
     const int lane = laneid();
     const uint32_t src_ptr = (uint32_t)(uintptr_t)&src.data[0];
@@ -119,24 +134,33 @@ __device__ inline static void load(RT &dst, const ST &src) {
             if constexpr (vectorizable) {
                 // Element 0's coordinate is the start of the lane's run, so ask
                 // rt_base_coord for it rather than restating the half-split.
-                // The 16-byte alignment this requires holds: tiles are
+                // The alignment this requires holds at both widths: tiles are
                 // KITTENS_DEFAULT_ALIGN'd, the byte offset of an 8-element
-                // column boundary is a multiple of 16, and the swizzle only
-                // moves bits 4-6.  The register side goes through memcpy
-                // because `data` is only 4-byte aligned as an array.
+                // column boundary is a multiple of vec_bytes, and the swizzle
+                // only moves bits 4-6, so it never splits a run that started
+                // inside a 16-byte granule.  The register side goes through
+                // memcpy because `data` is only 4-byte aligned as an array.
                 const int2 c0 = rt_base_coord<T, L>(0, lane);
                 const uint32_t p = src.idx(src_ptr, {row_base + c0.x, col_base + c0.y});
-                const float4 v = load_shared_vec4_async(p);
-                __builtin_memcpy((void*)&dst.tiles[i][j].data[0], &v, sizeof(v));
+                if constexpr (vec_bytes == 16) {
+                    const float4 v = load_shared_vec4_async(p);
+                    __builtin_memcpy((void*)&dst.tiles[i][j].data[0], &v, sizeof(v));
+                } else {
+                    const float2 v = load_shared_vec_async(p);
+                    __builtin_memcpy((void*)&dst.tiles[i][j].data[0], &v, sizeof(v));
+                }
             }
             else {
+                // `data` is dtype[], and dtype packs 2 elements for bf16/half/
+                // float but 4 for fp8, so index the unpacked type directly
+                // rather than through .x/.y. Same bytes either way -- the
+                // vectorized path above already memcpys over the whole array.
+                T* elems = reinterpret_cast<T*>(&dst.tiles[i][j].data[0]);
                 #pragma unroll
                 for(int e = 0; e < E; e++) {
                     const int2 c = rt_base_coord<T, L>(e, lane);
-                    const T val = base_types::convertor<T, U>::convert(
+                    elems[e] = base_types::convertor<T, U>::convert(
                         src[{row_base + c.x, col_base + c.y}]);
-                    if (e & 1) dst.tiles[i][j].data[e>>1].y = val;
-                    else       dst.tiles[i][j].data[e>>1].x = val;
                 }
             }
         }
@@ -179,7 +203,8 @@ __device__ inline static void store(ST &dst, const RT &src) {
     constexpr int  E      = base::elements_per_thread;
 
     constexpr bool vectorizable = is_row && base::element_stride == 1
-                                         && std::is_same_v<T, U> && sizeof(U) == 2;
+                                         && std::is_same_v<T, U> && (sizeof(U) == 2 || sizeof(U) == 1);
+    constexpr int  vec_bytes    = E * sizeof(U);
 
     const int lane = laneid();
     const uint32_t dst_ptr = (uint32_t)(uintptr_t)&dst.data[0];
@@ -192,22 +217,29 @@ __device__ inline static void store(ST &dst, const RT &src) {
             const int col_base = j*base::tile_size_col;
             if constexpr (vectorizable) {
                 // Unlike RDNA3 there is no mirroring here, so the 32 lanes
-                // write 32 disjoint 16-byte runs and cover the tile exactly
-                // once.  Nothing to deduplicate and nothing to collapse.
+                // write 32 disjoint runs and cover the tile exactly once.
+                // Nothing to deduplicate and nothing to collapse.
                 const int2 c0 = rt_base_coord<T, L>(0, lane);
                 const uint32_t p = dst.idx(dst_ptr, {row_base + c0.x, col_base + c0.y});
-                float4 v;
-                __builtin_memcpy(&v, (const void*)&src.tiles[i][j].data[0], sizeof(v));
-                store_shared_vec4(p, v);
+                if constexpr (vec_bytes == 16) {
+                    float4 v;
+                    __builtin_memcpy(&v, (const void*)&src.tiles[i][j].data[0], sizeof(v));
+                    store_shared_vec4(p, v);
+                } else {
+                    float2 v;
+                    __builtin_memcpy(&v, (const void*)&src.tiles[i][j].data[0], sizeof(v));
+                    store_shared_vec(p, v);
+                }
             }
             else {
+                // See the note in load(): index the unpacked type, because
+                // dtype holds 4 elements for fp8 and 2 for everything else.
+                const T* elems = reinterpret_cast<const T*>(&src.tiles[i][j].data[0]);
                 #pragma unroll
                 for(int e = 0; e < E; e++) {
                     const int2 c = rt_base_coord<T, L>(e, lane);
-                    const T val = (e & 1) ? src.tiles[i][j].data[e>>1].y
-                                          : src.tiles[i][j].data[e>>1].x;
                     dst[{row_base + c.x, col_base + c.y}] =
-                        base_types::convertor<U, T>::convert(val);
+                        base_types::convertor<U, T>::convert(elems[e]);
                 }
             }
         }
