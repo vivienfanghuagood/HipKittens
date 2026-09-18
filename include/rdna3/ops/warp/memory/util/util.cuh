@@ -180,6 +180,62 @@ __device__ inline float2 load_shared_vec_async(uint32_t lds_off) {
     return result;
 }
 
+/**
+ * @brief Wait until at most `N` LDS operations are still outstanding.
+ *
+ * LDS returns in order, so lds_wait<N>() after issuing a batch of M+N reads
+ * retires exactly the first M of them. That is what lets a caller issue the
+ * reads for K-slice k+1, then wait only on slice k's, and run slice k's math
+ * with the next slice's reads still in flight.
+ */
+template<int N=0> __device__ inline void lds_wait() {
+    static_assert(N >= 0 && N <= 63, "lgkmcnt is 6 bits on gfx11");
+    asm volatile("s_waitcnt lgkmcnt(%0)" :: "i"(N) : "memory");
+}
+
+/*
+ * 128-bit LDS access.
+ *
+ * These have to be inline asm for the same reason the b64 pair above does, and
+ * the reason is worth stating because it is not obvious from the C++: a shared
+ * tile reached through shared_allocator is a *generic* pointer as far as the
+ * compiler is concerned, so writing `*(float4*)p` gets you flat_load_b128, not
+ * ds_read_b128.  Both address the same bytes, but flat goes out through the
+ * memory pipe and counts against vmcnt.  Taking the 32-bit LDS offset and
+ * naming the instruction is what pins the access to the LDS pipe.
+ *
+ * Neither waits: the callers issue a batch and then a single s_waitcnt.
+ */
+// The asm operands are the native vector type rather than HIP's float4: a
+// 16-byte HIP_vector_type is not something clang will place in a register for a
+// "v" *input* constraint ("indirect register inputs"), though it accepts it as
+// an output.  The memcpys are free; both types are four consecutive dwords.
+typedef float raw_v4f __attribute__((ext_vector_type(4)));
+
+__device__ inline float4 load_shared_vec4_async(uint32_t lds_off) {
+    raw_v4f v;
+    asm volatile(
+        "ds_read_b128 %0, %1\n"
+        : "=v"(v)
+        : "v"(lds_off)
+        : "memory"
+    );
+    float4 result;
+    __builtin_memcpy(&result, &v, sizeof(v));
+    return result;
+}
+
+__device__ inline void store_shared_vec4(uint32_t lds_off, float4 val) {
+    raw_v4f v;
+    __builtin_memcpy(&v, &val, sizeof(v));
+    asm volatile(
+        "ds_write_b128 %0, %1\n"
+        :
+        : "v"(lds_off), "v"(v)
+        : "memory"
+    );
+}
+
 /* ----------   To prevent generic addressing  ---------- */
 
 template<typename T> struct move {

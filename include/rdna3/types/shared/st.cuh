@@ -90,26 +90,59 @@ namespace kittens {
                 underlying_width%2 == 0 ? 128 : 64
             ) : -1
         );
-        static constexpr int swizzle_repeat = swizzle_bytes << 4;
+        // The XOR swizzle permutes 16-byte granules within each aligned 128-byte
+        // block, using the next three address bits above that block as the key:
+        //
+        //     swizzle = ((off % 1024) >> 7) << 4;   off ^= swizzle
+        //
+        // Three properties make this the right constant on gfx11, and all three
+        // differ from what the CDNA trees do:
+        //
+        //  * 16-byte granule, not 8. The whole point is that a lane may read its
+        //    operand row with one ds_read_b128; that is only correct if 16
+        //    contiguous bytes survive the permutation intact. See the fast path
+        //    in ops/warp/memory/tile/shared_to_register.cuh.
+        //  * 128 bytes is exactly one LDS bank row (32 banks x 4 B), so
+        //    permuting granules *within* a block is precisely the freedom that
+        //    changes which banks a request hits, and permuting across blocks
+        //    would not. Sixteen lanes reading one 16-byte granule each then
+        //    start at eight distinct bank groups, two lanes per group, which is
+        //    the 2-cycle minimum for a 256-byte request. Hand-checked for row
+        //    strides of 32, 64 and 128 bytes, i.e. every swizzle_bytes below.
+        //  * the repeat is fixed at 1024 rather than derived from swizzle_bytes.
+        //    It has to be: the key bits (7..9) must not overlap the bits the
+        //    swizzle flips (4..6), and a repeat of 2048 would put a key bit at
+        //    position 7 of the swizzle, which is no longer a bijection.
+        //
+        // Note this swizzles the tile-relative offset, where CDNA swizzles the
+        // absolute address. Swizzling the address silently requires tiles to be
+        // 128-byte aligned for the conflict-free property to hold, and the
+        // allocator only promises 16. Offsets make the layout a property of the
+        // tile alone. It stays in bounds because the swizzle only moves bits 4-6
+        // and every tile is a whole number of 128-byte blocks (the smallest,
+        // st<fp8,16,16>, is 256 B).
+        static constexpr int swizzle_repeat = 1024;
         static constexpr int subtile_cols   = swizzle_bytes / sizeof(T);
-    
+        static_assert((rows*cols*sizeof(T)) % 128 == 0,
+                      "tile must be a whole number of 128-byte blocks for the offset swizzle to stay in bounds");
+
         dtype data[rows*cols]; ///< Raw data storage for the tile.
-        
+
         __device__ static inline T* idx(T *ptr, int2 coord) { // naive row-major coord default
             int r = coord.x, c = coord.y; // alias
             const int outer_idx = c/subtile_cols;
-            const uint64_t addr = (uint64_t)(&ptr[outer_idx*rows*subtile_cols + r*subtile_cols + c%subtile_cols]);
-            const int swizzle = ((addr % swizzle_repeat) >> 7) << 3;
-    
-            return (T*)(addr ^ swizzle);
+            const uint32_t off = sizeof(T)*(outer_idx*rows*subtile_cols + r*subtile_cols + c%subtile_cols);
+            const uint32_t swizzle = ((off % swizzle_repeat) >> 7) << 4;
+
+            return (T*)((char*)ptr + (off ^ swizzle));
         }
         __device__ static inline uint32_t idx(uint32_t ptr, int2 coord) {
             int r = coord.x, c = coord.y; // alias
             const int outer_idx = c/subtile_cols;
-            const uint32_t addr = ptr + sizeof(T)*(outer_idx*rows*subtile_cols + r*subtile_cols + c%subtile_cols);
-            const int swizzle = ((addr % swizzle_repeat) >> 7) << 3;
-    
-            return (addr ^ swizzle);
+            const uint32_t off = sizeof(T)*(outer_idx*rows*subtile_cols + r*subtile_cols + c%subtile_cols);
+            const uint32_t swizzle = ((off % swizzle_repeat) >> 7) << 4;
+
+            return ptr + (off ^ swizzle);
         }
         /**
          * @brief Access a shared tile element using a row and column, as if the tile were row-major.
@@ -191,29 +224,32 @@ namespace kittens {
             col_offset = rowcol.y * cols;
         }
     
+        // `ptr` is the *underlying* tile's base in every caller, so these compute
+        // the same offset the parent st would for the same absolute coordinate,
+        // and the two agree on the layout. See the note on st::idx above.
         __device__ inline T* idx(T *ptr, const int2 coord) { // naive row-major coord default
             int r = coord.x+row_offset, c = coord.y+col_offset; // alias
             const int outer_idx = c/subtile_cols;
-            const uint64_t addr = (uint64_t)(&ptr[outer_idx*underlying_rows*subtile_cols + r*subtile_cols + c%subtile_cols]);
-            const int swizzle = ((addr % swizzle_repeat) >> 7) << 3;
-    
-            return (T*)(addr ^ swizzle);
+            const uint32_t off = sizeof(T)*(outer_idx*underlying_rows*subtile_cols + r*subtile_cols + c%subtile_cols);
+            const uint32_t swizzle = ((off % swizzle_repeat) >> 7) << 4;
+
+            return (T*)((char*)ptr + (off ^ swizzle));
         }
         __device__ inline const T* idx(const T *ptr, const int2 coord) const { // const version
             int r = coord.x+row_offset, c = coord.y+col_offset; // alias
             const int outer_idx = c/subtile_cols;
-            const uint64_t addr = (uint64_t)(&ptr[outer_idx*underlying_rows*subtile_cols + r*subtile_cols + c%subtile_cols]);
-            const int swizzle = ((addr % swizzle_repeat) >> 7) << 3;
-    
-            return (const T*)(addr ^ swizzle);
+            const uint32_t off = sizeof(T)*(outer_idx*underlying_rows*subtile_cols + r*subtile_cols + c%subtile_cols);
+            const uint32_t swizzle = ((off % swizzle_repeat) >> 7) << 4;
+
+            return (const T*)((const char*)ptr + (off ^ swizzle));
         }
         __device__ inline uint32_t idx(uint32_t ptr, const int2 coord) const { // naive row-major coord default
             int r = coord.x+row_offset, c = coord.y+col_offset; // alias
             const int outer_idx = c/subtile_cols;
-            const uint32_t addr = ptr + sizeof(T)*(outer_idx*underlying_rows*subtile_cols + r*subtile_cols + c%subtile_cols);
-            const int swizzle = ((addr % swizzle_repeat) >> 7) << 3;
-    
-            return (addr ^ swizzle);
+            const uint32_t off = sizeof(T)*(outer_idx*underlying_rows*subtile_cols + r*subtile_cols + c%subtile_cols);
+            const uint32_t swizzle = ((off % swizzle_repeat) >> 7) << 4;
+
+            return ptr + (off ^ swizzle);
         }
         /**
          * @brief Access a shared tile element using a row and column, as if the tile were row-major.

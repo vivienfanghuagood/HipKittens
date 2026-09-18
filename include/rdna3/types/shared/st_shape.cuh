@@ -28,8 +28,9 @@ namespace ducks {
  * against the CDNA API and names a shape in nearly every signature; giving
  * rdna3 the one shape its tiles actually use lets those tests be ported
  * without forking the harness. If the shared tile ever does become
- * shape-parameterized on this arch -- the swizzle retuning that Phase 7 calls
- * for is the obvious reason to do it -- this is where the alternatives go.
+ * shape-parameterized on this arch, this is where the alternatives go. The
+ * swizzle retune is not such a case: it landed as a change to the granule and
+ * repeat inside `st::idx()`, which every tile shape wants anyway.
  */
 namespace st_shape {
 

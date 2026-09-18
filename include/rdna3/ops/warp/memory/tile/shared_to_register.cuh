@@ -28,13 +28,13 @@ namespace kittens {
  * fast path; the rest fall back to elementwise accesses, which is what the CDNA
  * tree already does for its column-major path.
  *
- * The fast path issues four 8-byte reads rather than one 32-byte read.  The XOR
- * swizzle in st::idx() works on an 8-byte granule (`((addr % repeat) >> 7) << 3`),
- * so a single wide read spanning 32 B would pick up four blocks that the swizzle
- * has permuted relative to each other.  Four separate idx() calls are correct
- * under the existing swizzle, and keep CDNA's conflict-free pattern of 16 lanes
- * hitting 16 distinct 8-byte offsets.  A wider swizzle granule is a Phase 7
- * question, to be settled against the LDS bank-conflict counters.
+ * The fast path issues two 16-byte reads rather than one 32-byte read.  The XOR
+ * swizzle in st::idx() permutes 16-byte granules, so 16 contiguous bytes survive
+ * it but 32 do not: the two halves of a row may land in either order.  Two
+ * separate idx() calls handle that, and two ds_read_b128 is the minimum
+ * instruction count a 32-byte-per-lane read can have.  See the swizzle note in
+ * types/shared/st.cuh for why 16 bytes is also the granule that keeps the access
+ * bank-conflict-free.
  *
  * Note that lanes l and l+16 of an operand tile issue *identical* addresses.
  * That is the 2x mirroring WMMA requires, and LDS broadcasts the matching
@@ -42,15 +42,46 @@ namespace kittens {
  */
 
 /**
+ * @brief Whether load()/store() for this pair take the vectorized ds_read_b128 path.
+ */
+template<ducks::rt::all RT, ducks::st::all ST>
+static constexpr bool lds_vectorizable =
+    std::is_same_v<typename RT::layout, ducks::rt_layout::row>
+    && rt_base<typename base_types::packing<typename RT::dtype>::unpacked_type,
+               typename RT::layout>::element_stride == 1
+    && std::is_same_v<typename base_types::packing<typename RT::dtype>::unpacked_type,
+                      typename ST::dtype>
+    && sizeof(typename ST::dtype) == 2;
+
+/**
+ * @brief How many LDS instructions load()/load_async() issues for this pair.
+ *
+ * Callers pipelining loads against math need this to size their s_waitcnt: see
+ * lds_wait() in the memory utilities. Zero means the pair does not take the
+ * vectorized path, in which case load_async() is not available.
+ */
+template<ducks::rt::all RT, ducks::st::all ST>
+static constexpr int lds_loads = lds_vectorizable<RT, ST> ? RT::height * RT::width * 2 : 0;
+
+/**
  * @brief Load data from a shared tile into a register tile.
  *
+ * @tparam wait Whether to retire the reads before returning. Pass false to keep
+ *              them in flight and wait later with lds_wait<>(), which is how a
+ *              caller overlaps the reads for one K-slice with the math of the
+ *              previous one. Only the vectorized path can do this -- the
+ *              elementwise fallback goes through the compiler, which inserts
+ *              its own waits, so it is a static_assert rather than a silent
+ *              downgrade.
  * @tparam RT The register tile type
  * @tparam ST The shared tile type
  * @param dst[out] The destination register tile.
  * @param src[in]  The source shared tile.
  */
-template<ducks::rt::all RT, ducks::st::all ST>
+template<bool wait=true, ducks::rt::all RT, ducks::st::all ST>
 __device__ inline static void load(RT &dst, const ST &src) {
+    static_assert(wait || lds_vectorizable<RT, ST>,
+                  "load<false> requires the vectorized path; check lds_loads<RT,ST> != 0");
 
     static_assert(RT::height == ST::height, "register tile and shared tile must match height");
     static_assert(RT::width  == ST::width,  "register tile and shared tile must match width");
@@ -65,12 +96,13 @@ __device__ inline static void load(RT &dst, const ST &src) {
     constexpr bool is_row = std::is_same_v<L, ducks::rt_layout::row>;
     constexpr int  E      = base::elements_per_thread;
 
-    // A whole 16-element row, same width in LDS as in registers: 4x ds_read_b64.
+    // A whole 16-element row, same width in LDS as in registers: 2x ds_read_b128.
     constexpr bool vectorizable = is_row && base::element_stride == 1
                                          && std::is_same_v<T, U> && sizeof(U) == 2;
 
     const int lane = laneid();
     const int l16  = lane & 15;
+    const uint32_t src_ptr = (uint32_t)(uintptr_t)&src.data[0];
 
     #pragma unroll
     for(int i = 0; i < RT::height; i++) {
@@ -79,18 +111,16 @@ __device__ inline static void load(RT &dst, const ST &src) {
             const int row_base = i*base::tile_size_row;
             const int col_base = j*base::tile_size_col;
             if constexpr (vectorizable) {
-                // Plain 8-byte copies, not inline asm: with T == U there is no
-                // conversion to generate a v_bfi_b32 (the thing the CDNA path's
-                // asm was working around), and letting the compiler own the
-                // reads lets it cover all four with one s_waitcnt lgkmcnt.
+                // The 16-byte alignment these require holds: tiles are
+                // KITTENS_DEFAULT_ALIGN'd, the byte offset of an 8-element
+                // column boundary is a multiple of 16, and the swizzle only
+                // moves bits 4-6.  The register side goes through memcpy
+                // because `data` is only 4-byte aligned as an array.
                 #pragma unroll
-                for(int b = 0; b < 4; b++) {
-                    const U *p = src.idx(const_cast<U*>(src.data), {row_base + l16, col_base + 4*b});
-                    // float2 rather than uint64_t: `data` is only 4-byte aligned
-                    // as a register array, while the LDS side is 8-byte aligned
-                    // (the allocator gives 16 and the swizzle only moves bits 3-6).
-                    const float2 v = *reinterpret_cast<const float2*>(p);
-                    __builtin_memcpy((void*)&dst.tiles[i][j].data[2*b], &v, sizeof(v));
+                for(int b = 0; b < 2; b++) {
+                    const uint32_t p = src.idx(src_ptr, {row_base + l16, col_base + 8*b});
+                    const float4 v = load_shared_vec4_async(p);
+                    __builtin_memcpy((void*)&dst.tiles[i][j].data[4*b], &v, sizeof(v));
                 }
             }
             else {
@@ -105,7 +135,17 @@ __device__ inline static void load(RT &dst, const ST &src) {
             }
         }
     }
+    // One wait for the whole tile: the reads above were issued back to back so
+    // that their latencies overlap, and the compiler cannot insert this itself
+    // for an inline-asm ds_read.
+    if constexpr (vectorizable && wait) asm volatile("s_waitcnt lgkmcnt(0)" ::: "memory");
 }
+
+/**
+ * @brief Issue a tile's LDS reads without waiting for them. See load<false>.
+ */
+template<ducks::rt::all RT, ducks::st::all ST>
+__device__ inline static void load_async(RT &dst, const ST &src) { load<false>(dst, src); }
 
 
 /**
@@ -137,6 +177,7 @@ __device__ inline static void store(ST &dst, const RT &src) {
 
     const int lane = laneid();
     const int l16  = lane & 15;
+    const uint32_t dst_ptr = (uint32_t)(uintptr_t)&dst.data[0];
 
     #pragma unroll
     for(int i = 0; i < RT::height; i++) {
@@ -150,11 +191,11 @@ __device__ inline static void store(ST &dst, const RT &src) {
                 // upper half would cost a branch for no bandwidth (LDS writes to
                 // a matching address collapse the same way reads broadcast).
                 #pragma unroll
-                for(int b = 0; b < 4; b++) {
-                    U *p = dst.idx(dst.data, {row_base + l16, col_base + 4*b});
-                    float2 v;
-                    __builtin_memcpy(&v, (const void*)&src.tiles[i][j].data[2*b], sizeof(v));
-                    *reinterpret_cast<float2*>(p) = v;
+                for(int b = 0; b < 2; b++) {
+                    const uint32_t p = dst.idx(dst_ptr, {row_base + l16, col_base + 8*b});
+                    float4 v;
+                    __builtin_memcpy(&v, (const void*)&src.tiles[i][j].data[4*b], sizeof(v));
+                    store_shared_vec4(p, v);
                 }
             }
             else {
@@ -169,5 +210,9 @@ __device__ inline static void store(ST &dst, const RT &src) {
             }
         }
     }
+    // Retire the writes before the caller's barrier, and before it can reuse
+    // the VGPRs the asm reads from -- neither is something the compiler tracks
+    // across an inline-asm ds_write.
+    if constexpr (vectorizable) asm volatile("s_waitcnt lgkmcnt(0)" ::: "memory");
 }
 }

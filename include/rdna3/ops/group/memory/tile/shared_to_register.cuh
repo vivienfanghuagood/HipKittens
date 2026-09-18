@@ -8,7 +8,7 @@
  * ops/warp/memory/tile/shared_to_register.cuh: warp w owns rows
  * [w*RT::height, (w+1)*RT::height) of subtiles and runs exactly the same lane
  * mapping within them. See that file for the gfx11 layouts and for why the
- * vectorized case issues four 8-byte reads.
+ * vectorized case issues two 16-byte reads.
  *
  * Note that unlike the CDNA version this goes through src.idx() / operator[]
  * rather than indexing src.data[] directly, so the shared tile's XOR swizzle is
@@ -46,6 +46,7 @@ __device__ inline static void load(RT &dst, const ST &src) {
     const int lane = ::kittens::laneid();
     const int l16  = lane & 15;
     const int warp_row_offset = warpid() * warp_height;
+    const uint32_t src_ptr = (uint32_t)(uintptr_t)&src.data[0];
 
     #pragma unroll
     for (int i = 0; i < dst.height; i++) {
@@ -55,10 +56,10 @@ __device__ inline static void load(RT &dst, const ST &src) {
             const int col_base = j * base::tile_size_col;
             if constexpr (vectorizable) {
                 #pragma unroll
-                for(int b = 0; b < 4; b++) {
-                    const U *p = src.idx(const_cast<U*>(src.data), {row_base + l16, col_base + 4*b});
-                    const float2 v = *reinterpret_cast<const float2*>(p);
-                    __builtin_memcpy((void*)&dst.tiles[i][j].data[2*b], &v, sizeof(v));
+                for(int b = 0; b < 2; b++) {
+                    const uint32_t p = src.idx(src_ptr, {row_base + l16, col_base + 8*b});
+                    const float4 v = load_shared_vec4_async(p);
+                    __builtin_memcpy((void*)&dst.tiles[i][j].data[4*b], &v, sizeof(v));
                 }
             }
             else {
@@ -73,6 +74,7 @@ __device__ inline static void load(RT &dst, const ST &src) {
             }
         }
     }
+    if constexpr (vectorizable) asm volatile("s_waitcnt lgkmcnt(0)" ::: "memory");
 }
 
 
@@ -107,6 +109,7 @@ __device__ inline static void store(ST &dst, const RT &src) {
     const int lane = ::kittens::laneid();
     const int l16  = lane & 15;
     const int warp_row_offset = warpid() * warp_height;
+    const uint32_t dst_ptr = (uint32_t)(uintptr_t)&dst.data[0];
 
     #pragma unroll
     for(int i = 0; i < src.height; i++) {
@@ -116,11 +119,11 @@ __device__ inline static void store(ST &dst, const RT &src) {
             const int col_base = j * base::tile_size_col;
             if constexpr (vectorizable) {
                 #pragma unroll
-                for(int b = 0; b < 4; b++) {
-                    U *p = dst.idx(dst.data, {row_base + l16, col_base + 4*b});
-                    float2 v;
-                    __builtin_memcpy(&v, (const void*)&src.tiles[i][j].data[2*b], sizeof(v));
-                    *reinterpret_cast<float2*>(p) = v;
+                for(int b = 0; b < 2; b++) {
+                    const uint32_t p = dst.idx(dst_ptr, {row_base + l16, col_base + 8*b});
+                    float4 v;
+                    __builtin_memcpy(&v, (const void*)&src.tiles[i][j].data[4*b], sizeof(v));
+                    store_shared_vec4(p, v);
                 }
             }
             else {
@@ -135,4 +138,5 @@ __device__ inline static void store(ST &dst, const RT &src) {
             }
         }
     }
+    if constexpr (vectorizable) asm volatile("s_waitcnt lgkmcnt(0)" ::: "memory");
 }

@@ -35,7 +35,6 @@ __device__ inline void load(ST& dst, const GL& src, const COORD& idx)
     const int row_stride = src.template stride<axis>();
     // we can handle this many rows each time we run a memcpy_async
     constexpr int elem_per_memcpy = sizeof(float4)/sizeof(typename ST::dtype); // if bf16, then 16/2 = 8. if fp8, then 16/1 = 16.
-    constexpr int elem_per_half_memcpy = sizeof(float2)/sizeof(typename ST::dtype); // if bf16, then 8/2 = 4. if fp8, then 8/1 = 8.
     constexpr int memcpy_per_row = ST::cols / elem_per_memcpy; // if 64 columns, then 64/8 = 8 or 64/16 = 4
     constexpr int total_calls = (ST::cols * ST::rows + N_THREADS*elem_per_memcpy-1) / (N_THREADS*elem_per_memcpy); // round up
 
@@ -81,8 +80,10 @@ __device__ inline void load(ST& dst, const GL& src, const COORD& idx)
             int col = (load_idx % memcpy_per_row) * elem_per_memcpy;
 
             if (row < dst.rows) {
-                store_shared_vec(dst.idx(dst_ptr, {row, col}), {buf[j].x, buf[j].y});
-                store_shared_vec(dst.idx(dst_ptr, {row, col + elem_per_half_memcpy}), {buf[j].z, buf[j].w});
+                // One ds_write_b128: `col` is a whole number of float4s, so the
+                // 16 bytes land inside a single swizzle granule and stay
+                // contiguous. See the swizzle note in types/shared/st.cuh.
+                store_shared_vec4(dst.idx(dst_ptr, {row, col}), buf[j]);
             }
         }
 
@@ -168,7 +169,6 @@ __device__ inline void store_register_buffer_to_shared(ST& dst, const float4* re
                                                        const int buffer_size = stage_calls<ST, N_THREADS>) {
     using T = typename ST::dtype;
     constexpr int elem_per_memcpy = sizeof(float4)/sizeof(T);
-    constexpr int elem_per_half_memcpy = sizeof(float2)/sizeof(T);
     constexpr int memcpy_per_row = ST::cols / elem_per_memcpy;
 
     uint32_t dst_ptr = reinterpret_cast<uintptr_t>(&dst.data[0]);
@@ -186,9 +186,7 @@ __device__ inline void store_register_buffer_to_shared(ST& dst, const float4* re
         if (c < buffer_size && chunk_idx < total_chunks) {
             int row = chunk_idx / memcpy_per_row;
             int col = (chunk_idx % memcpy_per_row) * elem_per_memcpy;
-            const float4& buf_val = reg_buffer[c];
-            store_shared_vec(dst.idx(dst_ptr, {row, col}), {buf_val.x, buf_val.y});
-            store_shared_vec(dst.idx(dst_ptr, {row, col + elem_per_half_memcpy}), {buf_val.z, buf_val.w});
+            store_shared_vec4(dst.idx(dst_ptr, {row, col}), reg_buffer[c]);
         }
     }
     #ifdef BUILTINS_ONLY
