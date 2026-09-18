@@ -17,38 +17,38 @@ def print_title(title, len=30):
     print(title)
     print("-"*len)
 
-def bench_gemm(gemm_params, gemm_func, transpose_B=False, num_warmup=500, num_iter=500):
-    start_event = torch.cuda.Event(enable_timing=True)
-    end_event = torch.cuda.Event(enable_timing=True)
+def time_gemm(gemm_params, gemm_func, transpose_B=False, num_warmup=20, num_iter=50):
+    """Average ms per call.
+
+    Allocation stays outside the timing loop and many calls sit between one pair
+    of events. The earlier version of this did the opposite -- three randn's per
+    iteration and one kernel per event pair -- which charges allocation and
+    launch latency to the kernel and understates everything by a few percent.
+    """
     m, n, k = gemm_params["shape"]
-    flop = 2*m*n*k
-    dtype = gemm_params["dtype"]
-    device = gemm_params["device"]
+    dtype, device = gemm_params["dtype"], gemm_params["device"]
 
-    A_shape = (m, k)
-    B_shape = (n, k) if transpose_B else (k, n)
-    C_shape = (m, n)
-
-    A = init_randn(A_shape, dtype, device)
-    B = init_randn(B_shape, dtype, device)
-    C = init_empty(C_shape, dtype, device)
+    A = init_randn((m, k), dtype, device)
+    B = init_randn((n, k) if transpose_B else (k, n), dtype, device)
+    C = init_empty((m, n), dtype, device)
 
     for _ in range(num_warmup):
         gemm_func(A, B, C)
+    torch.cuda.synchronize()
 
-    elapsed_time = 0
-    
+    start_event = torch.cuda.Event(enable_timing=True)
+    end_event = torch.cuda.Event(enable_timing=True)
+    start_event.record()
     for _ in range(num_iter):
-        A = init_randn(A_shape, dtype, device)
-        B = init_randn(B_shape, dtype, device)
-        C = init_empty(C_shape, dtype, device)
-        torch.cuda.synchronize()
-        start_event.record()
         gemm_func(A, B, C)
-        end_event.record()
-        torch.cuda.synchronize()
-        elapsed_time += start_event.elapsed_time(end_event)
+    end_event.record()
+    torch.cuda.synchronize()
+    return start_event.elapsed_time(end_event) / num_iter
 
-    avg_elapsed_time = elapsed_time / num_iter
-    tflops = int(flop / (avg_elapsed_time * 1e9))
-    print(f"m={m},n={n},k={k}: {tflops} TFLOPS")
+
+def bench_gemm(gemm_params, gemm_func, transpose_B=False, num_warmup=20, num_iter=50):
+    m, n, k = gemm_params["shape"]
+    ms = time_gemm(gemm_params, gemm_func, transpose_B, num_warmup, num_iter)
+    tflops = 2*m*n*k / (ms * 1e9)
+    print(f"m={m},n={n},k={k}: {tflops:.1f} TFLOPS")
+    return tflops

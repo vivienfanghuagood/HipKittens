@@ -11,7 +11,7 @@ the work here lives on the `rdna` branch, seven commits on top of `de0cddbd`.
 |---|---|---|
 | core library | `include/rdna3`, 68 files | `include/rdna4`, 68 files |
 | unit tests | **1659 passed, 0 failed** on a W7900D | compiles; **never executed** |
-| bf16 GEMM | **71 TFLOPs**, 58% of peak, beats hipBLASLt on 2 of 4 shapes | compiles; never executed |
+| bf16 GEMM | **71 TFLOPs**, 71% of the measured WMMA ceiling, 80% of rocBLAS | compiles; never executed |
 | fp8 | not available in hardware | implemented, all four opcodes, untested |
 
 **Read the second column as "written, not verified."** No gfx12 part was
@@ -101,24 +101,48 @@ if gfx12 fails, the bug is in `include/rdna4`, not in the tests.
   fp8 register tiles. `constants<fp8e4m3>` deliberately has no infinity, so a
   reduction over one is a compile error rather than a silently wrong answer.
 - **Split-K**, which is what the small-shape GEMM numbers are missing.
+- **Inner-loop software pipelining in the GEMM.** The global→LDS stage is
+  double-buffered; the LDS→register stage is not. That is what caps the warp
+  tile at 32×64 and leaves 20% on the table against rocBLAS.
 - **Multi-GPU / distributed**, untouched.
 - **RDNA4 on hardware**, at all.
 
 ## Performance
 
-W7900D (gfx1100, 96 CU, 122.6 TFLOPs bf16 peak). bf16 GEMM, fp32 accumulate,
-HipKittens vs torch on hipBLASLt:
+W7900D (gfx1100, 96 CU). bf16 GEMM, fp32 accumulate. Vendor columns are
+best-of-{NN,NT,TN,TT}; HipKittens implements one layout.
 
-| shape (M×N×K) | HK | torch | peak reached |
-|---|---|---|---|
-| 4096³ | 67 | 69 | 55% |
-| 8192×8192×4096 | 71 | 65 | 58% |
-| 8192×4096×2048 | 71 | 66 | 58% |
-| 2048³ | 46 | 55 | 38% |
+| shape (M×N×K) | hipBLASLt | rocBLAS | HK | HK / best | HK / ceiling |
+|---|---|---|---|---|---|
+| 4096³ | 69.3 | **81.3** | 66.9 | 82% | 67% |
+| 8192×8192×4096 | 66.5 | **88.8** | 69.4 | 78% | 69% |
+| 8192×4096×2048 | 70.0 | **88.7** | 71.3 | 80% | 71% |
+| 2048³ | 60.1 | **69.4** | 47.6 | 69% | 47% |
 
-Large shapes win, small ones lose — 2048³ is 256 workgroups over 96 CUs with no
-split-K. The WMMA-issue-only ceiling for this schedule is 98/102 TFLOPs, so the
-remaining gap is roughly half instruction issue and half LDS read.
+**Two corrections to numbers this file previously carried**, both of which made
+the kernel look better than it is:
+
+*The baseline was the wrong library.* torch on ROCm defaults to hipBLASLt, and
+on gfx1100 hipBLASLt is the slower of the two by up to 33% — rocBLAS wins every
+shape here. Benchmarking against torch's default is benchmarking against the
+library AMD has not tuned for this architecture. The real gap is 20-25%, not the
+"wins 2 of 4" that the hipBLASLt-only table showed.
+
+*The denominator was unreachable.* 122.6 TFLOPs is 96 CU × 512 FLOP/clk ×
+2.495 GHz boost. This card does not run a GEMM at 2.495 GHz: `rocm-smi` sampled
+under load shows 2.0-2.1 GHz against a 241 W limit. Back-to-back WMMA with no
+memory at all measures **100.5 TFLOPs**
+([`tools/rdna-probes/wmma_peak.hip`](tools/rdna-probes/wmma_peak.hip)) — 94% of
+the architectural issue rate, at 2.18 GHz and only 101 W. The reachable peak is
+~104, so percentages against 122.6 understate by about 18%.
+
+The 20% behind rocBLAS is one identified thing: LDS reads per WMMA. A 32×64 warp
+tile does 8 WMMAs per 6 operand loads; rocBLAS's 64×64 does 16 per 8. Every
+attempt to adopt the wider tile here measures slower, because this kernel hides
+LDS latency with occupancy and the wider tile costs occupancy — rocBLAS hides it
+with a software pipeline instead, which costs registers. The two changes only
+pay together. The full config sweep is in
+[`kernels/rdna3/gemm/bf16fp32/README.md`](kernels/rdna3/gemm/bf16fp32/README.md).
 
 RDNA4 has not been run. What is known is a register count: the operand tiles
 cost 24 VGPRs there against 48 on gfx1100, and the ported kernel sits at 128
@@ -144,6 +168,14 @@ Things that cost time and are written down so they cost it only once:
 - **fp8 on gfx12 is OCP, on gfx942 it is fnuz**, and HIP gates them by target.
   The fnuz types are still declared on gfx12, so a typedef inherited from the
   CDNA tree compiles until the first thing instantiates it.
+- **Benchmark against rocBLAS, not against torch's default.** torch on ROCm
+  picks hipBLASLt, and on gfx1100 that is the library with the thinner Tensile
+  tuning — rocBLAS is up to 33% faster on the same shape. Switch with
+  `torch.backends.cuda.preferred_blas_library("cublas")`, and take best-of-four
+  transposes while you are there; the spread across NN/NT/TN/TT reaches 40%.
+- **Do not use the data-sheet peak as a denominator.** Measure the ceiling with
+  `tools/rdna-probes/wmma_peak.hip` and sample `rocm-smi -c -P` during the run.
+  This card is clock- and power-limited well below boost under any real load.
 - **The layout probe is the ground truth**, not the ISA doc:
   [`tools/rdna-probes/`](tools/rdna-probes/), and `wmma_layout.hip` in
   particular, which has a `PROBE_GFX12_W32` variant already written for whenever

@@ -27,7 +27,26 @@ the gfx12 claims were checked without a gfx12 card.
 | `mem_gate.hip` | Phase 4 gate: every memory path round-tripped — global↔shared, global↔register, shared↔register, tiles and vectors, both layouts. |
 | `red_gate.hip`, `conv_gate.hip` | Phase 5 gates: tile reductions, and the layout conversions that have to move data across the wave halves. |
 | `srsrc.hip`, `srsrc2.hip`, `srsrc3.hip` | How the gfx10+ buffer resource descriptor actually behaves. CDNA's `0x110000` config word is a gfx9 format; these sweep word 3 against in-bounds and out-of-bounds accesses and land on `0x31004000`, valid for gfx11 and gfx12 both. |
+| `wmma_peak.hip` | **The performance denominator.** Back-to-back `v_wmma_f32_16x16x16_bf16` with no memory access in the inner loop, over a sweep of independent accumulator chains. Measures 100.5 TFLOPs on a W7900D at a sampled 2.18 GHz, against a spec-sheet 122.6 that assumes 2.495 GHz boost. Flat from `ACC=2` to `ACC=16`, so it is an issue-rate ceiling, not a latency artifact. Every "% of peak" in this tree is taken against this number. |
 | `empty.hip` | The minimal "does the toolchain work for this target" file. |
+
+## Do not measure against the spec sheet
+
+The W7900 data sheet says 122.6 TFLOPs bf16, which is 96 CU x 512 FLOP/clk x
+2.495 GHz. Sampling `rocm-smi` during each workload says the card does not get
+there and cannot:
+
+| workload | sclk | power | TFLOPs |
+|---|---|---|---|
+| `wmma_peak.hip` (no memory at all) | 2181 MHz | 101 W | 100.5 |
+| rocBLAS GEMM 4096^3 | 2089 MHz | 227 W | 86.4 |
+| hipBLASLt GEMM 4096^3 | 2062 MHz | 241 W | 68.3 |
+
+The pure-WMMA loop reaches 480 FLOP/clk/CU against the architectural 512, i.e.
+the issue rate is 94% of spec; the whole rest of the gap to 122.6 is clock. Add
+memory traffic and the card hits its 241 W limit and drops another 100 MHz. So
+the reachable peak on this part is ~104 TFLOPs, not 122.6, and a percentage
+computed against 122.6 understates a kernel by about 18%.
 
 ## One warning, learned the hard way
 

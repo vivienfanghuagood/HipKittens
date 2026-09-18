@@ -9,22 +9,70 @@ This is the kernel the RDNA3 port was validated against. Unlike
 
 ## Measured
 
-W7900D (gfx1100, 96 CU, 122.6 TFLOPs bf16 peak), ROCm 7.2.4. TFLOPs, HipKittens
-vs torch on hipBLASLt, same shapes, same machine:
+W7900D (gfx1100, 96 CU), ROCm 7.2.4. TFLOPs, HipKittens against **both** AMD
+BLAS libraries, vendor columns taken as best-of-{NN,NT,TN,TT}:
 
-| shape (M×N×K) | HK | torch | peak reached |
+| shape (M×N×K) | hipBLASLt | rocBLAS | HK | HK / best | HK / WMMA ceiling |
+|---|---|---|---|---|---|
+| 4096³ | 69.3 | **81.3** | 66.9 | 82% | 67% |
+| 8192×8192×4096 | 66.5 | **88.8** | 69.4 | 78% | 69% |
+| 8192×4096×2048 | 70.0 | **88.7** | 71.3 | 80% | 71% |
+| 2048³ | 60.1 | **69.4** | 47.6 | 69% | 47% |
+
+**This kernel is 20-25% behind the best vendor library on every shape.** An
+earlier version of this table compared only against torch's default backend and
+claimed the kernel won two shapes of four. That was wrong twice over: torch on
+ROCm defaults to hipBLASLt, and on gfx1100 hipBLASLt is the *slower* library by
+up to 33% — its Tensile tuning evidently does not cover RDNA the way rocBLAS's
+does. Run `python bench.py`, which now benchmarks both.
+
+Percentages are against **100.5 TFLOPs**, the measured back-to-back WMMA issue
+ceiling ([`tools/rdna-probes/wmma_peak.hip`](../../../../tools/rdna-probes/wmma_peak.hip)),
+not against the 122.6 TFLOPs on the data sheet. 122.6 assumes 2.495 GHz boost;
+sampling `rocm-smi` during a GEMM shows this card at 2.0-2.1 GHz against its
+241 W limit. The reachable peak here is ~104 TFLOPs.
+
+### Where the 20% goes, and why the obvious fixes do not work
+
+The gap is LDS reads per WMMA, and it is a consequence of the tile shape. A warp
+tile of M×N issues (M/16)(N/16) WMMAs against (M/16)+(N/16) operand tile loads:
+
+| warp tile | WMMAs | operand loads | ratio |
 |---|---|---|---|
-| 4096³ | 67 | 69 | 55% |
-| 8192×8192×4096 | 71 | 65 | 58% |
-| 8192×4096×2048 | 71 | 66 | 58% |
-| 2048³ | 46 | 55 | 38% |
+| 32×64 (this kernel) | 8 | 6 | 1.33 |
+| 64×64 (rocBLAS) | 16 | 8 | **2.00** |
 
-Small shapes lose, and the reason is occupancy rather than the inner loop: 2048³
-is 256 workgroups over 96 CUs, and there is no split-K here.
+rocBLAS's Tensile kernel for this shape is
+`Cijk_..._MT128x128x16_MI16x16x16x1_..._PGR1_PLR1_..._WG32_4_1`: the same 128×128
+block, but **4 waves of 64×64 at 256 VGPRs** (6 waves/SIMD) instead of 8 waves of
+32×64 at 128 VGPRs (9 waves/SIMD), with both global *and* local reads prefetched.
 
-The ceiling for this schedule is 98/102 TFLOPs — that is `ABLATE_GLOBAL=1
-ABLATE_LDS_READ=1`, i.e. the WMMA issue rate alone with both memory stages
-deleted. So the gap to peak is roughly half instruction issue and half LDS read.
+Every attempt to copy that shape here measures *slower*:
+
+| config | VGPRs | occ | 4096³ / 8192×8192×4096 |
+|---|---|---|---|
+| 128×128, 8 warps, 32×64/warp (default) | 164 | 9 | **66 / 72** |
+| 128×128, 4 warps, 64×64/warp | 238 | 6 | 52 / 57 |
+| 256×128, 8 warps, 64×64/warp | 256 | 5 | 62 / 68 |
+| 128×256, 8 warps, 64×64/warp | 256 | 5 | 62 / 69 |
+| 256×256, 16 warps, 64×64/warp | 227 | 6 | 59 / 66 |
+
+The 64×64 configurations do fit — 238 VGPRs, no spills, exactly rocBLAS's 6
+waves/SIMD — they are just latency-bound. This kernel hides LDS latency by
+*switching waves*, so every change that improves arithmetic intensity pays for it
+in occupancy, and the occupancy loss is larger. rocBLAS escapes the trade by
+hiding latency in a software pipeline (`PLR1`) instead, which costs registers
+rather than occupancy.
+
+**So the missing piece is inner-loop pipelining, and it has to come first.**
+Double-buffering the operand tiles is what makes the 64×64 shape pay; the 64×64
+shape is what makes the pipeline worth its registers. Adding either one alone
+measures slower, which is how this kernel ended up at a local optimum — see the
+first entry under "tried and did not work" below, which is that same experiment
+run at 32×64 and correctly concluded, for that shape only.
+
+Small shapes lose for a separate reason: 2048³ is 256 workgroups over 96 CUs,
+and there is no split-K.
 
 How it got there, each step measured at 4096³ / 8192×8192×4096:
 
@@ -64,12 +112,17 @@ the cost above.
 Two things that were tried and did *not* work, recorded so they are not retried
 blind:
 
-1. **Software-pipelining the LDS reads.** Double-buffering the operand tiles
-   costs 48 VGPRs, occupancy goes 9 → 7 waves/SIMD, and it measures 63/68 —
-   slower. At 9 waves the SIMD was already covering LDS latency by switching
-   waves. `load_async()` and `lds_wait<N>()` are kept in the library because
-   they are the right primitives for a low-occupancy schedule, where the trade
-   goes the other way.
+1. **Software-pipelining the LDS reads, at the 32×64 warp tile.**
+   Double-buffering the operand tiles costs 48 VGPRs, occupancy goes 9 → 7
+   waves/SIMD, and it measures 63/68 — slower. At 9 waves the SIMD was already
+   covering LDS latency by switching waves.
+
+   Read that as scoped to this tile shape, not as a verdict on pipelining. At
+   32×64 the operand loads are only 1.33 per WMMA, so there is little for a
+   pipeline to hide; at the 64×64 shape rocBLAS uses they are 2.0 per WMMA and
+   the pipeline is what makes the shape affordable. The two changes have to be
+   made together — see above. `load_async()` and `lds_wait<N>()` are in the
+   library for exactly that.
 2. **Bigger register blocks.** Every 4×4-base-tile shape hits the 256-VGPR
    ceiling and spills.
 
