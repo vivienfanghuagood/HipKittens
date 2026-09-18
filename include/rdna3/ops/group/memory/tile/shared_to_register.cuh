@@ -3,6 +3,18 @@
  * @brief Functions for a warpgroup to collaboratively transfer data directly between shared memory and registers and back.
  */
 
+/*
+ * Row-sliced version of the warp-level path in
+ * ops/warp/memory/tile/shared_to_register.cuh: warp w owns rows
+ * [w*RT::height, (w+1)*RT::height) of subtiles and runs exactly the same lane
+ * mapping within them. See that file for the gfx11 layouts and for why the
+ * vectorized case issues four 8-byte reads.
+ *
+ * Note that unlike the CDNA version this goes through src.idx() / operator[]
+ * rather than indexing src.data[] directly, so the shared tile's XOR swizzle is
+ * applied. Raw indexing is only correct for an unswizzled layout.
+ */
+
 /**
  * @brief Collaboratively load data from a shared tile into register tiles split across a warpgroup.
  *
@@ -18,42 +30,46 @@ __device__ inline static void load(RT &dst, const ST &src) {
     static_assert(height%N_WARPS == 0, "Group load / store requires tile height to be a multiple of N_WARPS.");
     static_assert(height%warp_height == 0, "Group load / store requires tile height to be a multiple of the RT height.");
     static_assert(ST::width==RT::width, "Group load / store requires tile widths to match.");
-    int local_warpid = warpid();
-    using T2 = RT::dtype;
-    using U  = ST::dtype;
-    using T  = base_types::packing<T2>::unpacked_type;
-    using U2 = base_types::packing<U>::packed_type;
-    int warp_laneid = ::kittens::laneid();
 
-    int warp_row_offset = local_warpid * warp_height;
-    int row_offset, col_offset;
-    if constexpr (std::is_same_v<typename RT::layout, ducks::rt_layout::row>) {
-        row_offset = warp_laneid%16;
-        col_offset = 4*(warp_laneid/16);
-    }
-    else {
-        row_offset = 4*(warp_laneid/16);
-        col_offset = warp_laneid%16;
-    }
+    using T2 = typename RT::dtype;
+    using T  = typename base_types::packing<T2>::unpacked_type;
+    using U  = typename ST::dtype;
+
+    using L    = typename RT::layout;
+    using base = rt_base<T, L>;
+
+    constexpr bool is_row = std::is_same_v<L, ducks::rt_layout::row>;
+    constexpr int  E      = base::elements_per_thread;
+    constexpr bool vectorizable = is_row && base::element_stride == 1
+                                         && std::is_same_v<T, U> && sizeof(U) == 2;
+
+    const int lane = ::kittens::laneid();
+    const int l16  = lane & 15;
+    const int warp_row_offset = warpid() * warp_height;
 
     #pragma unroll
     for (int i = 0; i < dst.height; i++) {
-        int row = (warp_row_offset + i) * dst.tile_size_row + row_offset;
+        const int row_base = (warp_row_offset + i) * base::tile_size_row;
         #pragma unroll
         for (int j = 0; j < dst.width; j++) {
-            int col = j * dst.tile_size_col + col_offset;
-            if constexpr (std::is_same_v<typename RT::layout, ducks::rt_layout::row>) { // handle the row-major layout
-                dst.tiles[i][j].data[0] = base_types::convertor<T2, U2>::convert(*(U2*)(&src.data[row * src.underlying_rows + col]));
-                dst.tiles[i][j].data[1] = base_types::convertor<T2, U2>::convert(*(U2*)(&src.data[row * src.underlying_rows + col + 2]));
+            const int col_base = j * base::tile_size_col;
+            if constexpr (vectorizable) {
+                #pragma unroll
+                for(int b = 0; b < 4; b++) {
+                    const U *p = src.idx(const_cast<U*>(src.data), {row_base + l16, col_base + 4*b});
+                    const float2 v = *reinterpret_cast<const float2*>(p);
+                    __builtin_memcpy((void*)&dst.tiles[i][j].data[2*b], &v, sizeof(v));
+                }
             }
-            else { // handle the column-major layout
-                U2 tmp[2];
-                
-                tmp[0] = U2{*(U*)(&src.data[row * src.underlying_rows + col]), *(U*)(&src.data[(row + 1) * src.underlying_rows + col]) };
-                tmp[1] = U2{*(U*)(&src.data[(row + 2) * src.underlying_rows + col]), *(U*)(&src.data[(row + 3) * src.underlying_rows + col]) };
-
-                dst.tiles[i][j].data[0] = base_types::convertor<T2, U2>::convert(tmp[0]);
-                dst.tiles[i][j].data[1] = base_types::convertor<T2, U2>::convert(tmp[1]);
+            else {
+                #pragma unroll
+                for(int e = 0; e < E; e++) {
+                    const int2 c = rt_base_coord<T, L>(e, lane);
+                    const T val = base_types::convertor<T, U>::convert(
+                        src[{row_base + c.x, col_base + c.y}]);
+                    if (e & 1) dst.tiles[i][j].data[e>>1].y = val;
+                    else       dst.tiles[i][j].data[e>>1].x = val;
+                }
             }
         }
     }
@@ -75,44 +91,48 @@ __device__ inline static void store(ST &dst, const RT &src) {
     static_assert(height%N_WARPS == 0, "Group load / store requires tile height to be a multiple of N_WARPS.");
     static_assert(height%warp_height == 0, "Group load / store requires tile height to be a multiple of the RT height.");
     static_assert(ST::width==RT::width, "Group load / store requires tile widths to match.");
-    int local_warpid = warpid();
-    using T2 = RT::dtype;
-    using U  = ST::dtype;
-    using T  = base_types::packing<T2>::unpacked_type;
-    using U2 = base_types::packing<U>::packed_type;
-    int warp_laneid = ::kittens::laneid();
 
-    int warp_row_offset = local_warpid * warp_height;
-    int row_offset, col_offset;
-    if constexpr (std::is_same_v<typename RT::layout, ducks::rt_layout::row>) {
-        row_offset = warp_laneid%16;
-        col_offset = 4*(warp_laneid/16);
-    }
-    else {
-        row_offset = 4*(warp_laneid/16);
-        col_offset = warp_laneid%16;
-    }
+    using T2 = typename RT::dtype;
+    using T  = typename base_types::packing<T2>::unpacked_type;
+    using U  = typename ST::dtype;
+
+    using L    = typename RT::layout;
+    using base = rt_base<T, L>;
+
+    constexpr bool is_row = std::is_same_v<L, ducks::rt_layout::row>;
+    constexpr int  E      = base::elements_per_thread;
+    constexpr bool vectorizable = is_row && base::element_stride == 1
+                                         && std::is_same_v<T, U> && sizeof(U) == 2;
+
+    const int lane = ::kittens::laneid();
+    const int l16  = lane & 15;
+    const int warp_row_offset = warpid() * warp_height;
+
     #pragma unroll
     for(int i = 0; i < src.height; i++) {
-        int row = (warp_row_offset + i) * src.tile_size_row + row_offset;
+        const int row_base = (warp_row_offset + i) * base::tile_size_row;
         #pragma unroll
         for(int j = 0; j < src.width; j++) {
-            int col = j * src.tile_size_col + col_offset;
-            if constexpr (std::is_same_v<typename RT::layout, ducks::rt_layout::row>) { // handle the row-major layout
-                *(U2*)(&dst.data[row * dst.underlying_rows + col]) = base_types::convertor<U2, T2>::convert(src.tiles[i][j].data[0]);
-                *(U2*)(&dst.data[row * dst.underlying_rows + col + 2]) = base_types::convertor<U2, T2>::convert(src.tiles[i][j].data[1]);
+            const int col_base = j * base::tile_size_col;
+            if constexpr (vectorizable) {
+                #pragma unroll
+                for(int b = 0; b < 4; b++) {
+                    U *p = dst.idx(dst.data, {row_base + l16, col_base + 4*b});
+                    float2 v;
+                    __builtin_memcpy(&v, (const void*)&src.tiles[i][j].data[2*b], sizeof(v));
+                    *reinterpret_cast<float2*>(p) = v;
+                }
             }
-            else { // handle the column-major layout
-                U2 tmp[2];
-
-                tmp[0] = base_types::convertor<U2, T2>::convert(src.tiles[i][j].data[0]);
-                tmp[1] = base_types::convertor<U2, T2>::convert(src.tiles[i][j].data[1]);
-
-                *(U*)(&dst.data[row * dst.underlying_rows + col]) = std::bit_cast<U>(tmp[0].x);
-                *(U*)(&dst.data[(row + 1) * dst.underlying_rows + col]) = std::bit_cast<U>(tmp[0].y);
-                *(U*)(&dst.data[(row + 2) * dst.underlying_rows + col]) = std::bit_cast<U>(tmp[1].x);
-                *(U*)(&dst.data[(row + 3) * dst.underlying_rows + col]) = std::bit_cast<U>(tmp[1].y);
-            }            
+            else {
+                #pragma unroll
+                for(int e = 0; e < E; e++) {
+                    const int2 c = rt_base_coord<T, L>(e, lane);
+                    const T val = (e & 1) ? src.tiles[i][j].data[e>>1].y
+                                          : src.tiles[i][j].data[e>>1].x;
+                    dst[{row_base + c.x, col_base + c.y}] =
+                        base_types::convertor<U, T>::convert(val);
+                }
+            }
         }
     }
 }

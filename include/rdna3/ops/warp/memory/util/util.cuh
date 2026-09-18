@@ -76,21 +76,40 @@ __device__ inline buffer_resource make_buffer_resource(uint64_t ptr, uint32_t ra
     return {ptr, range, config};
 }
 
-__device__ inline i32x4 make_srsrc(const void* ptr, uint32_t range_bytes, uint32_t row_stride_bytes = 0) {
+/*
+ * gfx11 buffer resource descriptor (V#).
+ *
+ * Word 3 is *not* the gfx9 config word the CDNA tree uses. Measured on gfx1100
+ * (see hk-rdna/probe/srsrc3.hip), a descriptor is only usable if both hold:
+ *
+ *   OOB_SELECT (bits 29:28) == 3.  At any smaller value NumRecords is counted in
+ *     units of STRIDE, and STRIDE is 0 for a raw buffer -- so *every* access is
+ *     out of bounds. Loads return zero and stores are dropped, silently, with no
+ *     fault and no warning. Both gfx9 words (0x00020000 from global_to_register
+ *     and 0x00110000 from the old make_srsrc) fail exactly this way on gfx1100.
+ *   FORMAT (bits 18:12) != 0.  Non-format buffer ops ignore what the format is,
+ *     but 0 is BUF_FMT_INVALID and invalidates the descriptor: 0x30000000 reads
+ *     back zeros while 0x30004000 works.
+ *
+ * 0x31014000 satisfies both and matches what LLVM emits for gfx10/gfx11.
+ */
+static constexpr uint32_t GFX11_BUFFER_CONFIG = 0x31014000u;
+
+/**
+ * @brief Build a raw buffer descriptor over `range_bytes` starting at `ptr`.
+ *
+ * Accesses at or past `range_bytes` are clamped by the hardware: loads read 0,
+ * stores are dropped. That bounds check is the whole reason to prefer buffer
+ * ops over plain pointers here -- it makes ragged edge tiles free.
+ *
+ * Unlike the CDNA version this takes no row stride. The stride field only means
+ * anything for *structured* buffers, and turning swizzling on would change the
+ * address computation out from under the raw byte offsets every caller passes.
+ */
+__device__ inline i32x4 make_srsrc(const void* ptr, uint32_t range_bytes) {
     std::uintptr_t as_int = reinterpret_cast<std::uintptr_t>(ptr);   // width = sizeof(void*)
     std::uint64_t  as_u64 = static_cast<std::uint64_t>(as_int);    // widen if host is 32-bit
-    buffer_resource rsrc = make_buffer_resource(as_u64, range_bytes, 0x110000);
-
-    row_stride_bytes &= 0x3FFF;
-    if (row_stride_bytes) {
-        // - The swizzle stride lives in bits 13:0 of word2.
-        //   Max value = 0x3FFF (8 KiB – one cache line per bank).
-        uint64_t stride_field = row_stride_bytes;
-        stride_field = stride_field | 0x4000;         // Cache swizzle
-        stride_field = stride_field | 0x8000;         // Swizzle enable
-        rsrc.ptr |= stride_field << 48;
-    }
-
+    buffer_resource rsrc = make_buffer_resource(as_u64, range_bytes, GFX11_BUFFER_CONFIG);
     return *reinterpret_cast<const i32x4*>(&rsrc);
 }
 

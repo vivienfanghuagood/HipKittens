@@ -67,7 +67,10 @@ struct rv {
         ? 1
         : (kittens::WMMA_REPLICATION<T> * kittens::TILE_ROW_DIM<T> * kittens::TILE_COL_DIM<T>)
               / (kittens::WARP_THREADS * base_types::packing<T2>::num());
-    static constexpr int outer_dim = is_naive ? (tiles+3)/4 : tiles; ///< Outer dim (also length in tiles)
+    /// Outer dim. For ortho/align this is the length in 16-wide subtiles. For
+    /// naive the wave covers WARP_THREADS = 32 entries at a time, i.e. two
+    /// subtiles per step -- on wave64 CDNA that divisor is 4, not 2.
+    static constexpr int outer_dim = is_naive ? (tiles+1)/2 : tiles;
 
     dtype data[outer_dim][inner_dim]; ///< The actual register vector data.
 

@@ -10,6 +10,21 @@
 
 namespace kittens {
 
+/**
+ * @brief How many 16-byte chunks each lane moves for one shared tile.
+ *
+ * This is the size a caller's register staging buffer must have for the
+ * load_global_to_register_buffer / store_register_buffer_to_shared pair below.
+ * RDNA has no global->LDS DMA, so that pair is the only asynchronous path there
+ * is, and getting this number right is the caller's side of the contract.
+ */
+template<ducks::st::all ST, int N_THREADS = WARP_THREADS>
+static constexpr int stage_calls =
+    ((ST::rows * ST::cols) / (sizeof(float4)/sizeof(typename ST::dtype)) + N_THREADS - 1) / N_THREADS;
+
+/// Loads issued (and registers held) per batch. See the note in load() below.
+static constexpr int stage_batch = 8;
+
 template< int  axis, bool assume_aligned,
           ducks::st::all ST, ducks::gl::all GL,
           ducks::coord::tile COORD = coord<ST>,
@@ -30,9 +45,13 @@ __device__ inline void load(ST& dst, const GL& src, const COORD& idx)
     uint32_t dst_ptr = reinterpret_cast<uintptr_t>(&dst.data[0]);
     const int laneid = threadIdx.x % N_THREADS;
 
-    // TODO: This is a hack to avoid the issue of too many VGPRs.
-    // We should find a better way to do this.
-    const int small_calls = 16;
+    // Loads are issued in batches of `small_calls` so that only that many are in
+    // flight -- and staged in registers -- at once. Each entry is a float4, i.e.
+    // 4 VGPRs, so a batch of 8 costs 32 VGPRs out of the 256 a gfx11 wave gets.
+    // CDNA uses 16 here, but a wave32 lane covers twice as many chunks as a
+    // wave64 one for the same tile, so the same number would double the live
+    // range. Eight is still enough outstanding loads to cover memory latency.
+    constexpr int small_calls = stage_batch;
     const int big_calls = (total_calls + small_calls - 1) / small_calls;
     float4    buf[small_calls];
 
@@ -105,35 +124,32 @@ __device__ inline void load_global_to_register_buffer(float4* reg_buffer, const 
     constexpr int elem_per_memcpy = sizeof(float4)/sizeof(T);
     constexpr int memcpy_per_row = ST::cols / elem_per_memcpy;
     constexpr int total_chunks = (ST::rows * ST::cols) / elem_per_memcpy;
-    constexpr int total_calls = (total_chunks + N_THREADS - 1) / N_THREADS;
-    constexpr int small_calls = 16;
-    const int big_calls = (total_calls + small_calls - 1) / small_calls;
+    constexpr int total_calls = stage_calls<ST, N_THREADS>;
 
     const int row_stride = src.template stride<axis>();
-    const int row_stride_bytes = row_stride * sizeof(T);
     coord<> unit_coord = idx.template unit_coord<axis, 3>();
     T* base_ptr = (T*)&src[unit_coord];  // global memory pointer
     const int laneid = threadIdx.x % N_THREADS;
 
-    // buffer resource
+    // buffer resource: a plain raw buffer spanning this tile's rows, so reads
+    // past the last row clamp to zero instead of walking off the allocation.
+    // The config word is the gfx11 one -- see make_srsrc; the gfx9 word the CDNA
+    // tree uses silently reads back zeros here.
     const int total_bytes = row_stride * ST::rows * sizeof(T);
-    i32x4 srsrc = make_srsrc(base_ptr, total_bytes, row_stride_bytes);
+    i32x4 srsrc = make_srsrc(base_ptr, total_bytes);
 
-    int buf_idx = 0;
-    for (int i = 0; i < big_calls && buf_idx < buffer_size; ++i) {
-        const int offset = i * small_calls;
-        #pragma unroll
-        for (int j = 0; j < small_calls; ++j) {
-            const int chunk_idx = (offset + j) * N_THREADS + laneid;
-            if (chunk_idx < total_chunks && buf_idx < buffer_size) {
-                int row = chunk_idx / memcpy_per_row;
-                int col = (chunk_idx % memcpy_per_row) * elem_per_memcpy;
-                int flat_offset = row * row_stride + col;
-                int byte_offset = flat_offset * sizeof(T);
-                __uint128_t raw = llvm_amdgcn_raw_buffer_load_b128(srsrc, byte_offset, 0, 0);
-                reg_buffer[buf_idx] = *reinterpret_cast<float4*>(&raw);
-                buf_idx++;
-            }
+    // Buffer slot c holds chunk c*N_THREADS + laneid. store_register_buffer_to_shared
+    // below walks the identical indexing, which is what keeps the two halves of
+    // this pair in agreement; do not make one of them skip slots.
+    #pragma unroll
+    for (int c = 0; c < total_calls; ++c) {
+        const int chunk_idx = c * N_THREADS + laneid;
+        if (c < buffer_size && chunk_idx < total_chunks) {
+            int row = chunk_idx / memcpy_per_row;
+            int col = (chunk_idx % memcpy_per_row) * elem_per_memcpy;
+            int byte_offset = (row * row_stride + col) * sizeof(T);
+            __uint128_t raw = llvm_amdgcn_raw_buffer_load_b128(srsrc, byte_offset, 0, 0);
+            reg_buffer[c] = *reinterpret_cast<float4*>(&raw);
         }
     }
 }
@@ -145,40 +161,41 @@ __device__ inline void load_global_to_register_buffer(float4* reg_buffer, const 
  * @tparam ST The type of the destination shared tile.
  * @param[out] dst The destination shared tile to store data into.
  * @param[in] reg_buffer The register buffer to store data from.
+ * @param[in] buffer_size The size of the register buffer, as passed to the load.
  */
 template<int N_THREADS = WARP_THREADS, ducks::st::all ST>
-__device__ inline void store_register_buffer_to_shared(ST& dst, const float4* reg_buffer) {
+__device__ inline void store_register_buffer_to_shared(ST& dst, const float4* reg_buffer,
+                                                       const int buffer_size = stage_calls<ST, N_THREADS>) {
     using T = typename ST::dtype;
     constexpr int elem_per_memcpy = sizeof(float4)/sizeof(T);
     constexpr int elem_per_half_memcpy = sizeof(float2)/sizeof(T);
     constexpr int memcpy_per_row = ST::cols / elem_per_memcpy;
-    
+
     uint32_t dst_ptr = reinterpret_cast<uintptr_t>(&dst.data[0]);
     const int laneid = threadIdx.x % N_THREADS;
-    
-    constexpr int total_chunks = (ST::rows * ST::cols) / elem_per_memcpy;
-    constexpr int total_calls = (total_chunks + N_THREADS - 1) / N_THREADS;
-    constexpr int small_calls = 16;
-    const int big_calls = (total_calls + small_calls - 1) / small_calls;
 
-    int buf_idx = 0;
-    // Store in the same batched pattern to maintain locality
+    constexpr int total_chunks = (ST::rows * ST::cols) / elem_per_memcpy;
+    constexpr int total_calls = stage_calls<ST, N_THREADS>;
+
+    // Same slot -> chunk mapping as load_global_to_register_buffer. The CDNA
+    // version guarded this with a hardcoded `buf_idx < 64` that had no relation
+    // to the buffer the caller actually passed; the size is a parameter here.
     #pragma unroll
-    for (int i = 0; i < big_calls; i++) {
-        const int offset = i * small_calls;
-        #pragma unroll
-        for(int j = 0; j < small_calls; j++) {
-            int load_idx = (offset + j) * N_THREADS + laneid;
-            int row = load_idx / memcpy_per_row;
-            int col = (load_idx % memcpy_per_row) * elem_per_memcpy;
-            if (row < dst.rows && buf_idx < 64) { // Safety check - use fixed limit
-                const float4& buf_val = reg_buffer[buf_idx];
-                store_shared_vec(dst.idx(dst_ptr, {row, col}), {buf_val.x, buf_val.y});
-                store_shared_vec(dst.idx(dst_ptr, {row, col + elem_per_half_memcpy}), {buf_val.z, buf_val.w});
-                buf_idx++;
-            }
-        } // Wait for this batch of stores to complete
+    for (int c = 0; c < total_calls; ++c) {
+        const int chunk_idx = c * N_THREADS + laneid;
+        if (c < buffer_size && chunk_idx < total_chunks) {
+            int row = chunk_idx / memcpy_per_row;
+            int col = (chunk_idx % memcpy_per_row) * elem_per_memcpy;
+            const float4& buf_val = reg_buffer[c];
+            store_shared_vec(dst.idx(dst_ptr, {row, col}), {buf_val.x, buf_val.y});
+            store_shared_vec(dst.idx(dst_ptr, {row, col + elem_per_half_memcpy}), {buf_val.z, buf_val.w});
+        }
     }
+    #ifdef BUILTINS_ONLY
+    __builtin_amdgcn_s_waitcnt(0);
+    #else
+    asm volatile("s_waitcnt lgkmcnt(0)");
+    #endif
 }
 
 

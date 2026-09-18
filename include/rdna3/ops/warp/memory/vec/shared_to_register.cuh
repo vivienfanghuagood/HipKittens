@@ -13,6 +13,25 @@
 
 namespace kittens {
 
+/*
+ * gfx11 register-vector layouts. All three follow from the tile layouts in
+ * types/register/rt_base.cuh -- a register vector is just one axis of a tile.
+ *
+ *   naive : entry i lives in lane i%32, outer step i/32. No replication; the
+ *           layout for plain vector work that never touches a tile.
+ *   ortho : indexed along the *lane* axis (l%16), so entry 16*w + l%16 sits in
+ *           data[w][0], replicated across the two wave halves.
+ *   align : indexed along the *element* axis, so the vector is replicated across
+ *           the 16 lanes of a half. Which entries a lane holds depends on the
+ *           element type -- a bf16/half operand's lane covers all 16, while an
+ *           f32 accumulator's two halves split the entries even/odd. That is
+ *           what rv_align_elem() resolves.
+ *
+ * None of these are bandwidth-critical (a vector is 1/16 of a tile), so they are
+ * all plain elementwise accesses. Lanes that map to the same entry issue the
+ * same address and LDS broadcasts them.
+ */
+
 /**
  * @brief Load data from a shared vector into a register vector.
  *
@@ -23,52 +42,38 @@ namespace kittens {
  */
 template<ducks::rv::all RV, ducks::sv::all SV>
 __device__ inline static void load(RV &dst, const SV &src) {
-    using T2 = RV::dtype;
-    using U = SV::dtype;
-    using U2 = base_types::packing<U>::packed_type;
-    using T = base_types::packing<T2>::unpacked_type;
+    using T2 = typename RV::dtype;
+    using U  = typename SV::dtype;
+    using T  = typename base_types::packing<T2>::unpacked_type;
 
     static_assert(SV::length == RV::length);
-    
-    int laneid = ::kittens::laneid();
-    
+
+    const int lane = ::kittens::laneid();
+
     if constexpr (std::is_same_v<typename RV::layout, align_l>) {
         #pragma unroll
-        for(auto w = 0; w < (dst.outer_dim+3)/4; w++) {
-            int idx = w*128 + 2 * laneid;
-            int o_dim = w*4 + (laneid/8) / 2;
-            int i_dim = (laneid/8) % 2;
-            // this should be a maximally coalesced load.
-            if(idx < dst.length) {
-                dst[o_dim][i_dim] = base_types::convertor<T2, U2>::convert(*(U2*)&src.data[idx]);
+        for(int w = 0; w < dst.outer_dim; w++) {
+            #pragma unroll
+            for(int p = 0; p < kittens::TILE_ROW_DIM<T>; p++) {
+                const int e = rv_align_elem<T>(p, lane);
+                if(e < 0) continue;
+                const T val = base_types::convertor<T, U>::convert(src.data[w*kittens::TILE_ROW_DIM<T> + p]);
+                if(e & 1) dst.data[w][e>>1].y = val;
+                else      dst.data[w][e>>1].x = val;
             }
-        }
-        // now we need to do a bunch of shuffle_sync's to make sure everyone has everything they need.
-        #pragma unroll
-        for(auto w = 0; w < dst.outer_dim; w++) {
-            int leader = 16*(w%4) + (laneid%8); // repeats every 128 columns
-            dst[w][0] = packed_shfl(MASK_ALL, dst[w][0], leader);
-            dst[w][1] = packed_shfl(MASK_ALL, dst[w][1], leader+8);
         }
     }
     else if constexpr (std::is_same_v<typename RV::layout, ortho_l>) {
-        // really hoping https://stackoverflow.com/questions/15029765/is-coalescing-triggered-for-accessing-memory-in-reverse-order is still true
-        // otherwise there will be some pain :/
         #pragma unroll
-        for(auto w = 0; w < (dst.outer_dim+3)/4; w++) {
-            int idx = w*64 + (laneid%8)*8 + (laneid/8);
-            int o_dim = w*2 + (laneid%4) / 2;
-            // this should be a maximally coalesced load.
-            if(idx < dst.length) {
-                T tmp = base_types::convertor<T, U>::convert(src.data[idx]);
-                dst[o_dim][0] =  tmp;
-            }
+        for(int w = 0; w < dst.outer_dim; w++) {
+            dst[w][0] = base_types::convertor<T, U>::convert(
+                src.data[w*kittens::TILE_ROW_DIM<T> + (lane & 15)]);
         }
     }
     else if constexpr (std::is_same_v<typename RV::layout, naive_l>) {
         #pragma unroll
-        for(auto w = 0; w < dst.outer_dim; w++) {
-            int idx = w*64 + laneid;
+        for(int w = 0; w < dst.outer_dim; w++) {
+            const int idx = w*WARP_THREADS + lane;
             if(idx < dst.length) {
                 dst[w][0] = base_types::convertor<T, U>::convert(src.data[idx]);
             }
@@ -86,43 +91,39 @@ __device__ inline static void load(RV &dst, const SV &src) {
  */
 template<ducks::sv::all SV, ducks::rv::all RV>
 __device__ inline static void store(SV &dst, const RV &src) {
-    using T2 = RV::dtype;
-    using U = SV::dtype;
-    using U2 = base_types::packing<U>::packed_type;
-    using T = base_types::packing<T2>::unpacked_type;
+    using T2 = typename RV::dtype;
+    using U  = typename SV::dtype;
+    using T  = typename base_types::packing<T2>::unpacked_type;
 
     static_assert(SV::length == RV::length);
-    
-    int laneid = ::kittens::laneid();
 
+    const int lane = ::kittens::laneid();
+
+    // In the replicated layouts several lanes hold the same entry and all write
+    // it. The values agree by construction, so the duplicate writes are benign.
     if constexpr (std::is_same_v<typename RV::layout, align_l>) {
         #pragma unroll
-        for(auto w = 0; w < (src.outer_dim+3)/4; w++) {
-            int idx = w*128 + 2 * laneid;
-            int o_dim = w*4 + (laneid/8) / 2;
-            int i_dim = (laneid/8) % 2;
-            // this should be a maximally coalesced store. I hope!
-            if(idx < src.length) 
-                *(U2*)&dst.data[idx] = base_types::convertor<U2, T2>::convert(src[o_dim][i_dim]);
+        for(int w = 0; w < src.outer_dim; w++) {
+            #pragma unroll
+            for(int p = 0; p < kittens::TILE_ROW_DIM<T>; p++) {
+                const int e = rv_align_elem<T>(p, lane);
+                if(e < 0) continue;
+                const T val = (e & 1) ? src.data[w][e>>1].y : src.data[w][e>>1].x;
+                dst.data[w*kittens::TILE_ROW_DIM<T> + p] = base_types::convertor<U, T>::convert(val);
+            }
         }
     }
     else if constexpr (std::is_same_v<typename RV::layout, ortho_l>) {
-        // really hoping https://stackoverflow.com/questions/15029765/is-coalescing-triggered-for-accessing-memory-in-reverse-order is still true
-        // otherwise there will be some pain :/
         #pragma unroll
-        for(auto w = 0; w < (src.outer_dim+3)/4; w++) {
-            int idx = w*64 + (laneid%8)*8 + (laneid/8);
-            int o_dim = w*2 + (laneid%4) / 2;
-            // this should be a maximally coalesced load.
-            if(idx < src.length) {
-                dst.data[idx] = base_types::convertor<U, T>::convert(src[o_dim][0]);
-            }
+        for(int w = 0; w < src.outer_dim; w++) {
+            dst.data[w*kittens::TILE_ROW_DIM<T> + (lane & 15)] =
+                base_types::convertor<U, T>::convert(src[w][0]);
         }
     }
     else if constexpr (std::is_same_v<typename RV::layout, naive_l>) {
         #pragma unroll
-        for(auto w = 0; w < src.outer_dim; w++) {
-            int idx = w*64 + laneid;
+        for(int w = 0; w < src.outer_dim; w++) {
+            const int idx = w*WARP_THREADS + lane;
             if(idx < src.length) {
                 dst.data[idx] = base_types::convertor<U, T>::convert(src[w][0]);
             }

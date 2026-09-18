@@ -123,6 +123,25 @@ __device__ static inline int2 rt_base_coord(int e, int lane) {
     else                                                    { return int2{pos, l16}; }
 }
 
+/**
+ * @brief Where entry `p` of an rv_layout::align vector lives within a lane.
+ *
+ * An `align` vector is indexed along a tile's element axis, so it inherits that
+ * axis' lane mapping: the vector is replicated across the 16 lanes of a wave
+ * half, and -- for the f32 accumulator, whose halves interleave -- each half
+ * holds only every other entry.
+ *
+ * Returns the element index `e` in 0..elements_per_thread-1 that this lane uses
+ * for entry `p` in 0..15, or -1 if this lane's half does not hold `p` at all.
+ * It is the inverse of the `pos` computed by rt_base_coord().
+ */
+template<typename T>
+__device__ static inline int rv_align_elem(int p, int lane) {
+    using base = rt_base<T, ducks::rt_layout::row>; // stride/interleave depend only on T
+    if constexpr (base::halves_interleave) return ((p & 1) == (lane >> 4)) ? (p >> 1) : -1;
+    else                                   return p; // replication 2: every lane holds every entry
+}
+
 /* ----------  CONCEPTS  ---------- */
 
 namespace ducks {

@@ -10,6 +10,13 @@
 
 namespace kittens {
 
+/*
+ * Identical lane mapping to the shared-memory vector path next door; see the
+ * comment there for the three layouts. Global memory just replaces src.data[]
+ * with a raw pointer, and lanes that map to the same entry coalesce instead of
+ * broadcasting.
+ */
+
  /**
  * @brief Load data into a register vector from a source array in global memory.
  *
@@ -20,50 +27,39 @@ namespace kittens {
  */
 template<ducks::rv::all RV, ducks::gl::all GL, ducks::coord::vec COORD=coord<RV>>
 __device__ inline static void load(RV &dst, const GL &src, const COORD &idx) {
-    using T2 = RV::dtype;
-    using U = typename GL::dtype;
-    using U2 = base_types::packing<U>::packed_type;
-    using T = base_types::packing<T2>::unpacked_type;
+    using T2 = typename RV::dtype;
+    using U  = typename GL::dtype;
+    using T  = typename base_types::packing<T2>::unpacked_type;
 
-    U *src_ptr = (U*)&src[(idx.template unit_coord<-1, 3>())];
-    int laneid = ::kittens::laneid();
+    const U *src_ptr = (const U*)&src[(idx.template unit_coord<-1, 3>())];
+    const int lane = ::kittens::laneid();
 
     if constexpr (std::is_same_v<typename RV::layout, align_l>) {
         #pragma unroll
-        for(auto w = 0; w < (dst.outer_dim+3)/4; w++) {
-            int idx = w*64 + 2 * laneid;
-            int o_dim = w*4 + (laneid/8) / 2;
-            int i_dim = (laneid/8) % 2;
-            // this should be a maximally coalesced load.
-            if(idx < dst.length)
-                dst[o_dim][i_dim] = base_types::convertor<T2, U2>::convert(*(U2*)&src_ptr[idx]);
-        }
-        // now we need to do a bunch of shuffle_sync's to make sure everyone has everything they need.
-        #pragma unroll
-        for(auto w = 0; w < dst.outer_dim; w++) {
-            int leader = 16*(w%4) + (laneid%8); // repeats every 128 columns
-            dst[w][0] = packed_shfl(MASK_ALL, dst[w][0], leader);
-            dst[w][1] = packed_shfl(MASK_ALL, dst[w][1], leader+8);
+        for(int w = 0; w < dst.outer_dim; w++) {
+            #pragma unroll
+            for(int p = 0; p < kittens::TILE_ROW_DIM<T>; p++) {
+                const int e = rv_align_elem<T>(p, lane);
+                if(e < 0) continue;
+                const T val = base_types::convertor<T, U>::convert(src_ptr[w*kittens::TILE_ROW_DIM<T> + p]);
+                if(e & 1) dst.data[w][e>>1].y = val;
+                else      dst.data[w][e>>1].x = val;
+            }
         }
     }
     else if constexpr (std::is_same_v<typename RV::layout, ortho_l>) {
         #pragma unroll
-        for(auto w = 0; w < (dst.outer_dim+3)/4; w++) {
-            int idx = w*64 + (laneid%8)*8 + (laneid/8);
-            int o_dim = w*2 + (laneid%4) / 2;
-            // this should be a maximally coalesced load.
-            if(idx < dst.length) {
-                T tmp = base_types::convertor<T, U>::convert(src_ptr[idx]);
-                dst[o_dim][0] = tmp;
-            }
+        for(int w = 0; w < dst.outer_dim; w++) {
+            dst[w][0] = base_types::convertor<T, U>::convert(
+                src_ptr[w*kittens::TILE_ROW_DIM<T> + (lane & 15)]);
         }
     }
     else if constexpr (std::is_same_v<typename RV::layout, naive_l>) {
         #pragma unroll
-        for(auto w = 0; w < dst.outer_dim; w++) {
-            int idx = w*64 + laneid;
-            if(idx < dst.length) {
-                dst[w][0] = base_types::convertor<T, U>::convert(src_ptr[idx]);
+        for(int w = 0; w < dst.outer_dim; w++) {
+            const int i = w*WARP_THREADS + lane;
+            if(i < dst.length) {
+                dst[w][0] = base_types::convertor<T, U>::convert(src_ptr[i]);
             }
         }
     }
@@ -79,48 +75,42 @@ __device__ inline static void load(RV &dst, const GL &src, const COORD &idx) {
  */
 template<ducks::rv::all RV, ducks::gl::all GL, ducks::coord::vec COORD=coord<RV>>
 __device__ inline static void store(const GL &dst, const RV &src, const COORD &idx) {
-    using T2 = RV::dtype;
-    using U = typename GL::dtype;
-    using U2 = base_types::packing<U>::packed_type;
-    using T = base_types::packing<T2>::unpacked_type;
-    
+    using T2 = typename RV::dtype;
+    using U  = typename GL::dtype;
+    using T  = typename base_types::packing<T2>::unpacked_type;
+
     U *dst_ptr = (U*)&dst[(idx.template unit_coord<-1, 3>())];
-    int laneid = ::kittens::laneid();
-    
-    if constexpr (std::is_same_v<typename RV::layout, align_l>) { 
-        #pragma unroll 
-        for(auto w = 0; w < (src.outer_dim+3)/4; w++) { 
-            int idx = w*64 + 2 * laneid; 
-            int o_dim = w*4 + (laneid/8) / 2; 
-            int i_dim = (laneid/8) % 2; 
-            // this should be a maximally coalesced store. I hope! 
-            if(idx < src.length) *(U2*)&dst_ptr[idx] = base_types::convertor<U2, T2>::convert(src[o_dim][i_dim]); 
-        } 
+    const int lane = ::kittens::laneid();
+
+    // As in the shared path, replicated layouts have several lanes writing the
+    // same entry with the same value.
+    if constexpr (std::is_same_v<typename RV::layout, align_l>) {
+        #pragma unroll
+        for(int w = 0; w < src.outer_dim; w++) {
+            #pragma unroll
+            for(int p = 0; p < kittens::TILE_ROW_DIM<T>; p++) {
+                const int e = rv_align_elem<T>(p, lane);
+                if(e < 0) continue;
+                const T val = (e & 1) ? src.data[w][e>>1].y : src.data[w][e>>1].x;
+                dst_ptr[w*kittens::TILE_ROW_DIM<T> + p] = base_types::convertor<U, T>::convert(val);
+            }
+        }
     }
     else if constexpr (std::is_same_v<typename RV::layout, ortho_l>) {
-        // really hoping https://stackoverflow.com/questions/15029765/is-coalescing-triggered-for-accessing-memory-in-reverse-order is still true
-        // otherwise there will be some pain :/
         #pragma unroll
-        for(auto w = 0; w < (src.outer_dim+3)/4; w++) {
-            int idx = w*64 + (laneid%8)*8 + (laneid/8);
-            int o_dim = w*2 + (laneid%4) / 2;
-            // this should be a maximally coalesced load.
-            if(idx < src.length) {
-                U tmp;
-                tmp = base_types::convertor<U, T>::convert(src[o_dim][0]);
-                dst_ptr[idx] = tmp;
-            }
+        for(int w = 0; w < src.outer_dim; w++) {
+            dst_ptr[w*kittens::TILE_ROW_DIM<T> + (lane & 15)] =
+                base_types::convertor<U, T>::convert(src[w][0]);
         }
     }
     else if constexpr (std::is_same_v<typename RV::layout, naive_l>) {
         #pragma unroll
-        for(auto w = 0; w < src.outer_dim; w++) {
-            int idx = w*64 + laneid;
-            if(idx < src.length) {
-                dst_ptr[idx] = base_types::convertor<U, T>::convert(src[w][0]);
+        for(int w = 0; w < src.outer_dim; w++) {
+            const int i = w*WARP_THREADS + lane;
+            if(i < src.length) {
+                dst_ptr[i] = base_types::convertor<U, T>::convert(src[w][0]);
             }
         }
     }
 }
 } // namespace kittens
-

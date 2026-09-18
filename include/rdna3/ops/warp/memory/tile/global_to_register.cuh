@@ -11,187 +11,159 @@
 
 namespace kittens {
 
-/**
- * @brief Load data from a source array into a row-major layout tile.
+/*
+ * Same gfx11 lane mapping as the shared-memory path (rt_base_coord in
+ * types/register/rt_base.cuh), minus the swizzle: global tiles are plain
+ * row-major with `row_stride` between rows.
  *
- * @tparam RT The row-major layout tile type.
- * @tparam U The data type of the source array.
+ * Only the row-layout 2-byte operand is contiguous per lane -- 16 elements =
+ * 32 B, issued as two 16-byte accesses. Everything else is strided and goes
+ * elementwise, which is what the CDNA tree already does for its column path.
+ *
+ * As there, lanes l and l+16 of an operand tile address identical bytes. That
+ * is the mirroring WMMA requires; the coalescer merges them.
+ *
+ * Unlike LDS, global rows are only as aligned as `row_stride` makes them: the
+ * allocation base is 256 B from hipMalloc, but row r starts at r*row_stride
+ * elements, so a stride of e.g. 8200 bf16 leaves every odd row 16-byte
+ * misaligned. The wide path is therefore selected at runtime (a warp-uniform
+ * scalar branch) and falls back to the elementwise loop, which needs no
+ * alignment at all, when the tile does not qualify.
+ */
+
+/**
+ * @brief Load data from a source array into a register tile.
+ *
+ * @tparam RT The register tile type.
+ * @tparam GL The global layout type.
  * @param dst[out] The destination tile to load data into.
  * @param src[in] The source array to load data from.
  * @param idx[in] The index of the tile to load data from.
  */
-template<int axis, ducks::rt::row_layout RT, ducks::gl::all GL, ducks::coord::tile COORD=coord<RT>>
+template<int axis, ducks::rt::all RT, ducks::gl::all GL, ducks::coord::tile COORD=coord<RT>>
 __device__ inline static void load(RT &dst, const GL &src, const COORD &idx) {
-    using T2 = RT::dtype;
-    using U = typename GL::dtype;
-    using U2 = base_types::packing<U>::packed_type;
+    using T  = typename base_types::packing<typename RT::dtype>::unpacked_type;
+    using U  = typename GL::dtype;
 
-    U *src_ptr = (U*)&src[(idx.template unit_coord<axis, 3>())];
+    using L    = typename RT::layout;
+    using base = rt_base<T, L>;
+
+    constexpr bool is_row = std::is_same_v<L, ducks::rt_layout::row>;
+    constexpr int  E      = base::elements_per_thread;
+    constexpr bool vectorizable = is_row && base::element_stride == 1
+                                         && std::is_same_v<T, U> && sizeof(U) == 2;
+
+    const U *src_ptr = (const U*)&src[(idx.template unit_coord<axis, 3>())];
     const int row_stride = src.template stride<axis>();
-    int laneid = kittens::laneid();
+    const int lane = laneid();
+    const int l16  = lane & 15;
 
-    int row_offset = laneid%16, col_offset = 4*(laneid/16);
+    // 16-byte alignment of every row this warp will touch. Uniform across the
+    // warp, so the branch below is a scalar branch, not divergence.
+    const bool wide = vectorizable &&
+        ((reinterpret_cast<uintptr_t>(src_ptr) | (row_stride * sizeof(U))) & 15) == 0;
 
-    uint32_t buffer_size = src.batch() * src.depth() * src.rows() * src.cols() * sizeof(U);
-    std::uintptr_t as_int = reinterpret_cast<std::uintptr_t>(src_ptr);
-    std::uint64_t  as_u64 = static_cast<std::uint64_t>(as_int);    // widen if host is 32-bit
-    buffer_resource br = make_buffer_resource(as_u64, buffer_size, 0x00020000);
-
+    auto elementwise = [&](int i, int j, int row_base, int col_base) {
+        #pragma unroll
+        for(int e = 0; e < E; e++) {
+            const int2 c = rt_base_coord<T, L>(e, lane);
+            const T val = base_types::convertor<T, U>::convert(
+                src_ptr[(row_base + c.x)*row_stride + col_base + c.y]);
+            if (e & 1) dst.tiles[i][j].data[e>>1].y = val;
+            else       dst.tiles[i][j].data[e>>1].x = val;
+        }
+    };
 
     #pragma unroll
     for(int i = 0; i < dst.height; i++) {
-        int row = dst.tile_size_row*i + row_offset;
-
         #pragma unroll
         for(int j = 0; j < dst.width; j++) {
-            int col = dst.tile_size_col*j + col_offset;
-
-            U2* tmp;
-            if constexpr (sizeof(U2) == 4) { // bf16_2
-                float2 loaded = std::bit_cast<float2>(llvm_amdgcn_raw_buffer_load_b64(
-                    std::bit_cast<i32x4>(br),
-                    (row*row_stride + col) * sizeof(U),
-                    0,
-                    0
-                ));
-                tmp = reinterpret_cast<U2*>(&loaded);
+            const int row_base = i*dst.tile_size_row;
+            const int col_base = j*dst.tile_size_col;
+            if constexpr (vectorizable) {
+                if (wide) {
+                    const U *p = &src_ptr[(row_base + l16)*row_stride + col_base];
+                    #pragma unroll
+                    for(int h = 0; h < 2; h++) {
+                        const float4 v = *reinterpret_cast<const float4*>(p + 8*h);
+                        __builtin_memcpy((void*)&dst.tiles[i][j].data[4*h], &v, sizeof(v));
+                    }
+                }
+                else elementwise(i, j, row_base, col_base);
             }
-            else { // float2
-                float4 loaded = std::bit_cast<float4>(llvm_amdgcn_raw_buffer_load_b128(
-                    std::bit_cast<i32x4>(br),
-                    (row*row_stride + col) * sizeof(U),
-                    0,
-                    0
-                ));
-                tmp = reinterpret_cast<U2*>(&loaded);
-            }
-            #pragma unroll
-            for(int k = 0; k < 2; k++) {
-                dst.tiles[i][j].data[k] = base_types::convertor<T2, U2>::convert(tmp[k]);
-            }
+            else elementwise(i, j, row_base, col_base);
         }
     }
-}
-
-
-/**
- * @brief Load data from a source array into a column-major layout tile.
- *
- * @tparam RT The column-major layout tile type.
- * @tparam U The data type of the source array.
- * @param dst[out] The destination tile to load data into.
- * @param src[in] The source array to load data from.
- * @param row_stride[in] The stride in elements between rows in the source array.
- */
-template<int axis, ducks::rt::col_layout RT, ducks::gl::all GL, ducks::coord::tile COORD=coord<RT>>
-__device__ inline static void load(RT &dst, const GL &src, const COORD &idx) {
-    using T = base_types::packing<typename RT::dtype>::unpacked_type;
-    using U = typename GL::dtype;
-    
-    U *src_ptr = (U*)&src[(idx.template unit_coord<axis, 3>())];
-    const int row_stride = src.template stride<axis>();
-    int laneid = kittens::laneid();
-
-    const int row_offset = 4*(laneid/16), col_offset = laneid%16;
-
-    #pragma unroll
-    for(int i = 0; i < dst.height; i++) {
-        int row = i*dst.tile_size_row + row_offset;
-
-        #pragma unroll
-        for(int j = 0; j < dst.width; j++) {
-            int col = j*dst.tile_size_col + col_offset;
-
-            dst.tiles[i][j].data[0].x = base_types::convertor<T, U>::convert(src_ptr[(row+0)*row_stride + col]);
-            dst.tiles[i][j].data[0].y = base_types::convertor<T, U>::convert(src_ptr[(row+1)*row_stride + col]);
-            dst.tiles[i][j].data[1].x = base_types::convertor<T, U>::convert(src_ptr[(row+2)*row_stride + col]);
-            dst.tiles[i][j].data[1].y = base_types::convertor<T, U>::convert(src_ptr[(row+3)*row_stride + col]);
-        }
-    }
-
 }
 
 template<ducks::rt::all RT, ducks::gl::all GL, ducks::coord::tile COORD=coord<RT>>
 __device__ inline static void load(RT &dst, const GL &src, const COORD &idx) {
-    load<2, RT, GL>(dst, src, idx);
+    load<2, RT, GL, COORD>(dst, src, idx);
 }
 
 /**
- * @brief Store data from a register tile to a destination array in global memory with a row-major layout.
+ * @brief Store data from a register tile to a destination array in global memory.
  *
- * @tparam RT The register tile type with a row-major layout.
- * @tparam U The data type of the destination array.
+ * @tparam RT The register tile type.
+ * @tparam GL The global layout type.
  * @param[out] dst The destination array in global memory to store data into.
  * @param[in] src The source register tile to store data from.
- * @param row_stride[in] The stride in elements between rows in the destination array.
+ * @param[in] idx The index of the tile to store data to.
  */
-template<int axis, ducks::rt::row_layout RT, ducks::gl::all GL, ducks::coord::tile COORD=coord<RT>>
+template<int axis, ducks::rt::all RT, ducks::gl::all GL, ducks::coord::tile COORD=coord<RT>>
 __device__ inline static void store(const GL &dst, const RT &src, const COORD &idx) {
-    using T2 = RT::dtype;
-    using U = typename GL::dtype;
-    using U2 = base_types::packing<U>::packed_type;
+    using T  = typename base_types::packing<typename RT::dtype>::unpacked_type;
+    using U  = typename GL::dtype;
+
+    using L    = typename RT::layout;
+    using base = rt_base<T, L>;
+
+    constexpr bool is_row = std::is_same_v<L, ducks::rt_layout::row>;
+    constexpr int  E      = base::elements_per_thread;
+    constexpr bool vectorizable = is_row && base::element_stride == 1
+                                         && std::is_same_v<T, U> && sizeof(U) == 2;
 
     U *dst_ptr = (U*)&dst[(idx.template unit_coord<axis, 3>())];
     const int row_stride = dst.template stride<axis>();
-    int laneid = kittens::laneid();
+    const int lane = laneid();
+    const int l16  = lane & 15;
 
-    int row_offset = laneid%16, col_offset = 4*(laneid/16);
+    const bool wide = vectorizable &&
+        ((reinterpret_cast<uintptr_t>(dst_ptr) | (row_stride * sizeof(U))) & 15) == 0;
 
-    #pragma unroll
-    for(int i = 0; i < src.height; i++) {
-        int row = src.tile_size_row*i + row_offset;
-        
+    // Lanes l and l+16 of an operand tile write the same bytes with the same
+    // values. That redundancy is exactly the WMMA mirroring invariant, so the
+    // write is benign whichever lane lands last.
+    auto elementwise = [&](int i, int j, int row_base, int col_base) {
         #pragma unroll
-        for(int j = 0; j < src.width; j++) {
-            int col = src.tile_size_col*j + col_offset;
-
-            U2 tmp[2];
-            #pragma unroll
-            for(int k = 0; k < 2; k++) {
-                tmp[k] = base_types::convertor<U2, T2>::convert(src.tiles[i][j].data[k]);
-            }
-            if constexpr (sizeof(U2) == 4) { // bf16_2
-                *(bytes_8*)&dst_ptr[row*row_stride + col] = *(bytes_8*)tmp;
-            }
-            else { // float2
-                *(bytes_16*)&dst_ptr[row*row_stride + col] = *(bytes_16*)tmp;
-            }
+        for(int e = 0; e < E; e++) {
+            const int2 c = rt_base_coord<T, L>(e, lane);
+            const T val = (e & 1) ? src.tiles[i][j].data[e>>1].y
+                                  : src.tiles[i][j].data[e>>1].x;
+            dst_ptr[(row_base + c.x)*row_stride + col_base + c.y] =
+                base_types::convertor<U, T>::convert(val);
         }
-    }
-}
-
-
-/**
- * @brief Store data from a register tile to a destination array in global memory with a column-major layout.
- *
- * @tparam RT The register tile type with a column-major layout.
- * @tparam U The data type of the destination array.
- * @param[out] dst The destination array in global memory to store data into.
- * @param[in] src The source register tile to store data from.
- * @param row_stride[in] The stride in elements between rows in the destination array.
- */
-template<int axis, ducks::rt::col_layout RT, ducks::gl::all GL, ducks::coord::tile COORD=coord<RT>>
-__device__ inline static void store(const GL &dst, const RT &src, const COORD &idx) {
-    using T = base_types::packing<typename RT::dtype>::unpacked_type;
-    using U = typename GL::dtype;
-
-    U *dst_ptr = (U*)&dst[(idx.template unit_coord<axis, 3>())];
-    const int row_stride = dst.template stride<axis>();
-    const int laneid = kittens::laneid();
-
-    const int row_offset = 4*(laneid/16), col_offset = laneid%16;
+    };
 
     #pragma unroll
     for(int i = 0; i < src.height; i++) {
-        const int row = i*src.tile_size_row + row_offset;
-
         #pragma unroll
         for(int j = 0; j < src.width; j++) {
-            const int col = j*src.tile_size_col + col_offset;
-            dst_ptr[(row+0)*row_stride + col] = base_types::convertor<U, T>::convert(src.tiles[i][j].data[0].x);
-            dst_ptr[(row+1)*row_stride + col] = base_types::convertor<U, T>::convert(src.tiles[i][j].data[0].y);
-            dst_ptr[(row+2)*row_stride + col] = base_types::convertor<U, T>::convert(src.tiles[i][j].data[1].x);
-            dst_ptr[(row+3)*row_stride + col] = base_types::convertor<U, T>::convert(src.tiles[i][j].data[1].y);
+            const int row_base = i*src.tile_size_row;
+            const int col_base = j*src.tile_size_col;
+            if constexpr (vectorizable) {
+                if (wide) {
+                    U *p = &dst_ptr[(row_base + l16)*row_stride + col_base];
+                    #pragma unroll
+                    for(int h = 0; h < 2; h++) {
+                        float4 v;
+                        __builtin_memcpy(&v, (const void*)&src.tiles[i][j].data[4*h], sizeof(v));
+                        *reinterpret_cast<float4*>(p + 8*h) = v;
+                    }
+                }
+                else elementwise(i, j, row_base, col_base);
+            }
+            else elementwise(i, j, row_base, col_base);
         }
     }
 }
