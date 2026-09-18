@@ -16,8 +16,9 @@
 COMMON_DIR := ../common
 TK_INCLUDE := ../../../include
 
-# HIP toolchain
-ROCM_INSTALL_DIR := $(ROCM_PATH)
+# HIP toolchain. ROCM_PATH is only exported by some ROCm images' login shells,
+# so fall back to the standard install location rather than building -I/include/hip.
+ROCM_INSTALL_DIR := $(if $(ROCM_PATH),$(ROCM_PATH),/opt/rocm)
 HIP_INCLUDE_DIR  := $(ROCM_INSTALL_DIR)/include/hip
 HIPCXX ?= $(ROCM_INSTALL_DIR)/bin/hipcc
 
@@ -80,18 +81,25 @@ OBJS := $(LOCAL_OBJS) $(COMMON_OBJS)
 .PHONY: all run clean
 all: $(TARGET)
 
+# Header dependencies. Nearly all of the library is headers, so without these a
+# change under include/ leaves every object stale and the test binary silently
+# keeps testing the old code.
+DEPFLAGS := -MMD -MP
+
 # Shared objects from ../common.
 $(BUILD_DIR)/common/%.o: $(COMMON_DIR)/%.cu
 	mkdir -p $(@D)
-	$(HIPCXX) $(HIPFLAGS) -c $< -o $@
+	$(HIPCXX) $(HIPFLAGS) $(DEPFLAGS) -c $< -o $@
 
 # Arch-local objects.
 $(BUILD_DIR)/%.o: %.cu
 	mkdir -p $(@D)
-	$(HIPCXX) $(HIPFLAGS) -c $< -o $@
+	$(HIPCXX) $(HIPFLAGS) $(DEPFLAGS) -c $< -o $@
 
 $(TARGET): $(OBJS)
 	$(HIPCXX) $(HIPFLAGS) $^ -o $(TARGET)
+
+-include $(OBJS:.o=.d)
 
 run: all
 	./$(TARGET)

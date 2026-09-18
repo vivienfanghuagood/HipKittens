@@ -5,5 +5,6 @@
 
 #pragma once
 
+#include "st_shape.cuh"
 #include "sv.cuh"
 #include "st.cuh"

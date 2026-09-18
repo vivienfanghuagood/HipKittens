@@ -49,6 +49,10 @@ using col_vec = T::col_vec;
 
 // ^ this code lives here because it applies to both sv and rv types
 
+// tile shapes. gfx11 has one of each; see rt_shape.cuh and st_shape.cuh.
+using rt_16x16_s = ducks::rt_shape::rt_16x16;
+using st_16x16_s = ducks::st_shape::st_16x16;
+
 // register tile layouts
 using row_l = ducks::rt_layout::row;
 using col_l = ducks::rt_layout::col;

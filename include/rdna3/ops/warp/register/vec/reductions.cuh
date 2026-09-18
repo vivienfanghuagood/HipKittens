@@ -34,10 +34,43 @@ __device__ static inline void reduce(
     using T = base_types::packing<typename RV::dtype>::unpacked_type;
     int laneid = kittens::laneid();
     if constexpr (std::is_same_v<typename RV::layout, ortho_l>) {
-        static_assert(false, "ortho_l reduce is not currently supported");
+        // Entry 16*o + (laneid%16) lives in lane `laneid`, and the two wave
+        // halves are mirrors. So fold the subtiles register-locally, then
+        // butterfly across the 16 lanes of a half. Each half runs the identical
+        // reduction over identical data, so both land on the same answer and no
+        // broadcast is needed.
+        T accum = src[0][0];
+        #pragma unroll
+        for(int o = 1; o < src.outer_dim; o++) {
+            accum = op::template op<T>(accum, src[o][0]);
+        }
+        accum = half_wave_butterfly<op, T>(accum);
+        if constexpr (!reset) accum = op::template op<T>(accum, src_accum);
+        dst_accum = accum;
     }
     else if constexpr (std::is_same_v<typename RV::layout, align_l>) {
-        static_assert(false, "align_l reduce is not currently supported");
+        // align replicates across the 16 lanes of a half, so a lane already
+        // holds every entry its half has -- the fold is entirely register-local.
+        // The only thing it cannot see is the other half, and the halves differ
+        // only for accumulators, whose element axis is strided by 2 with the
+        // wave-half bit supplying the low bit of the position. Operands mirror,
+        // so for them the exchange would be a no-op and is compiled out.
+        using T2 = typename RV::dtype;                                // packed
+        T2 accum2 = src[0][0];
+        #pragma unroll
+        for(int o = 0; o < src.outer_dim; o++) {
+            #pragma unroll
+            for(int i = 0; i < src.inner_dim; i++) {
+                if(o == 0 && i == 0) continue;                        // already seeded
+                accum2 = op::template op<T2>(accum2, src[o][i]);
+            }
+        }
+        T accum = op::template op<T>(accum2.x, accum2.y);
+        if constexpr (kittens::WMMA_REPLICATION<T> == 1) {
+            accum = op::template op<T>(accum, lane_xor<HALF_WAVE_SWAP>(accum));
+        }
+        if constexpr (!reset) accum = op::template op<T>(accum, src_accum);
+        dst_accum = accum;
     }
     else if constexpr (std::is_same_v<typename RV::layout, naive_l>) {
         // A naive vector covers WARP_THREADS entries per outer step, so a lane

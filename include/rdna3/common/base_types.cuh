@@ -185,13 +185,13 @@ template<> struct packing<half> {
     static __device__ inline constexpr int num() { return 1; }
     using unpacked_type = half;
     using packed_type = half_2;
-    static __device__ inline constexpr half_2 pack(const half &i) { return std::bit_cast<half_2>(static_cast<uint32_t>(i) << 16 | static_cast<uint32_t>(i)); }
+    static __device__ inline constexpr half_2 pack(const half &i) { return half_2{i, i}; }
 };
 template<> struct packing<half_2> {
     static __device__ inline constexpr int num() { return 2; }
     using unpacked_type = half;
     using packed_type = half_2;
-    static __device__ inline constexpr half_2 pack(const half &i) { return std::bit_cast<half_2>(static_cast<uint32_t>(i) << 16 | static_cast<uint32_t>(i)); } // this replication makes code cleaner later.
+    static __device__ inline constexpr half_2 pack(const half &i) { return half_2{i, i}; } // this replication makes code cleaner later.
 };
 template<> struct packing<float> {
     static __device__ inline constexpr int num() { return 1; }

@@ -236,6 +236,34 @@ __device__ static inline void transpose_sep(RT &dst, const rt<typename RT::T, RT
 }
 
 /**
+ * @brief Transposes a register tile by relabeling, without moving any data.
+ *
+ * The other transpose above moves values; this one does not move anything at all.
+ * A base tile's storage depends only on its dtype -- the layout tag is purely how
+ * (lane_low, pos) is read, (row, col) for row and (col, row) for col -- so reading
+ * the same registers under the opposite tag already yields the transpose. Pair that
+ * with sending tiles[i][j] to tiles[j][i] and the whole tile is transposed for free.
+ *
+ * dst and src must not alias; the grid permutation would overwrite as it goes.
+ *
+ * @param result[out] The transposed tile, of the mirrored shape and opposite layout.
+ * @param tile[in] The tile to transpose.
+ */
+template<typename T2, int _rows, int _cols, ducks::rt_layout::all layout>
+__device__ static inline void transpose(rt<T2, _cols, _rows, typename ducks::rt_layout::transpose<layout>::type> &result, const rt<T2, _rows, _cols, layout> &tile) {
+    #pragma unroll
+    for (int i = 0; i < tile.height; i++) {
+        #pragma unroll
+        for (int j = 0; j < tile.width; j++) {
+            #pragma unroll
+            for (int k = 0; k < tile.packed_per_tile; k++) {
+                result.tiles[j][i].data[k] = tile.tiles[i][j].data[k];
+            }
+        }
+    }
+}
+
+/**
  * @brief Transposes a register base tile in-place.
  *
  * @tparam T2 The data type of the register base tile elements.
