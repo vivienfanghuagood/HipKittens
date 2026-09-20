@@ -14,6 +14,8 @@
 // B is passed pre-transposed as (n, k), which keeps both shared loads
 // contiguous and makes mma_ABt the right primitive.
 
+#include <utility>
+
 #include "kittens.cuh"
 #include "pyutils/pyutils.cuh"
 using namespace kittens;
@@ -38,6 +40,15 @@ using namespace kittens;
 #ifndef WARP_ROWS
 #define WARP_ROWS 4
 #endif
+// How many N-direction chunks the warp's operand tile and accumulator are split
+// into. See the wait schedule in dot_tile(); 1 reproduces the unsplit loop.
+#ifndef N_SPLIT
+#define N_SPLIT 2
+#endif
+// Rotate each chunk's next-slice reads into the slot the chunk just freed.
+#ifndef ROTATE
+#define ROTATE 1
+#endif
 #ifndef MIN_BLOCKS_PER_CU
 #define MIN_BLOCKS_PER_CU 1
 #endif
@@ -59,6 +70,30 @@ using namespace kittens;
 #ifndef ABLATE_MMA
 #define ABLATE_MMA 0
 #endif
+
+// A constexpr for loop, so the loop index can be a template argument. lds_wait<N>
+// needs one; #pragma unroll does not give you that.
+template<int N, typename F> __device__ inline void static_for(F &&f) {
+    [&]<int... I>(std::integer_sequence<int, I...>) {
+        (f(std::integral_constant<int, I>{}), ...);
+    }(std::make_integer_sequence<int, N>{});
+}
+
+// How many LDS reads are still in flight once chunk (k, c)'s operands have
+// landed, under the rotated issue schedule in dot_tile(). Reads retire in
+// order, so this is just "how many were issued after the last one this chunk
+// needs". Deriving it here rather than writing lds_wait<0> everywhere is the
+// entire point of the schedule: a nonzero value is math running on top of LDS.
+constexpr int reads_in_flight(int k, int c, int n_split, int num_slices, int chunk_reads) {
+    const bool has_next = (k + 1 < num_slices);
+    // First slice: its own B chunks were all issued up front, so the tail of
+    // them is still moving, plus whatever has been rotated in behind them.
+    if (k == 0) return (n_split - 1 - c + (has_next ? c : 0)) * chunk_reads;
+    // Later slices: A was issued after B chunks 0..n-2 and before B chunk n-1,
+    // so for every chunk but the last, A is the read that gates.
+    if (c < n_split - 1) return ((has_next ? c : 0) + 1) * chunk_reads;
+    return (has_next ? (n_split - 1) : 0) * chunk_reads;
+}
 
 // Pin a register tile's values as live without emitting an instruction. The
 // ablations below delete whichever stage they are measuring, and without this
@@ -91,8 +126,9 @@ struct micro_globals {
 namespace cli {
 constexpr int block_m = BLOCK_M, block_n = BLOCK_N, k_step = K_STEP,
               dot_slice = DOT_SLICE, num_warps = NUM_WARPS,
-              warp_rows = WARP_ROWS, wgm = WGM;
+              warp_rows = WARP_ROWS, wgm = WGM, n_split = N_SPLIT;
 }
+#undef N_SPLIT
 #undef BLOCK_M
 #undef BLOCK_N
 #undef K_STEP
@@ -105,12 +141,12 @@ constexpr int block_m = BLOCK_M, block_n = BLOCK_N, k_step = K_STEP,
 // macros directly, because no single tiling wins across shapes -- see the table
 // in README.md and the selection rule in dispatch_micro below.
 template<int _BLOCK_M, int _BLOCK_N, int _K_STEP, int _DOT_SLICE,
-         int _NUM_WARPS, int _WARP_ROWS, int _WGM>
+         int _NUM_WARPS, int _WARP_ROWS, int _WGM, int _N_SPLIT = 2>
 struct config {
     static constexpr int BLOCK_M = _BLOCK_M, BLOCK_N = _BLOCK_N;
     static constexpr int K_STEP  = _K_STEP,  DOT_SLICE = _DOT_SLICE;
     static constexpr int NUM_WARPS = _NUM_WARPS, WARP_ROWS = _WARP_ROWS;
-    static constexpr int WGM = _WGM;
+    static constexpr int WGM = _WGM, N_SPLIT = _N_SPLIT;
 
     static constexpr int NUM_THREADS = kittens::WARP_THREADS * NUM_WARPS;
     // Warps tile the block WARP_ROWS (M) by WARP_COLS (N).
@@ -118,6 +154,11 @@ struct config {
     static_assert(WARP_ROWS * WARP_COLS == NUM_WARPS, "warp grid must cover the block");
     static constexpr int REG_BLOCK_M = BLOCK_M / WARP_ROWS;
     static constexpr int REG_BLOCK_N = BLOCK_N / WARP_COLS;
+    static constexpr int SPLIT_N = REG_BLOCK_N / N_SPLIT;
+    static_assert(SPLIT_N % 16 == 0 && SPLIT_N * N_SPLIT == REG_BLOCK_N,
+                  "N_SPLIT must divide the warp tile into whole 16-column chunks");
+    // ds_read_b128 count for one chunk: two per 16x16 base tile.
+    static constexpr int CHUNK_READS = (SPLIT_N / 16) * (DOT_SLICE / 16) * 2;
 
     using st_a = st_bf<BLOCK_M, K_STEP>;
     using st_b = st_bf<BLOCK_N, K_STEP>;
@@ -130,7 +171,7 @@ struct config {
 
 // What -DBLOCK_M=... on the command line selects. sweep.sh drives this one.
 using macro_config = config<cli::block_m, cli::block_n, cli::k_step, cli::dot_slice,
-                            cli::num_warps, cli::warp_rows, cli::wgm>;
+                            cli::num_warps, cli::warp_rows, cli::wgm, cli::n_split>;
 
 template<typename C>
 __global__ __launch_bounds__(C::NUM_THREADS, MIN_BLOCKS_PER_CU)
@@ -140,6 +181,7 @@ void micro_tk(const micro_globals g) {
     constexpr int WARP_ROWS = C::WARP_ROWS, WARP_COLS = C::WARP_COLS;
     constexpr int REG_BLOCK_M = C::REG_BLOCK_M, REG_BLOCK_N = C::REG_BLOCK_N;
     constexpr int WGM = C::WGM;
+    constexpr int N_SPLIT = C::N_SPLIT, SPLIT_N = C::SPLIT_N, CHUNK_READS = C::CHUNK_READS;
     using st_a = typename C::st_a;
     using st_b = typename C::st_b;
     using G    = typename C::G;
@@ -150,12 +192,17 @@ void micro_tk(const micro_globals g) {
     st_b (&Bs)[2] = al.allocate<st_b, 2>();
 
     constexpr int NUM_SLICES = K_STEP / DOT_SLICE;
+    // B and the accumulator are cut into N_SPLIT chunks along N. Same total
+    // registers as one wide pair -- this is a re-association, not a buffer.
     rt_bf<REG_BLOCK_M, DOT_SLICE, row_l> A_tile;
-    rt_bf<REG_BLOCK_N, DOT_SLICE, row_l> B_tile;
-    rt_fl<REG_BLOCK_M, REG_BLOCK_N, col_l> C_accum;
-    zero(C_accum);
+    rt_bf<SPLIT_N, DOT_SLICE, row_l> B_tile[N_SPLIT];
+    rt_fl<REG_BLOCK_M, SPLIT_N, col_l> C_accum[N_SPLIT];
+    #pragma unroll
+    for (int s = 0; s < N_SPLIT; s++) zero(C_accum[s]);
 #if ABLATE_LDS_READ
-    zero(A_tile); zero(B_tile);   // the ds_reads that would fill these are gone
+    zero(A_tile);                 // the ds_reads that would fill these are gone
+    #pragma unroll
+    for (int s = 0; s < N_SPLIT; s++) zero(B_tile[s]);
 #endif
 
     const int m_blocks = g.a.rows() / BLOCK_M;
@@ -187,31 +234,72 @@ void micro_tk(const micro_globals g) {
     // One K-tile of math: read a DOT_SLICE-wide pair of operand tiles out of
     // LDS, multiply, repeat.
     //
-    // The obvious next move here is to software-pipeline it -- double-buffer
-    // A_tile/B_tile and issue slice k+1's ds_reads before slice k's WMMAs, with
-    // lds_wait<SLICE_READS>() instead of lds_wait<0>(). The library has what
-    // that needs (load_async and lds_wait). It was tried and it is *slower*:
-    // 63/68 TFLOPs against 66/72, because the second set of operand tiles costs
-    // 48 VGPRs, which takes occupancy from 9 waves/SIMD to 7. At 9 waves the
-    // SIMD already covers LDS latency by switching waves, so the schedule is
-    // buying with registers something it was getting for free. Keep this in
-    // mind before reaching for ping-pong on a low-occupancy kernel, where the
-    // trade goes the other way.
+    // Double-buffering the operand tiles so slice k+1's reads overlap slice k's
+    // WMMAs was tried and is *slower*: 63/68 TFLOPs against 66/72, because the
+    // second set of tiles costs 48 VGPRs and takes occupancy from 9 waves/SIMD
+    // to 7. So the overlap here is arranged to cost zero registers instead.
+    //
+    // The whole slice's reads -- A plus every B chunk -- go in flight at once,
+    // and then the waits step down: lds_wait<N> means "at most N still
+    // outstanding", and LDS retires in order, so waiting for
+    // (N_SPLIT-1-s)*CHUNK_READS retires exactly A and B chunks 0..s while
+    // chunks s+1.. are still moving. Chunk s's WMMAs then issue on top of them.
+    // No tile is duplicated: the reads that overlap the math are reads this
+    // slice had to do anyway, just not fenced in front of it.
+    auto load_A = [&](int buf, int k) {
+        load<false>(A_tile, subtile_inplace<REG_BLOCK_M, DOT_SLICE>(As[buf], {warp_row, k}));
+    };
+    auto load_B = [&](int buf, int k, int c) {
+        load<false>(B_tile[c], subtile_inplace<SPLIT_N, DOT_SLICE>(
+                                   Bs[buf], {warp_col * N_SPLIT + c, k}));
+    };
+    auto mma_chunk = [&](int c) {
+#if !ABLATE_MMA
+        __builtin_amdgcn_s_setprio(1);
+        mma_ABt(C_accum[c], A_tile, B_tile[c], C_accum[c]);
+        __builtin_amdgcn_s_setprio(0);
+#else
+        keep_live(A_tile); keep_live(B_tile[c]);
+#endif
+    };
+
     auto dot_tile = [&](int buf) {
+#if ABLATE_LDS_READ
+        #pragma unroll
+        for (int k = 0; k < NUM_SLICES; k++)
+            static_for<N_SPLIT>([&](auto c) { mma_chunk(c); });
+#elif !ROTATE
         #pragma unroll
         for (int k = 0; k < NUM_SLICES; k++) {
-#if !ABLATE_LDS_READ
-            load(A_tile, subtile_inplace<REG_BLOCK_M, DOT_SLICE>(As[buf], {warp_row, k}));
-            load(B_tile, subtile_inplace<REG_BLOCK_N, DOT_SLICE>(Bs[buf], {warp_col, k}));
-#endif
-#if !ABLATE_MMA
-            __builtin_amdgcn_s_setprio(1);
-            mma_ABt(C_accum, A_tile, B_tile, C_accum);
-            __builtin_amdgcn_s_setprio(0);
-#else
-            keep_live(A_tile); keep_live(B_tile);
-#endif
+            load_A(buf, k);
+            static_for<N_SPLIT>([&](auto c) { load_B(buf, k, c); });
+            static_for<N_SPLIT>([&](auto c) {
+                lds_wait<(N_SPLIT - 1 - c) * CHUNK_READS>();
+                mma_chunk(c);
+            });
         }
+#else
+        // Slice 0 up front; after that every read is issued by the chunk whose
+        // register slot it is about to reuse. B_tile[c] is dead the instant
+        // chunk c's WMMAs have issued, so slice k+1's chunk c goes in flight
+        // there, one full chunk of math early, at no register cost. A_tile is
+        // dead only after the slice's last chunk, so A goes out at the boundary
+        // -- and *before* that chunk's B, so that the next slice's first chunk
+        // is gated on A rather than on a read issued behind it.
+        load_A(buf, 0);
+        static_for<N_SPLIT>([&](auto c) { load_B(buf, 0, c); });
+
+        static_for<NUM_SLICES>([&](auto k) {
+            static_for<N_SPLIT>([&](auto c) {
+                lds_wait<reads_in_flight(k, c, N_SPLIT, NUM_SLICES, CHUNK_READS)>();
+                mma_chunk(c);
+                if constexpr (k + 1 < NUM_SLICES) {
+                    if constexpr (c == N_SPLIT - 1) load_A(buf, k + 1);
+                    load_B(buf, k + 1, c);
+                }
+            });
+        });
+#endif
     };
 
     int tic = 0, toc = 1;
@@ -258,7 +346,11 @@ void micro_tk(const micro_globals g) {
     // Epilogue: last tile is already resident.
     dot_tile(tic);
 
-    store(g.c, C_accum, {0, 0, row * WARP_ROWS + warp_row, col * WARP_COLS + warp_col});
+    // Column coords are in units of the tile width, which is now SPLIT_N.
+    #pragma unroll
+    for (int s = 0; s < N_SPLIT; s++)
+        store(g.c, C_accum[s], {0, 0, row * WARP_ROWS + warp_row,
+                                (col * WARP_COLS + warp_col) * N_SPLIT + s});
 }
 
 template<typename C>
@@ -269,36 +361,43 @@ static void launch(const micro_globals &g) {
                   dim3(C::NUM_THREADS), mem_size, g.stream>>>(g);
 }
 
-// Two tilings, picked on the number of workgroups the M/N grid produces.
+// Three tilings. Two are picked on the number of workgroups the M/N grid
+// produces; the third only exists to cover a K the other two cannot tile.
 //
-//   big    128x128, 8 warps, 32x64 per warp. 164 VGPRs, 9 waves/SIMD, 32 KB of
-//          LDS. The most arithmetic intensity that fits without spilling.
-//   small  128x64, 8 warps, 32x32 per warp. 103 VGPRs, 12 waves/SIMD, 24 KB.
-//          Half the intensity, but twice the workgroups and a third more waves.
+//   big    128x128x64, 8 warps, 32x64 per warp, N_SPLIT=4. 208 VGPRs, 7
+//          waves/SIMD, 48 KB of LDS. The deepest K-tile that fits, which is
+//          what the rotated schedule in dot_tile() wants: with four K-slices
+//          of four chunks each, fifteen of the sixteen chunks have LDS reads
+//          in flight underneath them.
+//   small  128x64x64, 8 warps, 32x32 per warp, N_SPLIT=2. 134 VGPRs, 10
+//          waves/SIMD, 24 KB. Half the intensity, but twice the workgroups.
+//   k32    big with K_STEP=32, for a K that is not a multiple of 64. The
+//          kernel has no K remainder handling, so this is correctness, not
+//          tuning.
 //
-// The crossover is sharp and it is a tail-quantization effect, not an inner-loop
-// one. `big` uses 32 KB of LDS, so four of its workgroups fit per WGP and 48
-// WGPs hold 192 at once. At 2048x2048 the grid is 16x16 = 256 workgroups: one
-// full pass plus a second pass that is two thirds empty, and the machine idles
-// through it. `small` has 512 workgroups of two thirds the cost, which lands
-// much closer to a whole number of passes.
+// The big/small crossover is a tail-quantization effect, not an inner-loop one.
+// `big` uses 48 KB of LDS, so only one of its workgroups fits per WGP and 48
+// WGPs hold 48 at once; `small` at 24 KB holds 96. A grid that is a poor fit
+// for the coarser tiling idles through a mostly-empty final pass.
 //
-// Measured, TFLOPs, best of each column in bold in README.md:
+// Measured, TFLOPs (blocks counted at 128x128):
 //
-//   M,N       blocks | big | small
-//   1024^2        64 |  36 |  44
-//   2048^2       256 |  39 |  55      <- 2048x2048x2048
-//   2048^2       256 |  48 |  55      <- 2048x2048x4096
-//   2048x4096    512 |  63 |  61
-//   4096^2      1024 |  67 |  66
-//   4096x8192   2048 |  72 |  69
-//   8192^2      4096 |  71 |  59
+//   M,N,K                blocks | big | small
+//   512x512x4096             16 |  19 |  33
+//   1024x1024x4096           64 |  49 |  51
+//   2048x1024x4096          128 |  63 |  58
+//   2048x2048x2048          256 |  64 |  60
+//   4096x1024x4096          256 |  65 |  60
+//   4096x4096x4096         1024 |  73 |   -
+//   8192x8192x4096         4096 |  78 |   -
 //
-// so the rule is `blocks <= 256`, i.e. up to about 1.3 machine-fulls of `big`.
-// A third variant with K_STEP=64 was also measured; it wins nothing anywhere
-// that `small` does not win by more, so it is not carried here.
-using big_config   = config<128, 128, 32, 16, 8, 4, 8>;
-using small_config = config<128,  64, 32, 16, 8, 4, 8>;
+// so the rule is `blocks <= 64`. Note this threshold moved by 4x when the
+// rotated schedule landed: overlapping the LDS reads made `big` much better at
+// mid-size grids, and it now wins everywhere it has enough workgroups to fill
+// the machine once.
+using big_config   = config<128, 128, 64, 16, 8, 4, 8, 4>;
+using small_config = config<128,  64, 64, 16, 8, 4, 8, 2>;
+using k32_config   = config<128, 128, 32, 16, 8, 4, 8, 4>;
 
 #ifndef HK_MULTI_CONFIG
 #define HK_MULTI_CONFIG 1
@@ -306,10 +405,16 @@ using small_config = config<128,  64, 32, 16, 8, 4, 8>;
 
 void dispatch_micro(micro_globals g) {
 #if HK_MULTI_CONFIG
+    // num_tiles is a plain division, so a K-tile that does not divide K would
+    // silently drop the tail.
+    if (g.a.cols() % big_config::K_STEP != 0) {
+        launch<k32_config>(g);
+        return;
+    }
     const int blocks = (g.a.rows() / big_config::BLOCK_M) * (g.b.rows() / big_config::BLOCK_N);
     // Fall back to `big` on shapes `small` cannot tile; its BLOCK_N is the
     // smaller of the two, so this only triggers on N not divisible by 128.
-    if (blocks <= 256 && g.b.rows() % small_config::BLOCK_N == 0) {
+    if (blocks <= 64 && g.b.rows() % small_config::BLOCK_N == 0) {
         launch<small_config>(g);
         return;
     }
