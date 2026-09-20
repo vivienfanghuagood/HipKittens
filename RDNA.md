@@ -11,7 +11,7 @@ the work here lives on the `rdna` branch, seven commits on top of `de0cddbd`.
 |---|---|---|
 | core library | `include/rdna3`, 68 files | `include/rdna4`, 68 files |
 | unit tests | **1659 passed, 0 failed** on a W7900D | compiles; **never executed** |
-| bf16 GEMM | **71.5 TFLOPs** peak, 71% of the measured WMMA ceiling, 76-82% of rocBLAS across shapes | compiles; never executed |
+| bf16 GEMM | **76.4 TFLOPs** peak, 76% of the measured WMMA ceiling, faster than hipBLASLt on every shape and 85-95% of rocBLAS | compiles; never executed |
 | fp8 | not available in hardware | implemented, all four opcodes, untested |
 
 **Read the second column as "written, not verified."** No gfx12 part was
@@ -101,9 +101,9 @@ if gfx12 fails, the bug is in `include/rdna4`, not in the tests.
   fp8 register tiles. `constants<fp8e4m3>` deliberately has no infinity, so a
   reduction over one is a compile error rather than a silently wrong answer.
 - **Split-K**, which is what the small-shape GEMM numbers are missing.
-- **Inner-loop software pipelining in the GEMM.** The global→LDS stage is
-  double-buffered; the LDS→register stage is not. That is what caps the warp
-  tile at 32×64 and leaves 20% on the table against rocBLAS.
+- **A 64×64 warp tile in the GEMM.** The LDS→register stage is now pipelined
+  (at no register cost — see below), but the wider warp tile rocBLAS uses still
+  does not fit in 256 VGPRs on gfx1100. That is the last 10%.
 - **Multi-GPU / distributed**, untouched.
 - **RDNA4 on hardware**, at all.
 
@@ -114,13 +114,13 @@ best-of-{NN,NT,TN,TT}; HipKittens implements one layout.
 
 | shape (M×N×K) | hipBLASLt | rocBLAS | HK | HK / best | HK / ceiling |
 |---|---|---|---|---|---|
-| 4096³ | 69.1 | **83.2** | 68.5 | 82% | 68% |
-| 8192×8192×4096 | 65.0 | **88.6** | 69.5 | 78% | 69% |
-| 4096×8192×2048 | 70.4 | **88.6** | 71.5 | 81% | 71% |
-| 8192×4096×2048 | 70.0 | **88.6** | 71.4 | 81% | 71% |
-| 2048×4096×4096 | 68.0 | **85.7** | 64.9 | 76% | 65% |
-| 2048×2048×4096 | 63.7 | **75.1** | 57.4 | 76% | 57% |
-| 2048³ | 60.3 | **69.5** | 55.3 | 80% | 55% |
+| 4096³ | 69.5 | **83.0** | 74.5 | 90% | 74% |
+| 8192×8192×4096 | 66.3 | **88.7** | 76.4 | 86% | 76% |
+| 4096×8192×2048 | 70.5 | **88.6** | 75.4 | 85% | 75% |
+| 8192×4096×2048 | 69.7 | **88.6** | 75.4 | 85% | 75% |
+| 2048×4096×4096 | 67.9 | **85.3** | 73.4 | 86% | 73% |
+| 2048×2048×4096 | 63.4 | **76.9** | 67.3 | 87% | 67% |
+| 2048³ | 60.0 | **67.2** | 64.1 | 95% | 64% |
 
 **Two corrections to numbers this file previously carried**, both of which made
 the kernel look better than it is:
@@ -128,8 +128,9 @@ the kernel look better than it is:
 *The baseline was the wrong library.* torch on ROCm defaults to hipBLASLt, and
 on gfx1100 hipBLASLt is the slower of the two by up to 33% — rocBLAS wins every
 shape here. Benchmarking against torch's default is benchmarking against the
-library AMD has not tuned for this architecture. The real gap is 20-25%, not the
-"wins 2 of 4" that the hipBLASLt-only table showed.
+library AMD has not tuned for this architecture. The honest statement is "beats
+hipBLASLt everywhere, 5-15% behind rocBLAS", not the "wins 2 of 4" that the
+hipBLASLt-only table showed.
 
 *The denominator was unreachable.* 122.6 TFLOPs is 96 CU × 512 FLOP/clk ×
 2.495 GHz boost. This card does not run a GEMM at 2.495 GHz: `rocm-smi` sampled
@@ -139,7 +140,7 @@ memory at all measures **100.5 TFLOPs**
 the architectural issue rate, at 2.18 GHz and only 101 W. The reachable peak is
 ~104, so percentages against 122.6 understate by about 18%.
 
-The 20% behind rocBLAS is one identified thing: **LDS bytes per WMMA**, which is
+The gap to rocBLAS is one identified thing: **LDS bytes per WMMA**, which is
 arithmetic intensity, which is the warp tile. A 32×64 tile moves 1.5× the operand
 bytes per WMMA that rocBLAS's 64×64 does — `(M+N)/(M·N)`, exactly — and that puts
 this kernel at 48 bytes/clk/CU against a measured 64.8 ceiling, 74% utilised,
@@ -154,21 +155,39 @@ tree's access pattern at 64.8 bytes/clk/CU, tied with a hand-built conflict-free
 reference and 4.1× the same read with the swizzle removed. The swizzle constant
 is right.
 
-Every attempt to adopt the wider tile measures slower, because this kernel hides
-LDS latency with occupancy and the wider tile costs occupancy — rocBLAS hides it
-with a software pipeline (`PLR1`) instead, which costs registers. The two changes
-only pay together, and on gfx1100 they do not both fit: 64×64 needs 128 VGPRs of
-accumulator plus 64 of operands, and the operands are already 2× larger than they
-would be on CDNA because of the wave-half mirroring, so double-buffering them
-overruns the 256-VGPR file. **That is the wall, and it is an architectural one.**
-The full config sweep is in
+Half of that gap has since been closed, and how is the part worth carrying
+forward. rocBLAS pays for its wider tile with a software pipeline (`PLR1`) that
+costs registers; the textbook version of that here — double-buffering the
+operand tiles — costs 48 VGPRs, drops occupancy from 9 waves/SIMD to 7, and
+measures *slower*. The version that works costs nothing, because `lds_wait<N>()`
+waits until at most N LDS ops are still outstanding and LDS retires in order.
+Split the accumulator and the B operand into chunks along N, issue the whole
+slice's reads at once, and step the waits down: each chunk's WMMAs then run on
+top of the reads for the chunks after it. Then rotate — a B chunk's registers
+are dead the moment its WMMAs have issued, so the next K-slice's reads for that
+chunk go in flight right there. Register count is identical at every step (161
+VGPRs before the split, after the split, after the rotation), and it is worth
+65 → 70 TFLOPs at 4096³.
+
+It also moved two other optima, which is the usual reason to redo a sweep after
+a scheduling change rather than assume it composes. A deeper K-tile became worth
+its staging registers (`K_STEP` 32 → 64, 70 → 73, despite occupancy 9 → 7),
+because more K-slices means more rotation points. And the small-shape crossover
+moved by 4×, from 256 workgroups to 64.
+
+What is left is the tile itself: 64×64 needs 128 VGPRs of accumulator plus 64 of
+operands, and the operands are already 2× larger than they would be on CDNA
+because of the wave-half mirroring. There is no intermediate tile — accumulator
+VGPRs are `M·N/32` regardless of shape, so square is strictly optimal among
+powers of two, and 48-row tiles need `BLOCK_M=192`, which divides none of the
+benchmark shapes. **That is the wall, and it is an architectural one.** The full
+config sweep is in
 [`kernels/rdna3/gemm/bf16fp32/README.md`](kernels/rdna3/gemm/bf16fp32/README.md).
 
-Small shapes are a separate, fixed problem. They were bound by grid quantization
-— 2048² is 256 workgroups against 192 concurrent slots, so the second pass ran
-two thirds empty — and `dispatch_micro` now compiles two tilings and picks by
-workgroup count, worth 16% at 2048³ and nothing above the crossover. Split-K is
-still missing and is the next thing for that regime.
+Small shapes are a separate problem: grid quantization, not the inner loop.
+`dispatch_micro` compiles two tilings and picks by workgroup count. Below about
+64 workgroups even the small tiling falls off (33 TFLOPs at 512×512×4096);
+split-K is still missing and is the next thing for that regime.
 
 RDNA4 has not been run. What is known is a register count: the operand tiles
 cost 24 VGPRs there against 48 on gfx1100, and the ported kernel sits at 128
