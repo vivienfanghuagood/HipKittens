@@ -93,6 +93,12 @@ using namespace kittens;
 #ifndef ABLATE_MMA
 #define ABLATE_MMA 0
 #endif
+#ifndef ABLATE_LDS_WRITE
+#define ABLATE_LDS_WRITE 0
+#endif
+#ifndef ABLATE_BARRIER
+#define ABLATE_BARRIER 0
+#endif
 
 // A constexpr for loop, so the loop index can be a template argument. lds_wait<N>
 // needs one; #pragma unroll does not give you that.
