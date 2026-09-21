@@ -31,10 +31,11 @@ two answers:
 **In its own layout this kernel beats the best AMD library on every shape, by
 7-19%. Against the vendor's best layout it is 8-15% behind.** Both statements
 are true and they are about different problems: a GEMM with both operands
-K-contiguous is a harder memory problem than one where the vendor got to choose,
-and Tensile's NT tuning on gfx1100 is visibly the weakest of its four (rocBLAS
-spans 55-89 TFLOPs across layouts on the same shape). Pick the column that
-matches your data. Attention and MoE pipelines hand you the NT column.
+K-contiguous is a harder memory problem than one where the vendor got to choose.
+Pick the column that matches your data. Attention and MoE pipelines hand you the
+NT column. The section below takes the vendor's spread apart and shows exactly
+what the NT column is paying for — it is one number, it is measurable in this
+kernel too, and this kernel does not pay it.
 
 One further note on reading this: an early version of this table compared only
 against torch's default backend and claimed the kernel won two shapes of four.
@@ -48,13 +49,102 @@ not against the 122.6 TFLOPs on the data sheet. 122.6 assumes 2.495 GHz boost;
 sampling `rocm-smi` during a GEMM shows this card at 2.0-2.1 GHz against its
 241 W limit. The reachable peak here is ~104 TFLOPs.
 
+### Exactly one of the vendor's four layouts is slow, and it is a K-tile artifact
+
+rocBLAS on this card, 8192×8192×4096, same math four ways:
+
+| layout | A in memory | B in memory | TFLOPs |
+|---|---|---|---|
+| NN | K-contiguous | N-contiguous | 85.7 |
+| **NT** | **K-contiguous** | **K-contiguous** | **56.0** |
+| TN | M-contiguous | N-contiguous | 90.2 |
+| TT | M-contiguous | K-contiguous | 89.9 |
+
+Three of the four are within 5% of each other. NT — the one with *both* operands
+K-contiguous, which is the one HipKittens implements — falls off a cliff. That
+single outlier is where the whole "HK / best" versus "HK / NT" spread in the
+table above comes from, so it is worth knowing what it is.
+
+**It is not the inner loop.** Unbundling `TensileLibrary_Type_BB_HPA_*_gfx1100.co`
+(they are `CCOB` compressed offload bundles; `clang-offload-bundler --unbundle`
+gets the ELF out) and disassembling the two kernels `rocprofv3` actually
+dispatches for NT and TT, they are the same kernel to a remarkable degree:
+`MT128x128x16`, `MI16x16x16x1`, `WG32_4_1` — 4 waves, 64×64 each — `PGR1 PLR1`,
+`TT4_64`, 256 VGPRs, 128 of them accumulators, and no operand double-buffering in
+either. Per K-tile per wave:
+
+| | NT (56.0) | TT (89.9) |
+|---|---|---|
+| operand reads | 16 × `ds_load_b128` | 8 × `ds_load_b128` + 64 × `ds_load_u16` |
+| lane-bytes read | 8192 | 8192 |
+| LDS writes | 4 × `ds_store_b128` | 4 × `ds_store_b128` |
+| global loads | 4 × `buffer_load_b128` | 4 × `buffer_load_b128` |
+| WMMAs | 16 | 16 |
+
+The *slow* kernel is the one with the clean inner loop. TT cannot store its B
+operand straight into LDS, so it gathers it back 2 bytes at a time — 3× the LDS
+instructions for the same bytes — and still wins by 60%. Whatever separates them
+is not in there.
+
+**It is global-load granularity, and `K_STEP` is the knob.** A K-contiguous
+operand tiled at K=16 is 128 rows of 32 bytes: a quarter of a 128-byte cache
+line per row, so three quarters of every line fetched is thrown away, on *both*
+operands. NN/TN/TT each have at least one operand contiguous along a free
+dimension, where a tile row is 128 elements = 256 bytes and coalesces perfectly.
+
+This kernel can measure that penalty directly, because `K_STEP` is a `-D`. Same
+tiling, same layout, same code, only the K-tile depth moving (128×128, 8 warps,
+8192×8192×4096; `ABLATE_GLOBAL=1` deletes the global→LDS stage and leaves the
+math running on stale tiles):
+
+| `K_STEP` | bytes per tile row | full | `ABLATE_GLOBAL` | global costs |
+|---|---|---|---|---|
+| 16 | 32 | 59 | 81 | **22** |
+| 32 | 64 | 77 | 87 | **10** |
+| 64 | **128** | 78 | 83 | **5** |
+
+The cost collapses as the row reaches one cache line, and `GPREFETCH` 1→8 does
+not move it at all (77 / 77 / 76 / 76 / 74 / 65 at `K_STEP=32`), so it is
+granularity and not latency.
+
+So: rocBLAS's 56 is what the NT layout costs *at a 16-deep K-tile*, and Tensile's
+gfx1100 tuning has no deeper NT entry to pick. This kernel runs a 64-deep one and
+pays 5 instead of 22. **That is the entire reason the HK/NT column is above 100%
+— it is not a better inner loop, it is the one tuning decision the layout
+demands.** It also sets the honest ceiling for this layout: even with the global
+stage deleted entirely the kernel only reaches 83, so the vendor's 88-90 is not
+sitting in global memory waiting to be collected.
+
+### Could this kernel offer all four layouts?
+
+Yes, and it is a small change, but it is an API-completeness change and not a
+performance one — worth stating plainly because the measured table invites the
+opposite conclusion.
+
+The inner loop is layout-independent: LDS always holds the operands K-major, and
+`mma_ABt` always sees the same thing. Only the global→LDS stage differs, and it
+has exactly two forms — a straight copy when the operand's global layout matches
+the LDS one, or a transposing store when it does not, which is Tensile's
+`UMLDSA`/`UMLDSB` flag and nothing more. `load_global_to_register_buffer` already
+splits the load from the store, so a transposing variant of
+`store_register_buffer_to_shared` plus a layout tag on the tile types covers it.
+
+What it would not do is produce another 88. The reason NN/TN/TT are fast for the
+vendor is that at least one operand is free-dimension-contiguous, which is a
+property of the *caller's* data — porting the layouts does not conjure it. Each
+non-NT layout this kernel added would be slower than the NT path it already has,
+because it would trade a straight LDS store for a transposing one while the
+global side stays whatever the caller handed it. The value is that callers stop
+having to pre-transpose; there is no throughput in it.
+
 ### Where the remaining gap goes
 
 It is LDS *bytes*, not LDS instructions and not bank conflicts. Both of those
 were checked and neither is the answer.
 
-Disassembling rocBLAS's kernel and histogramming the two inner loops, normalized
-so both do 16 WMMAs:
+Disassembling the rocBLAS TT kernel — the 89.9 above, and therefore the one the
+"HK / best" column is measured against — and histogramming the two inner loops,
+normalized so both do 16 WMMAs:
 
 | per 16 WMMAs | rocBLAS | this kernel |
 |---|---|---|
@@ -101,23 +191,35 @@ and rocBLAS's Tensile kernel for this shape
 (`Cijk_..._MT128x128x16_MI16x16x16x1_..._PGR1_PLR1_..._WG32_4_1`) is exactly
 **4 waves of 64×64** against this kernel's 8 waves of 32×64.
 
-Every way of copying that measures *slower*:
+Every way of copying that measures *slower*. Swept at 8192×8192×4096, with the
+compiler's spill count, because the spills are the point:
 
-| config | VGPRs | waves/SIMD | 4096³ / 8192×8192×4096 |
-|---|---|---|---|
-| 128×128×64, 8 warps, 32×64/warp (default) | 208 | 2.0 | **74 / 79** |
-| 128×128, 4 warps, 64×64/warp | 238 | 2.0 | 52 / 57 |
-| 256×128, 8 warps, 64×64/warp | 256 | 2.0 | 62 / 69 |
-| 128×256, 8 warps, 64×64/warp | 256 | 2.0 | 62 / 69 |
-| 256×256, 16 warps, 64×64/warp | 249 | 2.0 | 64 / 71 |
-| 256×256×32, 16 warps, 64×64/warp | 256 | 4.0 | 44 / 51 |
+| config | warp tile | VGPRs | spill | waves/SIMD | TFLOPs |
+|---|---|---|---|---|---|
+| **128×128×64, 8 warps (default)** | **32×64** | **208** | **0** | **7** | **79** |
+| 128×128×16, 4 warps | 64×64 | 232 | 0 | 6 | 58 |
+| 128×128×32, 4 warps | 64×64 | 256 | 14 | 5 | 56 |
+| 128×128×64, 4 warps | 64×64 | 256 | 91 | 5 | 14 |
+| 256×128×16, 8 warps | 64×64 | 227 | 0 | 6 | 71 |
+| 256×128×32, 8 warps | 64×64 | 256 | 4 | 5 | 75 |
+| 128×256×32, 8 warps | 64×64 | 256 | 5 | 5 | 74 |
+| 256×256×16, 16 warps | 64×64 | 222 | 0 | 6 | 66 |
+| 256×256×32, 16 warps | 64×64 | 249 | 0 | 5 | 72 |
 
 Accumulator VGPRs are `M·N/32` regardless of shape, so 64×64 is 128 accumulator
-registers plus 64 operand registers before any staging; the configurations above
-are at or over the 256-VGPR file and have nothing left to pipeline with. There is
-no intermediate tile either — among powers of two the square tile is optimal, and
-a 48-row tile needs `BLOCK_M=192`, which divides none of the benchmark shapes
-(the kernel has no bounds predication).
+registers plus 64 operand registers before a single byte of global staging. Every
+row above either spills or falls to 5-6 waves/SIMD, and the ones that avoid both
+do it by taking `K_STEP` down to 16 — straight back into the 22-TFLOP global
+penalty measured two sections up. **That is the trade the default tiling makes:
+1.5× the LDS traffic per WMMA, bought with the registers to run a 64-deep K-tile
+at 7 waves/SIMD.** Measured, it is worth 4-21 TFLOPs over every 64×64 variant.
+
+rocBLAS runs 64×64 at 256 VGPRs with no spills because it is not carrying a
+64-deep K-tile's staging — and it pays for that with the 56 in the NT column.
+
+There is no intermediate tile either — among powers of two the square tile is
+optimal, and a 48-row tile needs `BLOCK_M=192`, which divides none of the
+benchmark shapes (the kernel has no bounds predication).
 
 ### Levers that were measured and are not levers
 

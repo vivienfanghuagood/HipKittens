@@ -11,7 +11,7 @@ the work here lives on the `rdna` branch, seven commits on top of `de0cddbd`.
 |---|---|---|
 | core library | `include/rdna3`, 68 files | `include/rdna4`, 68 files |
 | unit tests | **1659 passed, 0 failed** on a W7900D | compiles; **never executed** |
-| bf16 GEMM | **77.2 TFLOPs** peak, 77% of the measured WMMA ceiling. 107-119% of the best AMD library *in HipKittens' own layout*; 85-92% of that library when it is free to pick its own | compiles; never executed |
+| bf16 GEMM | **77.2 TFLOPs** peak, 77% of the measured WMMA ceiling. 107-119% of the best AMD library *in HipKittens' own layout*; 85-93% of that library when it is free to pick its own | compiles; never executed |
 | fp8 | not available in hardware | implemented, all four opcodes, untested |
 
 **Read the second column as "written, not verified."** No gfx12 part was
@@ -142,17 +142,44 @@ memory at all measures **100.5 TFLOPs**
 the architectural issue rate, at 2.18 GHz and only 101 W. The reachable peak is
 ~104, so percentages against 122.6 understate by about 18%.
 
-*The comparison was against a different problem.* rocBLAS's 88 TFLOPs headline
-is reached in TN or TT, which it is tuned for. Restricted to the layout this
-kernel implements it reaches 55-70, and HipKittens is **107-119% of the best
-AMD library** there — on every shape. Neither column is the "real" one; they
-answer different questions, and both are now printed. What the pair does show
-is that the residual gap is not HipKittens' inner loop against Tensile's inner
-loop. It is that a GEMM with both operands K-contiguous is a harder memory
-problem, and Tensile's NT tuning on gfx1100 is the weakest of its four.
+*The comparison was against a different problem.* rocBLAS's 88-90 TFLOPs
+headline is reached in NN, TN or TT. Restricted to the layout this kernel
+implements — NT, both operands K-contiguous — it reaches 55-70, and HipKittens
+is **107-119% of the best AMD library** there, on every shape. Neither column is
+the "real" one; they answer different questions, and both are now printed.
 
-The gap to the vendor's best layout is one identified thing, and it is now
-accounted for exactly rather than estimated: **LDS lane-bytes**.
+### What the vendor's layout spread actually is
+
+rocBLAS at 8192×8192×4096 measures NN 85.7, **NT 56.0**, TN 90.2, TT 89.9.
+Three of four are within 5%; the outlier is the one with *both* operands
+K-contiguous, which is the one HipKittens implements. Disassembling the two
+kernels rocprofv3 dispatches (unbundle the `CCOB` `.co` files with
+`clang-offload-bundler --unbundle`) shows NT and TT are the *same* Tensile
+kernel — `MT128x128x16`, 4 waves of 64×64, `PGR1 PLR1`, 256 VGPRs — and that the
+slow one has the cleaner inner loop: 16 × `ds_load_b128` against TT's 8 ×
+`ds_load_b128` + 64 × `ds_load_u16` for the same lane-bytes. The difference is
+not in there.
+
+It is global-load granularity. A K-contiguous operand tiled at K=16 is 128 rows
+of 32 bytes — a quarter of a cache line each, on both operands. This kernel can
+measure the penalty because `K_STEP` is a `-D`; same tiling, same layout, only
+the K-tile depth moving (128×128, 8 warps, 8192×8192×4096, against
+`ABLATE_GLOBAL`):
+
+| `K_STEP` | bytes per tile row | full | no global stage | global costs |
+|---|---|---|---|---|
+| 16 | 32 | 59 | 81 | **22** |
+| 32 | 64 | 77 | 87 | **10** |
+| 64 | **128** | 78 | 83 | **5** |
+
+and `GPREFETCH` 1→8 does not move it, so it is granularity, not latency. **The
+vendor's 56 in the NT column is what that layout costs at a 16-deep K-tile, and
+Tensile's gfx1100 tuning has no deeper NT entry to pick. This kernel runs a
+64-deep one and pays 5 instead of 22 — that, and not a better inner loop, is the
+whole of the >100% in the HK/NT column.**
+
+The remaining gap to the vendor's *best* layout is a different thing, and it is
+now accounted for exactly rather than estimated: **LDS lane-bytes**.
 
 A gfx11 WMMA operand is mirrored across the wave halves, so lanes `l` and `l^16`
 issue `ds_read_b128` against the same address. LDS charges for that duplicate in
@@ -245,7 +272,8 @@ Things that cost time and are written down so they cost it only once:
   picks hipBLASLt, and on gfx1100 that is the library with the thinner Tensile
   tuning — rocBLAS is up to 33% faster on the same shape. Switch with
   `torch.backends.cuda.preferred_blas_library("cublas")`, and take best-of-four
-  transposes while you are there; the spread across NN/NT/TN/TT reaches 40%.
+  transposes while you are there: at 8192×8192×4096 rocBLAS measures NN 85.7,
+  NT 56.0, TN 90.2, TT 89.9 — a 1.6× spread, all of it in the single outlier.
 - **Do not use the data-sheet peak as a denominator.** Measure the ceiling with
   `tools/rdna-probes/wmma_peak.hip` and sample `rocm-smi -c -P` during the run.
   This card is clock- and power-limited well below boost under any real load.
