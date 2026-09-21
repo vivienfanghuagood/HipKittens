@@ -61,7 +61,33 @@ __device__ __forceinline__ void lds_wait() {
     asm volatile("s_waitcnt lgkmcnt(0)" ::: "memory");
 }
 
-// 0 LINEAR, 1 TILE16, 2 TILE16X, 3 U16, 4 XOR4, 5 K64, 6 ST
+// 0 LINEAR, 1 TILE16, 2 TILE16X, 3 U16, 4 XOR4, 5 K64, 6 ST, 7 ST_HALF, 8 ST32
+//
+// 7 and 8 exist to answer one question: does the wave-half mirror cost LDS
+// bandwidth, or does the hardware broadcast it for free? A gfx11 WMMA operand
+// requires lanes l and l+16 to hold identical data, so ST issues 32 lane-slots
+// against only 16 distinct addresses. If LDS charges per lane, half of every
+// operand read in the GEMM is waste and masking it off would be worth 2x.
+//
+//   ST_HALF  ST with exec = 0xffff: same distinct bytes, half the lane-slots.
+//   ST32     ST with 32 distinct rows: same lane-slots, twice the distinct
+//            bytes.
+//
+// One of the two must move. If ST_HALF is 2x faster, LDS is lane-slot bound and
+// the mirror is pure waste. If ST32 is 2x slower, LDS is distinct-byte bound
+// and the mirror is already free.
+//
+// Neither moves. ST 1.978 ms, ST_HALF 1.969, ST32 1.975 -- half the lanes and
+// twice the distinct bytes both cost exactly the same. A conflict-free
+// ds_read_b128 on gfx1100 has a **fixed cost per instruction**, independent of
+// how many lanes are active and of how many distinct addresses they name. Two
+// consequences for a GEMM, and they point opposite ways:
+//
+//   - The wave-half mirror is free. Masking it off, or reconstructing the high
+//     half with permlane, buys nothing; there is no bandwidth being wasted.
+//   - The only way to spend less on LDS is to *issue fewer ds_read*. That count
+//     is 2*(16/M + 16/N) per WMMA for an MxN warp tile and nothing else moves
+//     it, which is why the warp tile is the whole ballgame.
 template <int MODE>
 __global__ __launch_bounds__(256)
 void lds_bw(unsigned *sink, int iters) {
@@ -91,6 +117,29 @@ void lds_bw(unsigned *sink, int iters) {
             lds_wait();
             #pragma unroll
             for (int k = 0; k < 8; k++) acc += v[k][0] + v[k][3];
+        }
+    } else if constexpr (MODE == 7 || MODE == 8) {
+        // MODE 8 drops the `& 15`, so the 32 lanes touch 32 distinct rows.
+        const int r = (MODE == 8) ? lane : (lane & 15);
+        // The exec mask goes around the whole loop, not around the loads. Put
+        // it inside and the compiler pays s_and_saveexec plus a zero-init of
+        // v[] every iteration, which is what is being timed instead of LDS.
+        // Out here it is one s_mov before the loop and the body is otherwise
+        // instruction-identical to MODE 6.
+        if (MODE == 8 || lane < 16) {
+            for (int it = 0; it < iters; it++) {
+                int4_t v[8];
+                #pragma unroll
+                for (int k = 0; k < 8; k++) {
+                    const int row  = r + 16 * (k >> 1);
+                    unsigned  off  = 64u * row + 32u * (k & 1) + (unsigned)(it & 1) * 8192u;
+                    off ^= ((off % 1024u) >> 7) << 4;
+                    v[k] = ds_read_b128(base + (off & (LDS_BYTES - 1)));
+                }
+                lds_wait();
+                #pragma unroll
+                for (int k = 0; k < 8; k++) acc += v[k][0] + v[k][3];
+            }
         }
     } else if constexpr (MODE == 3) {
         // 8 u16 per "tile row", stepping K by 256B, to match Tensile.
@@ -152,8 +201,9 @@ void run(const char *name, int cus, double mhz) {
 
     const double waves = (double)wgs * threads / 32.0;
     const double per_lane = (MODE == 3) ? 2.0 : 16.0;   // bytes each lane asks for
-    // bytes actually requested by the instruction stream, 32 lanes per wave
-    const double bytes = waves * 32.0 * ITERS * 8.0 * per_lane;
+    const double active   = (MODE == 7) ? 16.0 : 32.0;  // lanes the exec mask lets through
+    // bytes actually requested by the instruction stream
+    const double bytes = waves * active * ITERS * 8.0 * per_lane;
     const double bpc_cu = bytes / (ms * 1e-3) / (mhz * 1e6) / cus;
     printf("  %-8s %8.3f ms   %8.1f GB/s   %7.1f bytes/clk/CU\n",
            name, ms, bytes / (ms * 1e6), bpc_cu);
@@ -173,6 +223,8 @@ int main() {
     run<4>("XOR4",    cus, mhz);
     run<5>("K64",     cus, mhz);
     run<6>("ST",      cus, mhz);
+    run<7>("ST_HALF", cus, mhz);
+    run<8>("ST32",    cus, mhz);
     run<3>("U16",     cus, mhz);
     return 0;
 }
