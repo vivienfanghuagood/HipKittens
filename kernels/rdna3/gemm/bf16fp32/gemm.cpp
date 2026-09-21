@@ -45,6 +45,29 @@ using namespace kittens;
 #ifndef N_SPLIT
 #define N_SPLIT 2
 #endif
+// How many K-tiles of global data are kept in flight in the staging registers.
+// 1 is the classic one-tile-deep pipeline: the loads for tile t+2 are issued
+// just before tile t's math and waited on at the top of the next iteration, so
+// the distance they get to cover is one K-tile of WMMAs. Deeper costs
+// GPREFETCH * (stage_a + stage_b) float4s and buys a proportionally longer
+// shadow, which is what a short K-tile needs.
+#ifndef GPREFETCH
+#define GPREFETCH 1
+#endif
+// Where in the iteration the staged K-tile gets written to LDS.
+//   0  before the math, which is where the obvious loop structure puts it
+//   1  after the math, so the tile's ds_reads are not queued behind the writes
+//   2  inside the math, at the point where the last ds_read has been issued:
+//      late enough not to delay a read, early enough that the last K-slice's
+//      WMMAs cover the write latency instead of the barrier doing it
+// 1 is the default because it measures fastest (79 vs 78 TFLOPs at 8192^2x4096).
+// 2 is the more interesting schedule and it is correct, but it buys nothing: the
+// writes are only 1/8 of the tile's LDS traffic, so hiding them under the last
+// K-slice's WMMAs just moves the same cycles around inside a pipe that is
+// already the bottleneck.
+#ifndef WRITE_POS
+#define WRITE_POS 1
+#endif
 // Rotate each chunk's next-slice reads into the slot the chunk just freed.
 #ifndef ROTATE
 #define ROTATE 1
@@ -126,8 +149,11 @@ struct micro_globals {
 namespace cli {
 constexpr int block_m = BLOCK_M, block_n = BLOCK_N, k_step = K_STEP,
               dot_slice = DOT_SLICE, num_warps = NUM_WARPS,
-              warp_rows = WARP_ROWS, wgm = WGM, n_split = N_SPLIT;
+              warp_rows = WARP_ROWS, wgm = WGM, n_split = N_SPLIT,
+              gprefetch = GPREFETCH, write_pos = WRITE_POS;
 }
+#undef WRITE_POS
+#undef GPREFETCH
 #undef N_SPLIT
 #undef BLOCK_M
 #undef BLOCK_N
@@ -141,12 +167,14 @@ constexpr int block_m = BLOCK_M, block_n = BLOCK_N, k_step = K_STEP,
 // macros directly, because no single tiling wins across shapes -- see the table
 // in README.md and the selection rule in dispatch_micro below.
 template<int _BLOCK_M, int _BLOCK_N, int _K_STEP, int _DOT_SLICE,
-         int _NUM_WARPS, int _WARP_ROWS, int _WGM, int _N_SPLIT = 2>
+         int _NUM_WARPS, int _WARP_ROWS, int _WGM, int _N_SPLIT = 2,
+         int _GPREFETCH = 1, int _WRITE_POS = 2>
 struct config {
     static constexpr int BLOCK_M = _BLOCK_M, BLOCK_N = _BLOCK_N;
     static constexpr int K_STEP  = _K_STEP,  DOT_SLICE = _DOT_SLICE;
     static constexpr int NUM_WARPS = _NUM_WARPS, WARP_ROWS = _WARP_ROWS;
     static constexpr int WGM = _WGM, N_SPLIT = _N_SPLIT;
+    static constexpr int GPREFETCH = _GPREFETCH, WRITE_POS = _WRITE_POS;
 
     static constexpr int NUM_THREADS = kittens::WARP_THREADS * NUM_WARPS;
     // Warps tile the block WARP_ROWS (M) by WARP_COLS (N).
@@ -171,7 +199,8 @@ struct config {
 
 // What -DBLOCK_M=... on the command line selects. sweep.sh drives this one.
 using macro_config = config<cli::block_m, cli::block_n, cli::k_step, cli::dot_slice,
-                            cli::num_warps, cli::warp_rows, cli::wgm, cli::n_split>;
+                            cli::num_warps, cli::warp_rows, cli::wgm, cli::n_split,
+                            cli::gprefetch, cli::write_pos>;
 
 template<typename C>
 __global__ __launch_bounds__(C::NUM_THREADS, MIN_BLOCKS_PER_CU)
@@ -225,11 +254,18 @@ void micro_tk(const micro_globals g) {
 
     // Prefetch staging. There is no global->LDS DMA on RDNA, so the "async
     // copy" is: buffer_load into these VGPRs on one iteration, ds_write them on
-    // the next. A whole K-tile of math sits between the two halves.
+    // a later one. GPREFETCH K-tiles of math sit between the two halves.
+    constexpr int GP = C::GPREFETCH;
     constexpr int stage_a = G::template stage_calls<st_a>;
     constexpr int stage_b = G::template stage_calls<st_b>;
-    float4 buf_a[stage_a];
-    float4 buf_b[stage_b];
+    float4 buf_a[GP][stage_a];
+    float4 buf_b[GP][stage_b];
+    // Loads still in flight once the oldest batch has landed. Buffer loads
+    // return in vmcnt order, so this is the vmcnt analogue of the lgkmcnt
+    // schedule in dot_tile(): wait for batch p and leave the GP-1 newer
+    // batches moving.
+    constexpr int VM_KEEP = (GP - 1) * (stage_a + stage_b);
+    static_assert(VM_KEEP <= 63, "vmcnt is 6 bits; GPREFETCH is too deep");
 
     // One K-tile of math: read a DOT_SLICE-wide pair of operand tiles out of
     // LDS, multiply, repeat.
@@ -263,12 +299,25 @@ void micro_tk(const micro_globals g) {
 #endif
     };
 
-    auto dot_tile = [&](int buf) {
+    // `has_tail` has to be a compile-time argument rather than derived from
+    // WRITE_POS alone: the epilogue calls dot_tile with an empty tail, and an
+    // lgkmcnt immediate that is too *large* does not over-wait, it fails to
+    // wait at all. Counting writes that were never issued there would let the
+    // last tile's WMMAs run on operands still in flight.
+    auto dot_tile = [&](int buf, auto has_tail, auto &&tail) {
+        // LDS ops the interleaved store adds to the queue. Writes issued after
+        // a batch of reads retire after them -- lgkmcnt is in order -- so every
+        // wait downstream of the store has to carry them, or it would retire
+        // more reads than the schedule intends.
+        constexpr int TAIL_OPS =
+            (has_tail() && C::WRITE_POS == 2) ? (stage_a + stage_b) : 0;
 #if ABLATE_LDS_READ
+        tail();
         #pragma unroll
         for (int k = 0; k < NUM_SLICES; k++)
             static_for<N_SPLIT>([&](auto c) { mma_chunk(c); });
 #elif !ROTATE
+        tail();
         #pragma unroll
         for (int k = 0; k < NUM_SLICES; k++) {
             load_A(buf, k);
@@ -288,14 +337,22 @@ void micro_tk(const micro_globals g) {
         // is gated on A rather than on a read issued behind it.
         load_A(buf, 0);
         static_for<N_SPLIT>([&](auto c) { load_B(buf, 0, c); });
+        // Nothing left to issue for this tile when there is only one slice.
+        if constexpr (NUM_SLICES == 1) tail();
 
         static_for<NUM_SLICES>([&](auto k) {
             static_for<N_SPLIT>([&](auto c) {
-                lds_wait<reads_in_flight(k, c, N_SPLIT, NUM_SLICES, CHUNK_READS)>();
+                // Slice NUM_SLICES-1's reads were all issued before the store,
+                // so its waits are the ones that have to count the writes.
+                constexpr int extra = (k == NUM_SLICES - 1) ? TAIL_OPS : 0;
+                lds_wait<reads_in_flight(k, c, N_SPLIT, NUM_SLICES, CHUNK_READS) + extra>();
                 mma_chunk(c);
                 if constexpr (k + 1 < NUM_SLICES) {
                     if constexpr (c == N_SPLIT - 1) load_A(buf, k + 1);
                     load_B(buf, k + 1, c);
+                    // Last read of the tile is now in flight: hand the LDS
+                    // pipe to the store, and let this slice's math cover it.
+                    if constexpr (k + 2 == NUM_SLICES && c == N_SPLIT - 1) tail();
                 }
             });
         });
@@ -315,36 +372,76 @@ void micro_tk(const micro_globals g) {
     // of the two the CDNA kernel uses: the write-after-read hazard on `toc` is
     // already covered by the previous iteration's barrier, so only the
     // write-before-read hazard needs a fresh one, at the bottom.
+    // The K index is clamped rather than predicated. Past the end of the K
+    // loop this re-reads the last tile into staging registers that are never
+    // stored, which is a handful of L2-hot loads per workgroup -- and it keeps
+    // exactly GP batches in flight at all times, which is what makes VM_KEEP a
+    // compile-time immediate. Predicating the issue instead would make the
+    // right vmcnt a runtime value, and there is no such instruction.
+    auto gload = [&](int d, int t) {
+        const int tt = t < num_tiles ? t : num_tiles - 1;
+        G::load_global_to_register_buffer(buf_a[d], stage_a, g.a, coord<st_a>{0, 0, row, tt}, As[0]);
+        G::load_global_to_register_buffer(buf_b[d], stage_b, g.b, coord<st_b>{0, 0, col, tt}, Bs[0]);
+    };
+
     G::load(As[tic], g.a, {0, 0, row, 0});
     G::load(Bs[tic], g.b, {0, 0, col, 0});
 #if !ABLATE_GLOBAL
-    if (num_tiles > 1) {
-        G::load_global_to_register_buffer(buf_a, stage_a, g.a, coord<st_a>{0, 0, row, 1}, As[toc]);
-        G::load_global_to_register_buffer(buf_b, stage_b, g.b, coord<st_b>{0, 0, col, 1}, Bs[toc]);
-    }
+    static_for<GP>([&](auto d) { gload(d, d + 1); });
 #endif
     __builtin_amdgcn_s_barrier();
 
-    for (int tile = 0; tile < num_tiles - 1; ++tile, tic ^= 1, toc ^= 1) {
+    // Unrolled by GP so that the staging slot is a compile-time index; a
+    // runtime one would put buf_a/buf_b in scratch.
+    const int n_main = num_tiles - 1;
+    for (int base = 0; base < n_main; base += GP) {
+        static_for<GP>([&](auto dd) {
+            constexpr int d = dd;
+            const int tile = base + d;
+            if (tile < n_main) {
+                // Land batch d -- issued GP iterations ago -- then immediately
+                // refill that slot, so the staging registers are never idle.
+                auto store_tile = [&] {
 #if !ABLATE_GLOBAL
-        // Land the in-flight tile, then immediately put the one after it in
-        // flight, so the buffer_loads are outstanding across all the math below.
-        asm volatile("s_waitcnt vmcnt(0)");
-        G::store_register_buffer_to_shared(As[toc], buf_a, stage_a);
-        G::store_register_buffer_to_shared(Bs[toc], buf_b, stage_b);
-        if (tile + 2 < num_tiles) {
-            G::load_global_to_register_buffer(buf_a, stage_a, g.a, coord<st_a>{0, 0, row, tile + 2}, As[tic]);
-            G::load_global_to_register_buffer(buf_b, stage_b, g.b, coord<st_b>{0, 0, col, tile + 2}, Bs[tic]);
-        }
+                    vm_wait<VM_KEEP>();
+#if !ABLATE_LDS_WRITE
+                    // No drain: dot_tile's own lgkmcnt schedule retires these,
+                    // and its last chunk waits to zero, which is what the
+                    // barrier below needs.
+                    G::template store_register_buffer_to_shared<false>(As[toc], buf_a[d], stage_a);
+                    G::template store_register_buffer_to_shared<false>(Bs[toc], buf_b[d], stage_b);
 #endif
-
-        dot_tile(tic);
-
-        __builtin_amdgcn_s_barrier();
+                    gload(d, tile + 1 + GP);
+#endif
+                };
+                auto nop = [] {};
+                if constexpr (C::WRITE_POS == 0) {
+                    store_tile();
+                    dot_tile(tic, std::false_type{}, nop);
+                } else if constexpr (C::WRITE_POS == 1) {
+                    dot_tile(tic, std::false_type{}, nop);
+                    store_tile();
+                } else {
+                    dot_tile(tic, std::true_type{}, store_tile);
+                    // dot_tile's last chunk stops at lgkmcnt(TAIL_OPS), so the
+                    // writes are still moving. s_barrier does not order memory:
+                    // without this the next tile's ds_reads race them. It is
+                    // nearly free here -- a whole K-slice of WMMAs has run
+                    // since the writes were issued.
+                    lds_wait<0>();
+                }
+#if !ABLATE_BARRIER
+                __builtin_amdgcn_s_barrier();
+#endif
+                tic ^= 1;
+                toc ^= 1;
+            }
+        });
     }
 
-    // Epilogue: last tile is already resident.
-    dot_tile(tic);
+    // Epilogue: last tile is already resident, and there is nothing left to
+    // stage -- hence false_type, which zeroes TAIL_OPS.
+    dot_tile(tic, std::false_type{}, [] {});
 
     // Column coords are in units of the tile width, which is now SPLIT_N.
     #pragma unroll
@@ -357,6 +454,22 @@ template<typename C>
 static void launch(const micro_globals &g) {
     const unsigned long mem_size = C::SHARED_BYTES;
     hipFuncSetAttribute((void*)micro_tk<C>, hipFuncAttributeMaxDynamicSharedMemorySize, mem_size);
+    // The compiler's occupancy remark counts registers only. LDS is the other
+    // limit and on this kernel it is usually the binding one, so ask the
+    // runtime what actually fits. HK_OCC=1 to see it.
+    if (getenv("HK_OCC")) {
+        static bool once = false;
+        if (!once) {
+            once = true;
+            int blocks = 0;
+            hipOccupancyMaxActiveBlocksPerMultiprocessor(&blocks, (void*)micro_tk<C>,
+                                                         C::NUM_THREADS, mem_size);
+            fprintf(stderr, "occ: %d blocks/WGP, %d waves/WGP, %.1f waves/SIMD"
+                            " (LDS %lu B, %d threads)\n",
+                    blocks, blocks * C::NUM_WARPS, blocks * C::NUM_WARPS / 4.0,
+                    mem_size, C::NUM_THREADS);
+        }
+    }
     micro_tk<C><<<dim3((g.a.rows() / C::BLOCK_M) * (g.b.rows() / C::BLOCK_N)),
                   dim3(C::NUM_THREADS), mem_size, g.stream>>>(g);
 }

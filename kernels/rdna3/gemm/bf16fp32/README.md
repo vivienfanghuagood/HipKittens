@@ -10,26 +10,37 @@ This is the kernel the RDNA3 port was validated against. Unlike
 ## Measured
 
 W7900D (gfx1100, 96 CU), ROCm 7.2.4. TFLOPs, HipKittens against **both** AMD
-BLAS libraries, vendor columns taken as best-of-{NN,NT,TN,TT}:
+BLAS libraries. The vendor gets two columns because the comparison genuinely has
+two answers:
 
-| shape (M×N×K) | hipBLASLt | rocBLAS | HK | HK / best | HK / WMMA ceiling |
-|---|---|---|---|---|---|
-| 4096³ | 69.5 | **83.0** | 74.5 | 90% | 74% |
-| 8192×8192×4096 | 66.3 | **88.7** | 76.4 | 86% | 76% |
-| 4096×8192×2048 | 70.5 | **88.6** | 75.4 | 85% | 75% |
-| 8192×4096×2048 | 69.7 | **88.6** | 75.4 | 85% | 75% |
-| 2048×4096×4096 | 67.9 | **85.3** | 73.4 | 86% | 73% |
-| 2048×2048×4096 | 63.4 | **76.9** | 67.3 | 87% | 67% |
-| 2048³ | 60.0 | **67.2** | 64.1 | 95% | 64% |
+- **best** — best of {NN, NT, TN, TT}. The vendor picks its favourite data
+  layout; HipKittens has only one.
+- **NT** — the vendor restricted to HipKittens' layout: A is (m,k), B is (n,k),
+  C = A·Bᵀ, both operands K-contiguous.
 
-**This kernel beats hipBLASLt on every shape and is 5-15% behind rocBLAS.** Two
-notes on reading that. First, an early version of this table compared only
+| shape (M×N×K) | hipBLASLt best | rocBLAS best | vendor NT | HK | HK / best | HK / NT | HK / ceiling |
+|---|---|---|---|---|---|---|---|
+| 4096³ | 69.7 | **82.9** | 69.7 | 74.4 | 90% | **107%** | 74% |
+| 8192×8192×4096 | 64.9 | **88.8** | 64.9 | 77.2 | 87% | **119%** | 77% |
+| 4096×8192×2048 | 71.3 | **88.4** | 70.0 | 75.4 | 85% | **108%** | 75% |
+| 8192×4096×2048 | 69.9 | **88.6** | 69.9 | 75.3 | 85% | **108%** | 75% |
+| 2048×4096×4096 | 67.8 | **84.6** | 67.8 | 73.7 | 87% | **109%** | 73% |
+| 2048×2048×4096 | 63.8 | **75.8** | 57.7 | 67.4 | 89% | **117%** | 67% |
+| 2048³ | 60.2 | **69.8** | 55.1 | 64.5 | 92% | **117%** | 64% |
+
+**In its own layout this kernel beats the best AMD library on every shape, by
+7-19%. Against the vendor's best layout it is 8-15% behind.** Both statements
+are true and they are about different problems: a GEMM with both operands
+K-contiguous is a harder memory problem than one where the vendor got to choose,
+and Tensile's NT tuning on gfx1100 is visibly the weakest of its four (rocBLAS
+spans 55-89 TFLOPs across layouts on the same shape). Pick the column that
+matches your data. Attention and MoE pipelines hand you the NT column.
+
+One further note on reading this: an early version of this table compared only
 against torch's default backend and claimed the kernel won two shapes of four.
-That was wrong twice over: torch on ROCm defaults to hipBLASLt, and on gfx1100
-hipBLASLt is the *slower* library by up to 33% — its Tensile tuning evidently
-does not cover RDNA the way rocBLAS's does. Run `python bench.py`, which
-benchmarks both. Second, the vendor columns get best-of-four layouts and HK is
-measured in its one layout (NT), so this is if anything generous to them.
+That was wrong twice over — torch on ROCm defaults to hipBLASLt, and on gfx1100
+hipBLASLt is the *slower* library by up to 33%. `bench.py` benchmarks both,
+across all four layouts, every time.
 
 Percentages are against **100.5 TFLOPs**, the measured back-to-back WMMA issue
 ceiling ([`tools/rdna-probes/wmma_peak.hip`](../../../../tools/rdna-probes/wmma_peak.hip)),
@@ -61,59 +72,132 @@ hand-built conflict-free reference and 4.1× the same tile read with the swizzle
 removed. rocBLAS's 2-byte pattern reaches 35.8. Both are conflict-free; the
 `swizzle_bytes` constant in `st.cuh` does not need retuning.
 
-What is left is arithmetic intensity. A warp tile of M×N needs `(M+N)·K` operand
-elements for `(M/16)(N/16)` WMMAs, so the bytes per WMMA go as `(M+N)/(M·N)`:
+What is left is LDS bytes, and the amount left is now accounted for exactly
+rather than estimated.
 
-| warp tile | intensity `(M·N)/(M+N)` | distinct bytes per 16 WMMAs |
+**LDS charges lane-bytes, not distinct bytes.** That is the whole story, and it
+was worth measuring rather than assuming: a gfx11 WMMA operand is mirrored
+across the wave halves, so lanes `l` and `l^16` issue `ds_read_b128` against the
+*same* address, and the question is whether the hardware broadcasts that for
+free. It does not. `lds_peak.hip` mode `ST` reproduces this kernel's addressing
+exactly and reaches **64.8 lane-bytes/clk/CU = 129.6/WGP**, which is the
+hardware's 128 B/clk/WGP. The duplicate half is paid for in full.
+
+So, per WGP per K-tile at 128×128×64:
+
+| | LDS cycles | as a fraction of the 2048 SIMD cycles of WMMA in the same window |
 |---|---|---|
-| 32×64 (this kernel) | 21.3 | 6144 |
-| 64×64 (rocBLAS) | **32.0** | **4096** |
+| reads: 8 waves × 48 `ds_read_b128` × 512 lane-B ÷ 128 B/clk | 1536 | 75% |
+| writes: 64 `ds_write_b128` × 512 lane-B ÷ 128 B/clk | 256 | 12% |
+| **total** | **1792** | **87%** |
 
-1.5×, exactly. Converted to a rate: 16 WMMAs is 16 × 8192 FLOP, which at
-512 FLOP/clk/CU is 256 CU-cycles, and a CU retires two wave-iterations in that
-window — so this kernel asks LDS for 48 bytes/clk/CU against the 64.8 ceiling,
-**74% utilised**, where rocBLAS asks for 32.
+87% is not a number a pipeline can hide behind. It also matches where the
+kernel actually sits: 79 / 100.5 = 78%, with the remaining 9 points going to the
+barrier and to the windows where neither resident wave has math ready.
 
-rocBLAS's Tensile kernel for this shape is
-`Cijk_..._MT128x128x16_MI16x16x16x1_..._PGR1_PLR1_..._WG32_4_1`: the same 128×128
-block, but **4 waves of 64×64 at 256 VGPRs** (6 waves/SIMD) instead of 8 waves of
-32×64, with both global *and* local reads prefetched.
+The `(M+N)/(M·N)` intensity argument says the fix is a bigger warp tile —
+reads per WMMA are `2·(16/M + 16/N)`, so 32×64 costs 1.5 and 64×64 costs 1.0,
+and rocBLAS's Tensile kernel for this shape
+(`Cijk_..._MT128x128x16_MI16x16x16x1_..._PGR1_PLR1_..._WG32_4_1`) is exactly
+**4 waves of 64×64** against this kernel's 8 waves of 32×64.
 
-Every attempt to copy that warp tile here measures *slower*:
+Every way of copying that measures *slower*:
 
-| config | VGPRs | occ | 4096³ / 8192×8192×4096 |
+| config | VGPRs | waves/SIMD | 4096³ / 8192×8192×4096 |
 |---|---|---|---|
-| 128×128×64, 8 warps, 32×64/warp (default) | 208 | 7 | **73 / 78** |
-| 128×128, 4 warps, 64×64/warp | 238 | 6 | 52 / 57 |
-| 256×128, 8 warps, 64×64/warp | 256 | 5 | 62 / 69 |
-| 128×256, 8 warps, 64×64/warp | 256 | 5 | 62 / 69 |
-| 256×256, 16 warps, 64×64/warp | 249 | 5 | 64 / 71 |
+| 128×128×64, 8 warps, 32×64/warp (default) | 208 | 2.0 | **74 / 79** |
+| 128×128, 4 warps, 64×64/warp | 238 | 2.0 | 52 / 57 |
+| 256×128, 8 warps, 64×64/warp | 256 | 2.0 | 62 / 69 |
+| 128×256, 8 warps, 64×64/warp | 256 | 2.0 | 62 / 69 |
+| 256×256, 16 warps, 64×64/warp | 249 | 2.0 | 64 / 71 |
+| 256×256×32, 16 warps, 64×64/warp | 256 | 4.0 | 44 / 51 |
 
-The 64×64 configurations do fit — 238 VGPRs, no spills, exactly rocBLAS's 6
-waves/SIMD — they are just latency-bound, and there is no room left to pipeline
-them: 64×64 is 128 accumulator VGPRs plus 64 operand VGPRs plus staging, and a
-second copy of the operands would need 64 more against a 256-VGPR file. There is
-no intermediate tile either. Accumulator VGPRs are `M·N/32` regardless of shape,
-so among powers of two the square tile is strictly optimal, and 48-row tiles
-need `BLOCK_M=192`, which divides none of the benchmark shapes (the kernel has
-no bounds predication). **That is an architectural wall**, and it is the reason
-the last 10% is not reachable by tuning: a gfx11 WMMA operand is mirrored across
-the two wave halves, so a `bf16` `rt_base` costs the same 8 VGPRs as an `fp32`
-one. gfx12 halves this, which is why `kernels/rdna4/` has headroom this kernel
-does not.
+Accumulator VGPRs are `M·N/32` regardless of shape, so 64×64 is 128 accumulator
+registers plus 64 operand registers before any staging; the configurations above
+are at or over the 256-VGPR file and have nothing left to pipeline with. There is
+no intermediate tile either — among powers of two the square tile is optimal, and
+a 48-row tile needs `BLOCK_M=192`, which divides none of the benchmark shapes
+(the kernel has no bounds predication).
+
+### Levers that were measured and are not levers
+
+Each of these was a plausible story about the missing 20%. All of them are
+closed, and the measurement is recorded so none is retried blind.
+
+**Occupancy.** The compiler's occupancy remark counts registers only; LDS is the
+binding limit here, and `hipOccupancyMaxActiveBlocksPerMultiprocessor` (whose
+"multiprocessor" is a WGP: 4 SIMDs, 2048 threads, 64 KB usable LDS,
+`multiProcessorCount` = 48) gives the real number. Build with `HK_OCC=1` to
+print it. Raising it makes things monotonically worse:
+
+| config | LDS | waves/SIMD | 8192×8192×4096 |
+|---|---|---|---|
+| 128×128×64, 8 warps | 64 KB | **2.0** | **79** |
+| 128×256×32, 16 warps | 48 KB | 4.0 | 78 |
+| 128×128×32, 8 warps | 32 KB | 4.0 | 71 |
+| 256×256×32, 32 warps | 64 KB | 8.0 | 63 |
+| 128×512×16, 32 warps | 48 KB | 8.0 | 46 |
+
+Latency hiding here comes from the software pipeline, not from resident waves.
+Two waves per SIMD with a good schedule beat eight with a bad one, and once LDS
+is 87% busy more waves only add contention.
+
+**Deeper global prefetch** (`GPREFETCH`). Keeping 2-3 K-tiles of global data in
+flight, retired with `vm_wait<(GP-1)*(stage_a+stage_b)>()`, is completely flat at
+K_STEP ≥ 32 (79 / 79 / 71 for GP = 1 / 2 / 3, the last collapsing at 256 VGPRs).
+It recovers 52 → 58 at K_STEP=16, where the K-tile is too short to cover a global
+round trip — but K_STEP=16 is 20 TFLOPs behind anyway. Global latency is already
+covered.
+
+**Clocks.** Under a 20 s steady-state run `rocm-smi` reports **2171 MHz mean at
+197 W** — the same clock the `wmma_peak` probe ran at when it established
+100.5 TFLOPs. The denominator is honest; there is no thermal headroom being lost.
+
+**wave64.** The one structural escape from the mirror would be a WMMA whose
+operands are not replicated. gfx1100 does have
+`__builtin_amdgcn_wmma_f32_16x16x16_bf16_w64`, and its signature settles it: A
+and B are `v16i16` — 8 VGPRs, the full K=16 per lane, *identical to wave32* —
+with a `v4f32` accumulator. 64 lanes × 16 halves for a 256-element matrix is **4×
+replication, twice as bad as wave32's 2×**. It cannot reduce LDS bytes. Dead end,
+and cheap to confirm: it is one compile.
+
+**Interleaving the LDS writes into the math** (`WRITE_POS=2`, issuing the store
+at the point the tile's last `ds_read` goes out so the final K-slice's WMMAs
+cover it). Correct, and worth nothing: 78 against `WRITE_POS=1`'s 79. Writes are
+1/8 of the tile's LDS traffic, so moving them around inside a pipe that is
+already the bottleneck does not help.
+
+**Hardware counters** are not available to diagnose any of this. Every `SQ`
+counter except `SQ_WAVES` reads 0 under `rocprofv3` on this part —
+`SQ_WAVE_CYCLES`, `SQ_WAIT_ANY`, `SQ_WAIT_INST_LDS`, `SQ_INSTS_VALU`,
+`SQ_INSTS_LDS`, `LDSBankConflict`, `ALUStalledByLDS`, `GRBM_GUI_ACTIVE`. The
+ablation builds below exist because of this.
+
+**So the wall is architectural**, and it is the 2× operand mirroring: a gfx11
+`bf16` `rt_base` costs the same 8 VGPRs — and the same LDS bytes — as an `fp32`
+one. gfx12 splits K across the halves instead and halves both, which is why
+`kernels/rdna4/` has headroom this kernel does not.
 
 ### The LDS reads run underneath the WMMAs, for free
 
 Ablating one pipeline stage at a time (`sweep.sh` with `ABLATE_*`, at 4096³ /
 8192×8192×4096) is how the cost was located:
 
-| build | VGPRs | occ | TFLOPs |
-|---|---|---|---|
-| full | 208 | 7 | 73 / 78 |
-| no global prefetch | 164 | 9 | 79 / 83 |
-| no LDS reads | 118 | 12 | 88 / 92 |
-| no WMMAs | 144 | 10 | 117 / 123 |
-| WMMAs only | 92 | 16 | 95 / 101 |
+| build | TFLOPs |
+|---|---|
+| full | 74 / 79 |
+| no `s_barrier` | 77 / 83 |
+| no LDS writes | 76 / 83 |
+| no barrier *and* no LDS writes | 81 / 86 |
+| no global prefetch | 79 / 83 |
+| no LDS reads | 88 / 92 |
+| WMMAs only | 95 / 101 |
+
+Read down that list: the reads are worth 13 TFLOPs, the writes and the barrier
+together are worth 7, and global prefetch is worth 4. The reads are the wall
+analysed above. The 7 points in writes-plus-barrier are the only part that ever
+looked addressable, and `WRITE_POS=2` — which is precisely the schedule that
+should have collected them — does not.
 
 Before the change described here the full build was 66/71 and the no-LDS-read
 build was 84/95 — the read stage was the dominant cost, and perfectly overlapping
@@ -152,10 +236,10 @@ write-after-read on `B_tile[c]`, which was the thing most likely to go wrong.
 remembering. More K-slices means more rotation points, so a deeper K-tile is
 suddenly worth its staging registers even at lower occupancy:
 
-| K_STEP | slices | VGPRs | occ | 4096³ / 8192×8192×4096 |
+| K_STEP | slices | VGPRs | waves/SIMD | 4096³ / 8192×8192×4096 |
 |---|---|---|---|---|
-| 32 | 2 | 161 | 9 | 70 / 76 |
-| 64 | 4 | 208 | 7 | **73 / 78** |
+| 32 | 2 | 161 | 4.0 | 70 / 76 |
+| 64 | 4 | 208 | 2.0 | **74 / 79** |
 
 `K_STEP=64` was measured before the rotation landed and lost (66/69 against
 66/72); it wins now. `K_STEP=128` does not fit in 64 KB of LDS with two buffers.
@@ -177,7 +261,7 @@ So `dispatch_micro` compiles two tilings and picks by workgroup count:
 | 2048×2048×2048 | 256 | **64** | 60 |
 | 4096×1024×4096 | 256 | **65** | 60 |
 | 4096³ | 1024 | **73** | — |
-| 8192×8192×4096 | 4096 | **78** | — |
+| 8192×8192×4096 | 4096 | **79** | — |
 
 so the rule is `blocks <= 64`. **That threshold moved by 4× when the rotated
 schedule landed** — it used to be 256. Overlapping the LDS reads made the coarse
@@ -203,7 +287,8 @@ How it got there, each step measured at 4096³ / 8192×8192×4096:
 | `ds_read_b128` / `ds_write_b128` via inline asm | 66 / 72 |
 | split B along N, step the waits down | 69 / 75 |
 | rotate the next slice's reads into the freed slots | 70 / 76 |
-| K_STEP 32 → 64, which the rotation made affordable | **73 / 78** |
+| K_STEP 32 → 64, which the rotation made affordable | 73 / 78 |
+| write the staged tile *after* the math, and drop the unconditional `lgkmcnt(0)` drain from `store_register_buffer_to_shared` | **74 / 79** |
 
 (The last row and the first table are separate runs of the same build; ±1 TFLOP
 run to run is normal on this part.)
@@ -226,14 +311,23 @@ python bench.py      # the table above
 ## Tuning
 
 `BLOCK_M`, `BLOCK_N`, `K_STEP`, `DOT_SLICE`, `NUM_WARPS`, `WARP_ROWS`, `WGM`,
-`N_SPLIT`, `ROTATE` are
+`N_SPLIT`, `ROTATE`, `GPREFETCH`, `WRITE_POS` are
 `-D`-overridable, but only take effect with `-DHK_MULTI_CONFIG=0`, which pins the
 build to exactly that tiling instead of the two-way selection above. `sweep.sh`
 passes it; without it a sweep would measure the selection rule rather than the
-configuration it names. `ABLATE_GLOBAL` / `ABLATE_LDS_READ` / `ABLATE_MMA` delete one pipeline
+configuration it names. `ABLATE_GLOBAL` / `ABLATE_LDS_READ` / `ABLATE_LDS_WRITE` /
+`ABLATE_BARRIER` / `ABLATE_MMA` delete one pipeline
 stage each — they make the answer wrong on purpose, and they are what located
 the cost above. Run them with `QB_ARGS=--no-check`, or the correctness check in
-`quickbench.py` reports WRONG and no timing comes out.
+`quickbench.py` reports WRONG and no timing comes out. `HK_OCC=1` in the
+environment prints the runtime's real occupancy, which is the LDS-limited one
+and not what the compiler's remark says.
+
+One trap worth naming, because it cost a debugging cycle: an `s_waitcnt
+lgkmcnt(N)` immediate that is too *large* does not over-wait, it fails to wait
+at all. `dot_tile` takes `has_tail` as a compile-time argument for exactly this
+reason — the epilogue passes an empty tail, and counting writes that were never
+issued would let the last K-tile's WMMAs run on operands still in flight.
 
 Things that were tried and did *not* work, recorded so they are not retried
 blind:

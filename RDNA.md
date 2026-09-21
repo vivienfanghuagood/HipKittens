@@ -11,7 +11,7 @@ the work here lives on the `rdna` branch, seven commits on top of `de0cddbd`.
 |---|---|---|
 | core library | `include/rdna3`, 68 files | `include/rdna4`, 68 files |
 | unit tests | **1659 passed, 0 failed** on a W7900D | compiles; **never executed** |
-| bf16 GEMM | **76.4 TFLOPs** peak, 76% of the measured WMMA ceiling, faster than hipBLASLt on every shape and 85-95% of rocBLAS | compiles; never executed |
+| bf16 GEMM | **77.2 TFLOPs** peak, 77% of the measured WMMA ceiling. 107-119% of the best AMD library *in HipKittens' own layout*; 85-92% of that library when it is free to pick its own | compiles; never executed |
 | fp8 | not available in hardware | implemented, all four opcodes, untested |
 
 **Read the second column as "written, not verified."** No gfx12 part was
@@ -109,28 +109,30 @@ if gfx12 fails, the bug is in `include/rdna4`, not in the tests.
 
 ## Performance
 
-W7900D (gfx1100, 96 CU). bf16 GEMM, fp32 accumulate. Vendor columns are
-best-of-{NN,NT,TN,TT}; HipKittens implements one layout.
+W7900D (gfx1100, 96 CU). bf16 GEMM, fp32 accumulate. HipKittens implements one
+layout — A (m,k), B (n,k), C = A·Bᵀ, both operands K-contiguous, torch's "NT" —
+so the vendor gets two columns: its best of {NN, NT, TN, TT}, and the same
+library restricted to that one layout.
 
-| shape (M×N×K) | hipBLASLt | rocBLAS | HK | HK / best | HK / ceiling |
-|---|---|---|---|---|---|
-| 4096³ | 69.5 | **83.0** | 74.5 | 90% | 74% |
-| 8192×8192×4096 | 66.3 | **88.7** | 76.4 | 86% | 76% |
-| 4096×8192×2048 | 70.5 | **88.6** | 75.4 | 85% | 75% |
-| 8192×4096×2048 | 69.7 | **88.6** | 75.4 | 85% | 75% |
-| 2048×4096×4096 | 67.9 | **85.3** | 73.4 | 86% | 73% |
-| 2048×2048×4096 | 63.4 | **76.9** | 67.3 | 87% | 67% |
-| 2048³ | 60.0 | **67.2** | 64.1 | 95% | 64% |
+| shape (M×N×K) | hipBLASLt best | rocBLAS best | vendor NT | HK | HK / best | HK / NT | HK / ceiling |
+|---|---|---|---|---|---|---|---|
+| 4096³ | 69.7 | **82.9** | 69.7 | 74.4 | 90% | **107%** | 74% |
+| 8192×8192×4096 | 64.9 | **88.8** | 64.9 | 77.2 | 87% | **119%** | 77% |
+| 4096×8192×2048 | 71.3 | **88.4** | 70.0 | 75.4 | 85% | **108%** | 75% |
+| 8192×4096×2048 | 69.9 | **88.6** | 69.9 | 75.3 | 85% | **108%** | 75% |
+| 2048×4096×4096 | 67.8 | **84.6** | 67.8 | 73.7 | 87% | **109%** | 73% |
+| 2048×2048×4096 | 63.8 | **75.8** | 57.7 | 67.4 | 89% | **117%** | 67% |
+| 2048³ | 60.2 | **69.8** | 55.1 | 64.5 | 92% | **117%** | 64% |
 
-**Two corrections to numbers this file previously carried**, both of which made
-the kernel look better than it is:
+**Three corrections to numbers this file previously carried.** The first two
+made the kernel look better than it is; the third made it look worse.
 
 *The baseline was the wrong library.* torch on ROCm defaults to hipBLASLt, and
 on gfx1100 hipBLASLt is the slower of the two by up to 33% — rocBLAS wins every
 shape here. Benchmarking against torch's default is benchmarking against the
 library AMD has not tuned for this architecture. The honest statement is "beats
-hipBLASLt everywhere, 5-15% behind rocBLAS", not the "wins 2 of 4" that the
-hipBLASLt-only table showed.
+hipBLASLt everywhere", not the "wins 2 of 4" that the hipBLASLt-only table
+showed.
 
 *The denominator was unreachable.* 122.6 TFLOPs is 96 CU × 512 FLOP/clk ×
 2.495 GHz boost. This card does not run a GEMM at 2.495 GHz: `rocm-smi` sampled
@@ -140,11 +142,27 @@ memory at all measures **100.5 TFLOPs**
 the architectural issue rate, at 2.18 GHz and only 101 W. The reachable peak is
 ~104, so percentages against 122.6 understate by about 18%.
 
-The gap to rocBLAS is one identified thing: **LDS bytes per WMMA**, which is
-arithmetic intensity, which is the warp tile. A 32×64 tile moves 1.5× the operand
-bytes per WMMA that rocBLAS's 64×64 does — `(M+N)/(M·N)`, exactly — and that puts
-this kernel at 48 bytes/clk/CU against a measured 64.8 ceiling, 74% utilised,
-where rocBLAS sits at 32.
+*The comparison was against a different problem.* rocBLAS's 88 TFLOPs headline
+is reached in TN or TT, which it is tuned for. Restricted to the layout this
+kernel implements it reaches 55-70, and HipKittens is **107-119% of the best
+AMD library** there — on every shape. Neither column is the "real" one; they
+answer different questions, and both are now printed. What the pair does show
+is that the residual gap is not HipKittens' inner loop against Tensile's inner
+loop. It is that a GEMM with both operands K-contiguous is a harder memory
+problem, and Tensile's NT tuning on gfx1100 is the weakest of its four.
+
+The gap to the vendor's best layout is one identified thing, and it is now
+accounted for exactly rather than estimated: **LDS lane-bytes**.
+
+A gfx11 WMMA operand is mirrored across the wave halves, so lanes `l` and `l^16`
+issue `ds_read_b128` against the same address. LDS charges for that duplicate in
+full — `lds_peak.hip` mode `ST` reproduces the kernel's exact addressing and
+measures 64.8 lane-bytes/clk/CU, i.e. 129.6 per WGP, which *is* the hardware's
+128 B/clk/WGP. So per WGP per K-tile at 128×128×64: reads are 8 waves × 48
+`ds_read_b128` × 512 lane-B ÷ 128 B/clk = **1536 cycles against 2048 cycles of
+WMMA in the same window (75%)**, and writes add 256 more (**87% total**). The
+kernel sits at 77% of the WMMA ceiling; there is no room under 87% for it to sit
+much higher.
 
 It is worth saying what it is *not*, because both alternatives look plausible
 from the disassembly and both were checked. It is not instruction count: rocBLAS
@@ -155,8 +173,18 @@ tree's access pattern at 64.8 bytes/clk/CU, tied with a hand-built conflict-free
 reference and 4.1× the same read with the swizzle removed. The swizzle constant
 is right.
 
-Half of that gap has since been closed, and how is the part worth carrying
-forward. rocBLAS pays for its wider tile with a software pipeline (`PLR1`) that
+Every escape from that was measured and none works. **Occupancy** is not the
+lever — 2, 4 and 8 waves/SIMD measure 79, 78 and 63, because latency hiding here
+comes from the software pipeline and not from resident waves. **Deeper global
+prefetch** is flat at K_STEP ≥ 32. **Clocks** are not a hidden denominator: 20 s
+of steady state holds 2171 MHz, the same clock the WMMA probe ran at. And
+**wave64**, the one structural way to kill the mirror, is worse: gfx1100's
+`__builtin_amdgcn_wmma_f32_16x16x16_bf16_w64` takes A and B as `v16i16` — 8
+VGPRs, the full K=16 per lane, identical to wave32 — so 64 lanes hold 1024 halves
+for a 256-element matrix, **4× replication against wave32's 2×**.
+
+Half of the gap that *was* closeable has been closed, and how is the part worth
+carrying forward. rocBLAS pays for its wider tile with a software pipeline (`PLR1`) that
 costs registers; the textbook version of that here — double-buffering the
 operand tiles — costs 48 VGPRs, drops occupancy from 9 waves/SIMD to 7, and
 measures *slower*. The version that works costs nothing, because `lds_wait<N>()`

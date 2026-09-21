@@ -40,8 +40,8 @@ __device__ static inline void load_global_to_register_buffer(float4* reg_buffer,
         reg_buffer, buffer_size, src, idx, dst_template);
 }
 
-template<ducks::st::all ST>
+template<bool wait = true, ducks::st::all ST>
 __device__ static inline void store_register_buffer_to_shared(ST& dst, const float4* reg_buffer,
                                                               const int buffer_size = stage_calls<ST>) {
-    kittens::store_register_buffer_to_shared<GROUP_THREADS, ST>(dst, reg_buffer, buffer_size);
+    kittens::store_register_buffer_to_shared<GROUP_THREADS, wait, ST>(dst, reg_buffer, buffer_size);
 }

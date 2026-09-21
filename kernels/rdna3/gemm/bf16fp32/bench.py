@@ -9,11 +9,24 @@ produced a published number that was wrong:
     the kernel. `torch.backends.cuda.preferred_blas_library` switches between
     them at runtime ("cublaslt" is hipBLASLt, "cublas" is rocBLAS).
 
-2.  **Every layout.** Tensile tunes per transpose combination and the four are
-    not equally covered on this part -- hipBLASLt spans 58..70 TFLOPs across
-    NN/NT/TN/TT at 4096^3. HipKittens implements one layout (C = A*B^T, B given
-    as (n,k)), so the honest comparison is against the vendor's *best* layout,
-    not against whichever one happens to match.
+2.  **Every layout, and the matching one.** Tensile tunes per transpose
+    combination and the four are not equally covered on this part -- rocBLAS
+    spans 56..88 TFLOPs across NN/NT/TN/TT at 8192^2x4096. HipKittens
+    implements exactly one layout: A is (m,k), B is (n,k), C = A*B^T, i.e. both
+    operands K-contiguous, which is torch's "NT". So there are two honest
+    numbers and this table prints both:
+
+      HK/best  against the vendor's best layout. This is the number that
+               matters if you get to choose how your data is laid out, and it
+               is the harder comparison -- the vendor is solving an easier
+               memory problem with the same math.
+      HK/same  against the vendor in HipKittens' own layout. This is the number
+               that matters if your data is already K-contiguous, which is what
+               an attention or MoE pipeline hands you.
+
+    Reporting only HK/best understates the kernel; reporting only HK/same
+    flatters it. The gap between the two columns is a statement about Tensile's
+    NT tuning on gfx1100, not about either kernel's math.
 
 3.  **The denominator.** There is no `PEAK_TFLOPS` constant here any more. The
     122.6 TFLOPs figure is 96 CU x 512 FLOP/clk x 2.495 GHz boost, and this
@@ -49,8 +62,12 @@ dtype = torch.bfloat16
 device = "cuda:0"
 
 
-def vendor_best(shape, backend):
-    """Best TFLOPs over all four transpose combinations, for one BLAS backend."""
+def vendor_layouts(shape, backend):
+    """TFLOPs per transpose combination, for one BLAS backend.
+
+    "NT" is the entry to compare against directly: it is the layout HipKittens
+    implements, both operands K-contiguous.
+    """
     m, n, k = shape
     torch.backends.cuda.preferred_blas_library(backend)
     A  = torch.randn((m, k), dtype=dtype, device=device)
@@ -64,7 +81,7 @@ def vendor_best(shape, backend):
         "TN": lambda: torch.matmul(At.t(), B,      out=C),
         "TT": lambda: torch.matmul(At.t(), Bt.t(), out=C),
     }
-    best_tf, best_lay = 0.0, ""
+    out = {}
     for lay, fn in layouts.items():
         for _ in range(15):
             fn()
@@ -75,29 +92,36 @@ def vendor_best(shape, backend):
             fn()
         e.record()
         torch.cuda.synchronize()
-        tf = 2*m*n*k / ((s.elapsed_time(e) / 50) * 1e9)
-        if tf > best_tf:
-            best_tf, best_lay = tf, lay
+        out[lay] = 2*m*n*k / ((s.elapsed_time(e) / 50) * 1e9)
     del A, At, B, Bt, C
     torch.cuda.empty_cache()
-    return best_tf, best_lay
+    return out
 
 
 if __name__ == "__main__":
     print_title(f"bf16 GEMM on gfx1100 -- WMMA ceiling {WMMA_CEILING} TFLOPs", 76)
+    print("vendor columns: best-of-four-layouts, and NT = the layout HK implements")
     print(f"{'shape (MxNxK)':>18} | {'hipBLASLt':>13} | {'rocBLAS':>13} | "
-          f"{'HipKittens':>10} | {'HK/best':>7} | {'HK/ceil':>7}")
-    print("-" * 82)
+          f"{'vendor NT':>9} | {'HipKittens':>10} | {'HK/best':>7} | "
+          f"{'HK/same':>7} | {'HK/ceil':>7}")
+    print("-" * 100)
 
     for shape in bench_shapes:
         m, n, k = shape
-        hipblaslt = vendor_best(shape, "cublaslt")
-        rocblas   = vendor_best(shape, "cublas")
+        hipblaslt = vendor_layouts(shape, "cublaslt")
+        rocblas   = vendor_layouts(shape, "cublas")
 
         params = {"device": device, "dtype": dtype, "shape": shape}
         hk = 2*m*n*k / (time_gemm(params, tk_kernel.dispatch_micro, True) * 1e9)
 
-        best = max(hipblaslt[0], rocblas[0])
-        print(f"{m}x{n}x{k:<6} | {hipblaslt[0]:8.1f} ({hipblaslt[1]}) | "
-              f"{rocblas[0]:8.1f} ({rocblas[1]}) | {hk:10.1f} | "
-              f"{100*hk/best:6.0f}% | {100*hk/WMMA_CEILING:6.0f}%")
+        def top(d):
+            lay = max(d, key=d.get)
+            return d[lay], lay
+        lt_tf, lt_lay = top(hipblaslt)
+        rb_tf, rb_lay = top(rocblas)
+        best = max(lt_tf, rb_tf)
+        same = max(hipblaslt["NT"], rocblas["NT"])
+
+        print(f"{m}x{n}x{k:<6} | {lt_tf:8.1f} ({lt_lay}) | {rb_tf:8.1f} ({rb_lay}) | "
+              f"{same:9.1f} | {hk:10.1f} | {100*hk/best:6.0f}% | "
+              f"{100*hk/same:6.0f}% | {100*hk/WMMA_CEILING:6.0f}%")

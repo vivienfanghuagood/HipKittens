@@ -193,6 +193,20 @@ template<int N=0> __device__ inline void lds_wait() {
     asm volatile("s_waitcnt lgkmcnt(%0)" :: "i"(N) : "memory");
 }
 
+/**
+ * @brief Wait until at most `N` vector-memory loads are still outstanding.
+ *
+ * The vmcnt analogue of lds_wait. Buffer loads return in issue order, so a
+ * caller that keeps D batches of `B` loads in flight retires the oldest batch
+ * with vm_wait<(D-1)*B>() and leaves the newer D-1 batches moving. That is how
+ * the GEMM gets a global prefetch distance of more than one K-tile without
+ * more than one barrier.
+ */
+template<int N=0> __device__ inline void vm_wait() {
+    static_assert(N >= 0 && N <= 63, "vmcnt is 6 bits on gfx11");
+    asm volatile("s_waitcnt vmcnt(%0)" :: "i"(N) : "memory");
+}
+
 /*
  * 128-bit LDS access.
  *

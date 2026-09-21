@@ -164,7 +164,7 @@ __device__ inline void load_global_to_register_buffer(float4* reg_buffer, const 
  * @param[in] reg_buffer The register buffer to store data from.
  * @param[in] buffer_size The size of the register buffer, as passed to the load.
  */
-template<int N_THREADS = WARP_THREADS, ducks::st::all ST>
+template<int N_THREADS = WARP_THREADS, bool wait = true, ducks::st::all ST>
 __device__ inline void store_register_buffer_to_shared(ST& dst, const float4* reg_buffer,
                                                        const int buffer_size = stage_calls<ST, N_THREADS>) {
     using T = typename ST::dtype;
@@ -189,11 +189,18 @@ __device__ inline void store_register_buffer_to_shared(ST& dst, const float4* re
             store_shared_vec4(dst.idx(dst_ptr, {row, col}), reg_buffer[c]);
         }
     }
-    #ifdef BUILTINS_ONLY
-    __builtin_amdgcn_s_waitcnt(0);
-    #else
-    asm volatile("s_waitcnt lgkmcnt(0)");
-    #endif
+    // Draining here costs a full LDS write latency on every call, and a caller
+    // that is about to issue its own ds_reads does not need it: lgkmcnt retires
+    // in order, so those reads' waits already cover these writes. What does
+    // need it is the barrier that publishes the tile -- s_barrier does not
+    // order memory -- and the caller is the one that knows where that is.
+    if constexpr (wait) {
+        #ifdef BUILTINS_ONLY
+        __builtin_amdgcn_s_waitcnt(0);
+        #else
+        asm volatile("s_waitcnt lgkmcnt(0)" ::: "memory");
+        #endif
+    }
 }
 
 
