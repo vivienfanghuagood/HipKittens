@@ -1,4 +1,5 @@
-// Fused GEMM -> ReduceScatter on RDNA3, two ranks.
+// Fused GEMM -> ReduceScatter on RDNA3, two ranks, on the shapes an actual
+// TP=2 deployment produces.
 //
 // The shape of the problem. In a tensor-parallel row-parallel linear layer, K
 // is split across ranks: rank r holds A[:, K_r] and B[:, K_r], computes a full
@@ -19,10 +20,10 @@
 // shared root complex and per-rank bandwidth falls as the ring grows. Against a
 // 77 TFLOP/s GEMM the break-even arithmetic intensity is ~4300 FLOP/byte at 2
 // ranks and ~17000 at 8, and for a GEMM whose output is reduce-scattered that
-// number is exactly K_local. A K_local of 4096 is an ordinary shape; 17000 is
-// not. At 8 ranks this node is fabric-bound however the kernel is written.
+// number is exactly K_local. At 8 ranks this node is fabric-bound however the
+// kernel is written.
 //
-// What is measured:
+// What is measured, per shape:
 //
 //   fused       GEMM with the reduce-scatter in its epilogue, then combine
 //   sequential  GEMM writing a full local M x N, then a bulk peer copy of the
@@ -33,6 +34,22 @@
 // kernel, so what is under test is the sharding and the peer stores, not the
 // math.
 //
+//                         --- the shapes ---
+//
+// Qwen3.8-27B (Qwen3_5ForConditionalGeneration), from its config.json:
+// hidden_size 5120, intermediate_size 17408, 64 layers in a 3:1 linear/full
+// attention pattern, num_attention_heads 24 x head_dim 256 = 6144, and linear
+// attention with 48 value heads x 128 = 6144 as well. Under TP=2 the layers
+// that need a reduce-scatter are the row-parallel ones, and there are exactly
+// two distinct shapes, both with N = hidden_size = 5120:
+//
+//   attn_out   K = 6144   (o_proj; the same 6144 for full and linear layers)
+//   mlp_down   K = 17408  (down_proj)
+//
+// M is the number of tokens in the batch, which is where concurrency enters:
+// prefill batches C requests of L tokens into min(C*L, chunk cap) tokens per
+// forward, decode batches C requests into exactly C tokens.
+//
 // Running this: two idle GPUs, pinned. HIP_VISIBLE_DEVICES=0,3 ./gemm_rs, under
 // an external timeout. The node is shared.
 #define HK_GEMM_NO_PYBIND 1
@@ -41,12 +58,14 @@
 #include "symmem.cuh"
 
 #include <chrono>
-#include <cstring>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <vector>
 
 using namespace hk_dist;
+
+static constexpr int WORLD = 2;
 
 // Globals for the fused epilogue. Same a and b as micro_globals; c is now only
 // my shard rather than the whole output, plus where the peer's half goes.
@@ -146,38 +165,35 @@ __global__ void err_scale(const bf16 *got, const bf16 *ref, size_t n,
 
 #define CHK(x) HKD_CHECK(x)
 
-int main(int argc, char **argv) {
-    // Unbuffered: this is meant to be run under an external timeout, and a full
-    // stdio buffer dies with the process.
-    setvbuf(stdout, nullptr, _IONBF, 0);
+// ---------------------------------------------------------------------------
+// One shape, both paths, verified and timed. Prints one table row.
+// ---------------------------------------------------------------------------
+static bool run_shape(const char *phase, int conc, const char *op,
+                      int M, int N, int K) {
+    const int K_local = K / WORLD;
+    const int shard   = M / WORLD;
 
-    const int M = argc > 1 ? atoi(argv[1]) : 8192;
-    const int N = argc > 2 ? atoi(argv[2]) : 8192;
-    const int K = argc > 3 ? atoi(argv[3]) : 8192;
-    const int ITERS = argc > 4 ? atoi(argv[4]) : 10;
-    const int world = 2;
-
-    const int K_local = K / world;
-    const int shard   = M / world;
-
-    // The epilogue decides ownership one warp tile at a time, so a shard
-    // boundary falling inside a tile would silently split one. Requiring a
-    // multiple of BLOCK_M is stricter than the REG_BLOCK_M the epilogue
-    // actually needs, and unlike it does not depend on which config runs.
-    if (M % (world * big_config::BLOCK_M) || N % big_config::BLOCK_N ||
-        K_local % big_config::K_STEP) {
-        fprintf(stderr, "need M %% %d == 0, N %% %d == 0, (K/%d) %% %d == 0\n",
-                world * big_config::BLOCK_M, big_config::BLOCK_N, world,
-                big_config::K_STEP);
-        return 1;
+    // What this GEMM can express. Two separate limits, worth distinguishing
+    // because only one of them is about the fusion:
+    //
+    //   * M % BLOCK_M -- the GEMM itself has no M-remainder path, so a batch of
+    //     fewer than BLOCK_M tokens cannot run at all, fused or not. This is
+    //     what rules out every decode shape.
+    //   * shard % REG_BLOCK_M -- the fused epilogue assigns ownership one warp
+    //     tile at a time, so a shard boundary inside a tile would split it.
+    //     Implied by the first for WORLD=2, checked anyway.
+    constexpr int BM = big_config::BLOCK_M, RBM = big_config::REG_BLOCK_M;
+    if (M % BM || shard % RBM) {
+        printf("%-8s %4d %-9s %6d %7d %6d %5d   -- M=%d is not a multiple of "
+               "BLOCK_M=%d; this GEMM has no M-remainder path\n",
+               phase, conc, op, M, K, K_local, N, M, BM);
+        return true;   // a limitation to report, not a failure to verify
     }
-
-    int avail = 0; CHK(hipGetDeviceCount(&avail));
-    if (avail < world) { fprintf(stderr, "need %d GPUs, see %d\n", world, avail); return 1; }
-    hipDeviceProp_t prop; CHK(hipGetDeviceProperties(&prop, 0));
-    printf("=== fused GEMM->ReduceScatter, %d x %s (%s) ===\n",
-           world, prop.name, prop.gcnArchName);
-    printf("M=%d N=%d K=%d   K_local=%d   shard=%d rows\n", M, N, K, K_local, shard);
+    if (N % big_config::BLOCK_N || K_local % big_config::K_STEP) {
+        printf("%-8s %4d %-9s %6d %7d %6d %5d   -- N or K_local does not tile\n",
+               phase, conc, op, M, K, K_local, N);
+        return true;
+    }
 
     const size_t a_elems = (size_t)M * K_local;
     const size_t b_elems = (size_t)N * K_local;
@@ -189,8 +205,7 @@ int main(int argc, char **argv) {
     // on every rank is what makes translate() a subtraction, so it all goes in.
     const size_t per_rank =
         (a_elems + b_elems + c_elems + 2 * s_elems) * sizeof(bf16) + (16u << 20);
-    printf("symmetric heap: %.2f GB per rank\n", per_rank / 1073741824.0);
-    sym_heap heap(per_rank, world);
+    sym_heap heap(per_rank, WORLD);
 
     auto A     = heap.allocate_all<bf16>(a_elems);
     auto B     = heap.allocate_all<bf16>(b_elems);
@@ -198,7 +213,7 @@ int main(int argc, char **argv) {
     auto Cout  = heap.allocate_all<bf16>(s_elems);   // my shard of the answer
     auto Inbox = heap.allocate_all<bf16>(s_elems);   // the peer's partial of it
 
-    for (int r = 0; r < world; r++) {
+    for (int r = 0; r < WORLD; r++) {
         CHK(hipSetDevice(r));
         hipLaunchKernelGGL(fill_a, dim3(1024), dim3(256), 0, heap.stream(r),
                            A[r], M, K_local, r * K_local);
@@ -206,7 +221,6 @@ int main(int argc, char **argv) {
                            B[r], N, K_local, r * K_local);
     }
     heap.sync_all();
-    printf("operands built\n");
 
     // ---------------------------------------------------------------- reference
     bf16 *rA, *rB, *rC;
@@ -223,7 +237,6 @@ int main(int argc, char **argv) {
         dispatch_micro(g);
         CHK(hipDeviceSynchronize());
     }
-    printf("reference built\n");
 
     // ------------------------------------------------------------------- fused
     // c_peer is built once, on the host: the peer's Inbox address translated
@@ -231,7 +244,7 @@ int main(int argc, char **argv) {
     // arithmetic -- the epilogue's peer store is an ordinary vectorized global
     // store that happens to land on another GPU.
     std::vector<micro_globals_rs> gr;
-    for (int r = 0; r < world; r++) {
+    for (int r = 0; r < WORLD; r++) {
         const int peer = 1 - r;
         bf16 *peer_inbox = heap.view(r).translate(Inbox[r], peer);
         gr.push_back(micro_globals_rs{
@@ -248,9 +261,9 @@ int main(int argc, char **argv) {
     // which is the whole point; what this barrier costs is the tail of the
     // slower rank, not the transfer.
     auto run_fused = [&]() {
-        for (int r = 0; r < world; r++) { CHK(hipSetDevice(r)); launch<big_config>(gr[r]); }
+        for (int r = 0; r < WORLD; r++) { CHK(hipSetDevice(r)); dispatch_any(gr[r]); }
         heap.sync_all();
-        for (int r = 0; r < world; r++) {
+        for (int r = 0; r < WORLD; r++) {
             CHK(hipSetDevice(r));
             hipLaunchKernelGGL(combine, dim3(1024), dim3(256), 0, heap.stream(r),
                                Cout[r], Inbox[r], s_elems);
@@ -263,14 +276,24 @@ int main(int argc, char **argv) {
     // same combine. The copy sits on the rank's own stream behind its own GEMM,
     // which is exactly the serialization the fused version removes.
     std::vector<micro_globals> gs;
-    for (int r = 0; r < world; r++)
+    for (int r = 0; r < WORLD; r++)
         gs.push_back(micro_globals{_gl_A(A[r], 1, 1, M, K_local),
                                    _gl_B(B[r], 1, 1, N, K_local),
                                    _gl_C(Cfull[r], 1, 1, M, N), heap.stream(r)});
 
+    // The ceiling: the same two GEMMs with no communication at all and no
+    // combine. This is not a correct implementation of anything -- it drops the
+    // reduce -- it is the floor time that any overlap scheme is trying to reach.
+    // Without it a speedup over the unfused path cannot be read as progress
+    // toward anything, only as a ratio between two arbitrary numbers.
+    auto run_gemm_only = [&]() {
+        for (int r = 0; r < WORLD; r++) { CHK(hipSetDevice(r)); dispatch_any(gs[r]); }
+        heap.sync_all();
+    };
+
     auto run_sequential = [&]() {
-        for (int r = 0; r < world; r++) { CHK(hipSetDevice(r)); launch<big_config>(gs[r]); }
-        for (int r = 0; r < world; r++) {
+        for (int r = 0; r < WORLD; r++) { CHK(hipSetDevice(r)); dispatch_any(gs[r]); }
+        for (int r = 0; r < WORLD; r++) {
             const int peer = 1 - r;
             CHK(hipSetDevice(r));
             // My copy of the peer's shard starts at row peer*shard.
@@ -279,7 +302,7 @@ int main(int argc, char **argv) {
                                    s_elems * sizeof(bf16), heap.stream(r)));
         }
         heap.sync_all();
-        for (int r = 0; r < world; r++) {
+        for (int r = 0; r < WORLD; r++) {
             CHK(hipSetDevice(r));
             // The baseline's own shard is still sitting inside Cfull, so this
             // reduces in place there rather than into Cout.
@@ -291,10 +314,9 @@ int main(int argc, char **argv) {
 
     // ------------------------------------------------------------------ verify
     // got[r] points at rank r's finished shard, wherever that path left it.
-    auto verify = [&](const char *what, std::vector<bf16 *> got) {
-        double worst = 0.0, worst_abs = 0.0, worst_scale = 0.0;
-        bool degenerate = false;
-        for (int r = 0; r < world; r++) {
+    auto verify = [&](std::vector<bf16 *> got, double *out_rel) {
+        double worst = 0.0;
+        for (int r = 0; r < WORLD; r++) {
             CHK(hipSetDevice(r));
             unsigned *d; CHK(hipMalloc(&d, 8)); CHK(hipMemset(d, 0, 8));
             // The reference lives on GPU 0; rank r reads its own slice of it
@@ -322,78 +344,234 @@ int main(int argc, char **argv) {
             // reference whose largest element is below 1 means the generator is
             // cancelling rather than the GEMM working -- which is exactly what
             // happened with the separable generator this file used first.
-            if (!(fh[1] > 1.f)) { degenerate = true; continue; }
-            if (fh[0] > worst_abs)   worst_abs = fh[0];
-            if (fh[1] > worst_scale) worst_scale = fh[1];
+            if (!(fh[1] > 1.f)) { *out_rel = -1.0; return false; }
             if ((double)fh[0] / fh[1] > worst) worst = (double)fh[0] / fh[1];
         }
+        *out_rel = worst;
         // Where the bound comes from. bf16 has 8 significand bits, so a single
         // rounding is up to 2^-8 = 3.9e-3 relative. The reference rounds once;
         // the distributed path rounds each of the two partials and then their
         // sum, and where the K-halves cancel the partials are larger than the
-        // answer. Three roundings puts the expectation near 1.2e-2 of full
-        // scale, and both paths measure 1.08e-2 at 2048x2048x4096 -- the same
-        // number for fused and sequential, which is itself the evidence that
-        // this is arithmetic and not routing.
-        //
-        // 5e-2 is therefore ~4x headroom over the arithmetic while staying 20x
-        // below what any routing bug costs: a misrouted tile delivers some
-        // other rank's partial, which is wrong by order 100% of scale, not by
-        // parts per hundred.
-        if (degenerate) {
-            printf("%-11s reference has no scale -- the comparison is vacuous   FAIL\n",
-                   what);
-            return false;
-        }
-        const bool ok = worst < 5e-2;
-        // The scale is printed, not just the ratio: a ratio on its own cannot
-        // be checked against the bf16 argument above, and it was a bad ratio
-        // that hid the overflow in the first version of this reduction.
-        printf("%-11s max|err| %.4g / max|ref| %.4g = %.2e   %s\n", what,
-               worst_abs, worst_scale, worst, ok ? "OK" : "FAIL");
-        return ok;
+        // answer. 5e-2 is ~4x headroom over that while staying 20x below what
+        // any routing bug costs: a misrouted tile delivers some other rank's
+        // partial, wrong by order 100% of scale, not by parts per hundred.
+        return worst < 5e-2;
     };
 
+    double rel_f = 0, rel_s = 0;
     run_fused();
-    bool ok = verify("fused", Cout);
-
+    bool ok = verify(Cout, &rel_f);
     run_sequential();
-    std::vector<bf16 *> seq_out(world);
-    for (int r = 0; r < world; r++) seq_out[r] = Cfull[r] + (size_t)r * shard * N;
-    ok = verify("sequential", seq_out) && ok;
-
-    if (!ok) { fprintf(stderr, "numerics are wrong; not reporting timings\n"); return 2; }
+    std::vector<bf16 *> seq_out(WORLD);
+    for (int r = 0; r < WORLD; r++) seq_out[r] = Cfull[r] + (size_t)r * shard * N;
+    ok = verify(seq_out, &rel_s) && ok;
 
     // -------------------------------------------------------------------- time
+    // Enough iterations to put ~4 TFLOP through each shape, so a 512-token
+    // attn_out and a 16384-token mlp_down are timed over comparable windows
+    // instead of one of them being three launches long.
+    const double flops = 2.0 * M * N * K;
+    int iters = (int)(4e12 / flops);
+    if (iters < 5) iters = 5;
+    if (iters > 100) iters = 100;
+
     // Host wall clock, not hip events: the work spans two devices and several
     // streams and every iteration ends in a host sync anyway, so an event on
     // one device's stream would be timing a subset of it.
-    auto time_it = [&](const char *what, auto &&fn) {
+    auto time_it = [&](auto &&fn) {
         for (int w = 0; w < 3; w++) fn();
         const auto t0 = std::chrono::steady_clock::now();
-        for (int i = 0; i < ITERS; i++) fn();
+        for (int i = 0; i < iters; i++) fn();
         const auto t1 = std::chrono::steady_clock::now();
-        const double ms =
-            std::chrono::duration<double, std::milli>(t1 - t0).count() / ITERS;
-        // FLOPs for the whole problem: the two ranks together do one M x N x K
-        // GEMM, so this is comparable to the single-GPU numbers in
-        // ../gemm/bf16fp32/README.md doubled.
-        printf("%-11s %8.3f ms   %6.1f TFLOPs (both ranks)\n", what, ms,
-               2.0 * M * N * K / (ms * 1e-3) / 1e12);
-        return ms;
+        return std::chrono::duration<double, std::milli>(t1 - t0).count() / iters;
     };
 
-    const double ms_seq = time_it("sequential", run_sequential);
-    const double ms_fus = time_it("fused", run_fused);
-    printf("fused speedup %.2fx\n", ms_seq / ms_fus);
+    const double ms_gem = time_it(run_gemm_only);
+    const double ms_seq = time_it(run_sequential);
+    const double ms_fus = time_it(run_fused);
 
-    // How much there was to win: what the baseline's bulk copy costs on its own.
-    printf("(peer copy alone: %.1f MB per rank, %.2f ms at the ~17 GB/s this "
-           "fabric measures)\n",
-           s_elems * sizeof(bf16) / 1048576.0,
-           s_elems * sizeof(bf16) / 17e9 * 1e3);
+    // ms_fus/ms_gem is the number that matters: 1.00 would mean the transfer
+    // has disappeared entirely behind the math.
+    printf("%-8s %4d %-9s %6d %7d %6d %5d %8.3f %8.3f %8.3f %7.2fx %6.2f %7.1f  %s\n",
+           phase, conc, op, M, K, K_local, N, ms_gem, ms_seq, ms_fus,
+           ms_seq / ms_fus, ms_fus / ms_gem, flops / (ms_fus * 1e-3) / 1e12,
+           ok ? "ok" : (rel_f < 0 || rel_s < 0 ? "VACUOUS" : "MISMATCH"));
 
     CHK(hipSetDevice(0));
     (void)hipFree(rA); (void)hipFree(rB); (void)hipFree(rC);
-    return 0;
+    return ok;
+}
+
+// Push into the peer's heap with ordinary stores, the way a fused epilogue
+// does. This is the same traffic hipMemcpyPeerAsync moves, with none of the
+// copy-engine setup.
+__global__ void push_bytes(sym_view v, float4 *dst, const float4 *src, int n4,
+                           int peer) {
+    size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    const size_t stride = (size_t)gridDim.x * blockDim.x;
+    float4 *remote = v.translate(dst, peer);
+    for (; i < (size_t)n4; i += stride) remote[i] = src[i];
+}
+
+// ---------------------------------------------------------------------------
+// What the transfer alone costs at a given volume, along two axes.
+//
+// The decode shapes cannot run through the GEMM at all, so this is the only
+// part of them that is measurable here -- and it is easy to misread, because
+// two quite different costs are superimposed and the first version of this
+// function reported their sum as though it were one number.
+//
+// Axis 1, memcpy vs in-kernel push: a fused epilogue writes to the peer with
+// ordinary stores, so if the copy engine's setup were the expensive part,
+// fusing would remove it and the push column would be faster.
+//
+// Axis 2, blocking vs pipelined, and this is the one that was missing: every
+// iteration used to end in a host sync on both devices. That made a 10 KB
+// transfer and a 160 KB transfer cost the same ~40 us -- and the natural
+// reading, "the fabric has a 40 us latency floor", was wrong. Most of it was
+// the host round trip. A decode loop does not pay that: 64 layers are
+// submitted ahead of the device and the host is not between them. Enqueuing
+// the transfers back to back and synchronising once amortises the round trip
+// away and leaves the part a real pipeline actually pays.
+// ---------------------------------------------------------------------------
+static void comm_floor(size_t bytes) {
+    bytes = (bytes + 15) & ~size_t(15);   // whole float4s for the push kernel
+    // Two buffers of `bytes` each, so the heap has to hold both. Sizing it for
+    // one was survivable at 10-160 KB purely because the 1 MB of slack happened
+    // to exceed the second allocation, and aborted the moment a prefill-scale
+    // volume was asked for.
+    sym_heap heap(2 * bytes + (1u << 20), WORLD);
+    auto src = heap.allocate_all<float4>(bytes / 16);
+    auto dst = heap.allocate_all<float4>(bytes / 16);
+    const int n4 = (int)(bytes / 16);
+    // Enough blocks to cover the payload, capped: at 10 KB this is 3 blocks,
+    // and launching 1024 of them would be measuring block dispatch.
+    const int blocks = (n4 + 255) / 256 < 1024 ? (n4 + 255) / 256 : 1024;
+
+    // Enqueue only -- the sync is the caller's, because whether there is one
+    // per transfer is the entire question here.
+    auto memcpy_enq = [&]() {
+        for (int r = 0; r < WORLD; r++) {
+            CHK(hipSetDevice(r));
+            CHK(hipMemcpyPeerAsync(dst[1 - r], 1 - r, src[r], r, bytes,
+                                   heap.stream(r)));
+        }
+    };
+    auto push_enq = [&]() {
+        for (int r = 0; r < WORLD; r++) {
+            CHK(hipSetDevice(r));
+            hipLaunchKernelGGL(push_bytes, dim3(blocks), dim3(256), 0,
+                               heap.stream(r), heap.view(r), dst[r], src[r],
+                               n4, 1 - r);
+        }
+    };
+
+    const int iters = 200;
+    // One transfer, then a host sync on both devices, per iteration. This is
+    // what a layer pays if it waits for its collective before going on.
+    auto time_blocking = [&](auto &&enq) {
+        for (int w = 0; w < 10; w++) { enq(); heap.sync_all(); }
+        const auto t0 = std::chrono::steady_clock::now();
+        for (int i = 0; i < iters; i++) { enq(); heap.sync_all(); }
+        const auto t1 = std::chrono::steady_clock::now();
+        return std::chrono::duration<double, std::milli>(t1 - t0).count() / iters;
+    };
+    // All the transfers enqueued back to back, one sync at the end. The host
+    // round trip is amortised to nothing, which is the situation a decode loop
+    // is actually in: 64 layers are submitted ahead and the host is not in the
+    // loop. The difference between the two columns is the cost of synchronising,
+    // not the cost of moving the bytes.
+    auto time_pipelined = [&](auto &&enq) {
+        for (int w = 0; w < 10; w++) enq();
+        heap.sync_all();
+        const auto t0 = std::chrono::steady_clock::now();
+        for (int i = 0; i < iters; i++) enq();
+        heap.sync_all();
+        const auto t1 = std::chrono::steady_clock::now();
+        return std::chrono::duration<double, std::milli>(t1 - t0).count() / iters;
+    };
+
+    const double blk_cpy  = time_blocking(memcpy_enq);
+    const double blk_push = time_blocking(push_enq);
+    const double pip_cpy  = time_pipelined(memcpy_enq);
+    const double pip_push = time_pipelined(push_enq);
+    printf("  %9.1f KB %8.3f %8.3f   %8.3f %8.3f %8.2f\n", bytes / 1024.0,
+           blk_cpy, blk_push, pip_cpy, pip_push,
+           bytes / (pip_push * 1e-3) / 1e9);
+}
+
+int main(int argc, char **argv) {
+    // Unbuffered: this is meant to be run under an external timeout, and a full
+    // stdio buffer dies with the process.
+    setvbuf(stdout, nullptr, _IONBF, 0);
+
+    int avail = 0; CHK(hipGetDeviceCount(&avail));
+    if (avail < WORLD) { fprintf(stderr, "need %d GPUs, see %d\n", WORLD, avail); return 1; }
+    hipDeviceProp_t prop; CHK(hipGetDeviceProperties(&prop, 0));
+    printf("=== fused GEMM->ReduceScatter, %d x %s (%s) ===\n",
+           WORLD, prop.name, prop.gcnArchName);
+
+    // One explicit shape, for poking at something the sweep does not cover.
+    if (argc > 3) {
+        printf("%-8s %4s %-9s %6s %7s %6s %5s %8s %8s %8s %7s\n",
+               "phase", "conc", "op", "M", "K", "K_loc", "N", "seq_ms",
+               "fus_ms", "speedup", "TFLOPs");
+        return run_shape("manual", 0, "manual", atoi(argv[1]), atoi(argv[2]),
+                         atoi(argv[3])) ? 0 : 2;
+    }
+
+    // Qwen3.8-27B under TP=2. H=5120, I=17408, attention output width 6144 for
+    // both the full and the linear layers.
+    const int H = 5120, I = 17408, ATTN = 6144;
+
+    printf("\nQwen3.8-27B, TP=2. N = hidden = %d; attn_out K = %d, mlp_down K = %d.\n",
+           H, ATTN, I);
+    printf("Prefill: C requests of 2048 tokens, batched to min(C*2048, 8192) --\n"
+           "the chunk cap most engines default to, which is why the shape stops\n"
+           "growing past C=4 and concurrency turns into more forwards instead.\n"
+           "Decode: exactly C tokens per forward.\n\n");
+
+    printf("gemm_ms is the two GEMMs with no communication and no reduce at "
+           "all -- not a\ncorrect implementation, just the floor overlap is "
+           "aiming at. fus/gemm of 1.00\nwould mean the transfer vanished "
+           "completely behind the math.\n\n");
+    printf("%-8s %4s %-9s %6s %7s %6s %5s %8s %8s %8s %8s %6s %7s  %s\n",
+           "phase", "conc", "op", "M", "K", "K_loc", "N", "gemm_ms", "seq_ms",
+           "fus_ms", "speedup", "f/g", "TFLOPs", "check");
+
+    bool ok = true;
+    const int CONC[] = {1, 2, 4, 8, 16, 32};
+    // `gemm_rs comm` re-runs just the transfer measurements, which take seconds,
+    // without the several minutes of GEMM sweep in front of them.
+    const bool comm_only = (argc == 2 && !strcmp(argv[1], "comm"));
+
+    for (int c : CONC) {
+        if (comm_only) break;
+        long long tok = (long long)c * 2048;
+        const int M = (int)(tok < 8192 ? tok : 8192);
+        ok &= run_shape("prefill", c, "attn_out", M, H, ATTN);
+        ok &= run_shape("prefill", c, "mlp_down", M, H, I);
+    }
+    for (int c : CONC) {
+        if (comm_only) break;
+        ok &= run_shape("decode", c, "attn_out", c, H, ATTN);
+        ok &= run_shape("decode", c, "mlp_down", c, H, I);
+    }
+
+    // The decode rows above are all limitation notices, so measure the part of
+    // decode that does exist: the reduce-scatter volume, C*H*2 bytes, halved
+    // because each rank only sends the other rank's shard.
+    printf("\nThe transfer alone at decode volumes (C/2 x %d x 2 bytes -- each "
+           "rank sends\nonly the other's shard). 'blocking' syncs the host after "
+           "every transfer;\n'pipelined' enqueues them back to back and syncs "
+           "once, which is the situation\n64 decode layers are in. The gap "
+           "between the two is host round trip, not wire.\n", H);
+    printf("  %9s %17s   %17s %8s\n", "", "blocking", "pipelined", "");
+    printf("  %9s %8s %8s   %8s %8s %8s\n", "size", "cpy_ms", "push_ms",
+           "cpy_ms", "push_ms", "GB/s");
+    for (int c : CONC) comm_floor((size_t)(c / 2 ? c / 2 : 1) * H * sizeof(bf16));
+    printf("\nAnd at a prefill volume, for scale:\n");
+    comm_floor((size_t)4096 * H * sizeof(bf16));
+
+    return ok ? 0 : 2;
 }

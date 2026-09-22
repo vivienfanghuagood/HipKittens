@@ -579,8 +579,13 @@ using k32_config   = config<128, 128, 32, 16, 8, 4, 8, 4>;
 #define HK_MULTI_CONFIG 1
 #endif
 
-void dispatch_micro(micro_globals g) {
-#if HK_MULTI_CONFIG
+// The selection rule, templated on the globals type so that a caller with a
+// different output policy gets the same tiling decisions. The fused kernel used
+// to pin itself to `big`, which measures the wrong thing on the small-M shapes
+// a decode or short-prefill batch produces -- the point of comparing against an
+// unfused baseline is that the two differ only in the epilogue.
+template<typename GL>
+static void dispatch_any(const GL &g) {
     // num_tiles is a plain division, so a K-tile that does not divide K would
     // silently drop the tail.
     if (g.a.cols() % big_config::K_STEP != 0) {
@@ -595,6 +600,11 @@ void dispatch_micro(micro_globals g) {
         return;
     }
     launch<big_config>(g);
+}
+
+void dispatch_micro(micro_globals g) {
+#if HK_MULTI_CONFIG
+    dispatch_any(g);
 #else
     launch<macro_config>(g);   // -DBLOCK_M=... from sweep.sh
 #endif
