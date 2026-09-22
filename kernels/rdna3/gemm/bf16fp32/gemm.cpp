@@ -17,7 +17,13 @@
 #include <utility>
 
 #include "kittens.cuh"
+// pyutils pulls in pybind11 and the Python headers. The distributed kernel
+// includes this file for the tuned inner loop and has its own host harness, so
+// both the include and the module below are opt-out -- otherwise a build with
+// no Python development headers could not use the GEMM at all.
+#ifndef HK_GEMM_NO_PYBIND
 #include "pyutils/pyutils.cuh"
+#endif
 using namespace kittens;
 
 // Tiling knobs. The defaults are the shape this file is named for; the sweep
@@ -147,6 +153,13 @@ struct micro_globals {
     _gl_B b;
     _gl_C c;
     hipStream_t stream;   // a: (m, k), b: (n, k), c: (m, n)
+
+    // The epilogue is selected on this rather than on a template parameter of
+    // the kernel, so that a caller with a different output policy supplies a
+    // different globals type and nothing else changes. See
+    // kernels/rdna3/distributed/gemm_rs.hip, whose globals set it true to turn
+    // the store into a reduce-scatter push.
+    static constexpr bool FUSED_RS = false;
 };
 
 // The command line sets the tunables as macros, and the config struct below
@@ -208,9 +221,9 @@ using macro_config = config<cli::block_m, cli::block_n, cli::k_step, cli::dot_sl
                             cli::num_warps, cli::warp_rows, cli::wgm, cli::n_split,
                             cli::gprefetch, cli::write_pos>;
 
-template<typename C>
+template<typename C, typename GL = micro_globals>
 __global__ __launch_bounds__(C::NUM_THREADS, MIN_BLOCKS_PER_CU)
-void micro_tk(const micro_globals g) {
+void micro_tk(const GL g) {
     constexpr int BLOCK_M = C::BLOCK_M, BLOCK_N = C::BLOCK_N;
     constexpr int K_STEP = C::K_STEP, DOT_SLICE = C::DOT_SLICE;
     constexpr int WARP_ROWS = C::WARP_ROWS, WARP_COLS = C::WARP_COLS;
@@ -450,16 +463,60 @@ void micro_tk(const micro_globals g) {
     dot_tile(tic, std::false_type{}, [] {});
 
     // Column coords are in units of the tile width, which is now SPLIT_N.
-    #pragma unroll
-    for (int s = 0; s < N_SPLIT; s++)
-        store(g.c, C_accum[s], {0, 0, row * WARP_ROWS + warp_row,
-                                (col * WARP_COLS + warp_col) * N_SPLIT + s});
+    const int row_tile = row * WARP_ROWS + warp_row;   // in REG_BLOCK_M units
+    const int col_tile = (col * WARP_COLS + warp_col) * N_SPLIT;
+
+    if constexpr (!GL::FUSED_RS) {
+        #pragma unroll
+        for (int s = 0; s < N_SPLIT; s++)
+            store(g.c, C_accum[s], {0, 0, row_tile, col_tile + s});
+    } else {
+        // Fused reduce-scatter. Every rank computes a full M x N partial
+        // product over its own slice of K, and the final C is the sum of those
+        // partials, row-sharded across ranks. So a tile is either mine to keep
+        // or the owner's to receive, and the cheapest moment to decide is here:
+        // the accumulator is already in registers, and the alternative is to
+        // write the whole M x N locally and move half of it again afterwards.
+        //
+        // The shard boundary is in units of REG_BLOCK_M and the host has
+        // checked it divides, so a warp tile never straddles two owners and no
+        // tile has to be split.
+        //
+        // g.c_peer is the peer's inbox, already translated to the peer's heap
+        // on the host, so the peer store is an ordinary vectorized global store
+        // to an address that happens to live on another GPU -- no device-side
+        // address arithmetic, and no per-element loop. Being able to do this is
+        // the whole reason symmem.cuh keeps translate() public where Iris does
+        // not.
+        //
+        // One peer, hence one gl: kittens::gl has no default constructor and
+        // its only constructor is __host__, so an array of them cannot be a
+        // member and a device-side one cannot be built. Supporting more ranks
+        // means passing world-1 named gls or giving gl a device constructor;
+        // two is the size the fabric measurements say is worth fusing anyway.
+        // shard_rows is in rows, not tiles, because the tile height is a
+        // property of the config the dispatcher picked and the host does not
+        // know which one that was. One integer division at the very end of the
+        // kernel costs nothing.
+        const int shard_tiles = g.shard_rows / C::REG_BLOCK_M;
+        const int owner = row_tile / shard_tiles;
+        const int local_row_tile = row_tile - owner * shard_tiles;
+        if (owner == g.my_rank) {
+            #pragma unroll
+            for (int s = 0; s < N_SPLIT; s++)
+                store(g.c, C_accum[s], {0, 0, local_row_tile, col_tile + s});
+        } else {
+            #pragma unroll
+            for (int s = 0; s < N_SPLIT; s++)
+                store(g.c_peer, C_accum[s], {0, 0, local_row_tile, col_tile + s});
+        }
+    }
 }
 
-template<typename C>
-static void launch(const micro_globals &g) {
+template<typename C, typename GL = micro_globals>
+static void launch(const GL &g) {
     const unsigned long mem_size = C::SHARED_BYTES;
-    hipFuncSetAttribute((void*)micro_tk<C>, hipFuncAttributeMaxDynamicSharedMemorySize, mem_size);
+    hipFuncSetAttribute((void*)micro_tk<C, GL>, hipFuncAttributeMaxDynamicSharedMemorySize, mem_size);
     // The compiler's occupancy remark counts registers only. LDS is the other
     // limit and on this kernel it is usually the binding one, so ask the
     // runtime what actually fits. HK_OCC=1 to see it.
@@ -468,7 +525,7 @@ static void launch(const micro_globals &g) {
         if (!once) {
             once = true;
             int blocks = 0;
-            hipOccupancyMaxActiveBlocksPerMultiprocessor(&blocks, (void*)micro_tk<C>,
+            hipOccupancyMaxActiveBlocksPerMultiprocessor(&blocks, (void*)micro_tk<C, GL>,
                                                          C::NUM_THREADS, mem_size);
             fprintf(stderr, "occ: %d blocks/WGP, %d waves/WGP, %.1f waves/SIMD"
                             " (LDS %lu B, %d threads)\n",
@@ -476,7 +533,7 @@ static void launch(const micro_globals &g) {
                     mem_size, C::NUM_THREADS);
         }
     }
-    micro_tk<C><<<dim3((g.a.rows() / C::BLOCK_M) * (g.b.rows() / C::BLOCK_N)),
+    micro_tk<C, GL><<<dim3((g.a.rows() / C::BLOCK_M) * (g.b.rows() / C::BLOCK_N)),
                   dim3(C::NUM_THREADS), mem_size, g.stream>>>(g);
 }
 
@@ -543,7 +600,11 @@ void dispatch_micro(micro_globals g) {
 #endif
 }
 
+// The distributed kernel includes this file for the tuned inner loop and
+// supplies its own host harness, so the python module is opt-out.
+#ifndef HK_GEMM_NO_PYBIND
 PYBIND11_MODULE(tk_kernel, m) {
     m.doc() = "tk_kernel python module";
     py::bind_function<dispatch_micro>(m, "dispatch_micro", &micro_globals::a, &micro_globals::b, &micro_globals::c);
 }
+#endif
