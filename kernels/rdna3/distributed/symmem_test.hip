@@ -61,16 +61,45 @@ __global__ void raise_flag(sym_view v, uint32_t *flag, uint32_t val, int peer) {
     if (threadIdx.x == 0 && blockIdx.x == 0) v.signal(flag, val, peer);
 }
 
-// Wait on my own flag, then verify what the predecessor left in my inbox.
-__global__ void wait_and_check(sym_view v, const uint32_t *flag, uint32_t val,
-                               const int *inbox, int n, int from, int *bad) {
-    __shared__ int ready;
-    if (threadIdx.x == 0) {
-        v.wait(flag, val);
-        ready = 1;
+// Wait on my own flag. One block, deliberately.
+//
+// The obvious way to write this test is one kernel that spins and then
+// verifies, sized to cover the buffer. That deadlocks, and the reason is worth
+// keeping: the waiter and the push to the *successor* run on the same GPU, so
+// a waiter wide enough to fill the device leaves no room for the push to be
+// scheduled. Rank 0 then waits on a push from rank 1 that rank 1's own waiter
+// is blocking, all the way round the ring. Splitting wait from verify keeps
+// the property under test -- a consumer resident and spinning while the
+// producer writes, with no host synchronization between them -- while leaving
+// the other 95 CUs free.
+//
+// The spin is bounded, unlike sym_view::wait. A real overlap kernel spins
+// indefinitely because the alternative is worse, but a *test* that spins
+// forever on a handshake that never completes leaves a kernel wedged on a GPU
+// other people are sharing, and the way out of that is a device reset. One
+// block also means one deadline: the first version put a deadline in each of
+// 512 blocks, which do not run concurrently, so the timeouts ran in series and
+// the "10 second" bound was closer to a minute.
+//
+// clock64() was verified to advance on gfx1100 before being trusted here --
+// s_memtime and s_memrealtime are both gone in gfx11, so a counter reading as
+// a constant would have made this a watchdog that silently wasn't one.
+__global__ void wait_flag(const uint32_t *flag, uint32_t val, int *timed_out) {
+    if (threadIdx.x != 0) return;
+    const long long deadline = clock64() + 20000000000LL;  // ~10s at 2GHz
+    while (clock64() < deadline) {
+        if (__hip_atomic_load(flag, __ATOMIC_ACQUIRE,
+                              __HIP_MEMORY_SCOPE_SYSTEM) >= val)
+            return;
     }
-    __syncthreads();
-    (void)ready;
+    *timed_out = 1;
+}
+
+// Verify what the predecessor left in my inbox. Stream-ordered behind
+// wait_flag, so the acquire that made the payload visible has already happened.
+__global__ void verify_inbox(const int *inbox, int n, int from, int *bad,
+                             const int *timed_out) {
+    if (*timed_out) return;   // nothing arrived; an inbox of zeros is not news
     size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
     const size_t stride = (size_t)gridDim.x * blockDim.x;
     int errs = 0;
@@ -80,6 +109,11 @@ __global__ void wait_and_check(sym_view v, const uint32_t *flag, uint32_t val,
 }
 
 int main(int argc, char **argv) {
+    // Unbuffered, because this program can be killed by an external timeout and
+    // a full stdio buffer dies with it. Losing the trace of where it got to is
+    // exactly the information a timeout is being used to obtain.
+    setvbuf(stdout, nullptr, _IONBF, 0);
+
     int avail = 0;
     HKD_CHECK(hipGetDeviceCount(&avail));
     const int N = argc > 1 ? atoi(argv[1]) : avail;
@@ -92,20 +126,26 @@ int main(int argc, char **argv) {
 
     // Three buffers plus a flag page per rank, allocated in the same order on
     // every rank so the offsets stay symmetric.
+    printf("  allocating symmetric heap ...\n");
     sym_heap heap((size_t)(MB << 20) * 2 + (1 << 20), N);
     auto mine  = heap.allocate_all<int>(n);        // my pattern
     auto inbox = heap.allocate_all<int>(n);        // what my predecessor sends
     auto flags = heap.allocate_all<uint32_t>(64);
+    printf("  heap ready\n");
 
+    // Two counters per rank: [0] mismatches, [1] the handshake timed out. They
+    // mean different things -- a mismatch is a wrong answer, a timeout is no
+    // answer -- and conflating them would report a hang as a data error.
     std::vector<int *> bad(N);
     for (int r = 0; r < N; r++) {
         HKD_CHECK(hipSetDevice(r));
-        HKD_CHECK(hipMalloc(&bad[r], 4));
-        HKD_CHECK(hipMemset(bad[r], 0, 4));
+        HKD_CHECK(hipMalloc(&bad[r], 8));
+        HKD_CHECK(hipMemset(bad[r], 0, 8));
         hipLaunchKernelGGL(fill, dim3(512), dim3(256), 0, heap.stream(r),
                            mine[r], n, r);
     }
     heap.sync_all();
+    printf("  fill done\n");
 
     // 1. translate()
     for (int r = 0; r < N; r++) {
@@ -144,27 +184,44 @@ int main(int argc, char **argv) {
 
     // Correctness round: the waiters must be resident before the pushes land,
     // so they are launched first on their own streams.
+    printf("  launching waiters ...\n");
     std::vector<hipStream_t> wstream(N);
     for (int r = 0; r < N; r++) {
         HKD_CHECK(hipSetDevice(r));
         HKD_CHECK(hipStreamCreate(&wstream[r]));
         const int pred = (r + N - 1) % N;
-        hipLaunchKernelGGL(wait_and_check, dim3(512), dim3(256), 0, wstream[r],
-                           heap.view(r), flags[r], 1u, inbox[r], n, pred, bad[r]);
+        hipLaunchKernelGGL(wait_flag, dim3(1), dim3(64), 0, wstream[r],
+                           flags[r], 1u, bad[r] + 1);
+        hipLaunchKernelGGL(verify_inbox, dim3(512), dim3(256), 0, wstream[r],
+                           inbox[r], n, pred, bad[r], bad[r] + 1);
     }
+    printf("  pushing ...\n");
     round(1u);
     heap.sync_all();
     for (int r = 0; r < N; r++) {
         HKD_CHECK(hipSetDevice(r)); HKD_CHECK(hipStreamSynchronize(wstream[r]));
     }
     total = 0;
+    int hangs = 0;
     for (int r = 0; r < N; r++) {
-        int h = 0; HKD_CHECK(hipSetDevice(r));
-        HKD_CHECK(hipMemcpy(&h, bad[r], 4, hipMemcpyDeviceToHost));
-        total += h;
+        int h[2] = {0, 0}; HKD_CHECK(hipSetDevice(r));
+        HKD_CHECK(hipMemcpy(h, bad[r], 8, hipMemcpyDeviceToHost));
+        total += h[0];
+        hangs += h[1];
     }
-    printf("[2] peer push + release/acquire handoff: %s (%d mismatches)\n",
-           total ? "FAIL" : "OK", total);
+    printf("[2] peer push + release/acquire handoff: %s (%d mismatches, %d timeouts)\n",
+           (total || hangs) ? "FAIL" : "OK", total, hangs);
+    if (hangs) {
+        // The flag never arrived. Pushing more traffic at a peer that is not
+        // listening tells us nothing, so stop rather than run the bandwidth
+        // round on a broken fabric.
+        fprintf(stderr, "handshake timed out on %d rank(s); skipping [3]\n", hangs);
+        for (int r = 0; r < N; r++) {
+            HKD_CHECK(hipSetDevice(r));
+            (void)hipFree(bad[r]); (void)hipStreamDestroy(wstream[r]);
+        }
+        return 2;
+    }
 
     // Bandwidth round: pushes only, no waiters, so the number is the transport
     // and not the handshake.
