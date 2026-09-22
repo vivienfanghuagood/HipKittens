@@ -81,16 +81,24 @@ __global__ void raise_flag(sym_view v, uint32_t *flag, uint32_t val, int peer) {
 // 512 blocks, which do not run concurrently, so the timeouts ran in series and
 // the "10 second" bound was closer to a minute.
 //
-// clock64() was verified to advance on gfx1100 before being trusted here --
-// s_memtime and s_memrealtime are both gone in gfx11, so a counter reading as
-// a constant would have made this a watchdog that silently wasn't one.
-__global__ void wait_flag(const uint32_t *flag, uint32_t val, int *timed_out) {
+// The bound must come from wall_clock64(), not clock64(). clock64() on gfx1100
+// is s_getreg hwreg(HW_REG_SHADER_CYCLES), which is *20 bits wide* with the
+// high word zeroed -- it wraps every ~0.5 ms and never exceeds 2^20. So the
+// obvious `deadline = clock64() + 20e9; while (clock64() < deadline)` is a
+// watchdog that silently isn't one: the comparison is unconditionally true and
+// the kernel spins forever, which on a shared node means a device reset. This
+// code had exactly that bug. wall_clock64() is a real 64-bit counter at
+// hipDeviceAttributeWallClockRate (measured 100000 kHz = 100 MHz here).
+__global__ void wait_flag(const uint32_t *flag, uint32_t val, int *timed_out,
+                          long long budget) {
     if (threadIdx.x != 0) return;
-    const long long deadline = clock64() + 20000000000LL;  // ~10s at 2GHz
-    while (clock64() < deadline) {
+    const long long t0 = wall_clock64();
+    for (;;) {
         if (__hip_atomic_load(flag, __ATOMIC_ACQUIRE,
                               __HIP_MEMORY_SCOPE_SYSTEM) >= val)
             return;
+        __asm__ __volatile__("" ::: "memory");
+        if (wall_clock64() - t0 > budget) break;
     }
     *timed_out = 1;
 }
@@ -190,8 +198,12 @@ int main(int argc, char **argv) {
         HKD_CHECK(hipSetDevice(r));
         HKD_CHECK(hipStreamCreate(&wstream[r]));
         const int pred = (r + N - 1) % N;
+        int wall_khz = 0;
+        HKD_CHECK(hipDeviceGetAttribute(&wall_khz,
+                                        hipDeviceAttributeWallClockRate, r));
         hipLaunchKernelGGL(wait_flag, dim3(1), dim3(64), 0, wstream[r],
-                           flags[r], 1u, bad[r] + 1);
+                           flags[r], 1u, bad[r] + 1,
+                           (long long)wall_khz * 10000);  // 10 s
         hipLaunchKernelGGL(verify_inbox, dim3(512), dim3(256), 0, wstream[r],
                            inbox[r], n, pred, bad[r], bad[r] + 1);
     }
@@ -225,7 +237,13 @@ int main(int argc, char **argv) {
 
     // Bandwidth round: pushes only, no waiters, so the number is the transport
     // and not the handshake.
-    const int reps = 10;
+    //
+    // reps is an argument because 10 was not enough. ipc_heap_test reads 24.0
+    // GB/s to three decimal places over 50 reps and anywhere from 8.4 to 25.8
+    // over 10, so a 10-rep number here is a sample of a distribution, not a
+    // measurement -- and this harness's number is the control that the
+    // multi-process one is compared against.
+    const int reps = argc > 3 ? atoi(argv[3]) : 50;
     for (int w = 0; w < 2; w++) round(2u);
     heap.sync_all();
     HKD_CHECK(hipSetDevice(0));

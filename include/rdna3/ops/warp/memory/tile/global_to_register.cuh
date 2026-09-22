@@ -11,6 +11,18 @@
 
 namespace kittens {
 
+namespace detail {
+// __builtin_nontemporal_store takes only native scalar/vector types, and the
+// tile element types here are classes (__hip_bfloat16, HIP_vector_type). These
+// are the same-width native types to memcpy through; nothing is converted, the
+// bits go out unchanged.
+template<int Bytes> struct nt_word;
+template<> struct nt_word<2> { using type = unsigned short; };
+template<> struct nt_word<4> { using type = unsigned int;   };
+template<int Bytes> using nt_word_t = typename nt_word<Bytes>::type;
+using nt_vec4 = unsigned int __attribute__((ext_vector_type(4)));
+}
+
 /*
  * Same gfx11 lane mapping as the shared-memory path (rt_base_coord in
  * types/register/rt_base.cuh), minus the swizzle: global tiles are plain
@@ -102,18 +114,29 @@ __device__ inline static void load(RT &dst, const GL &src, const COORD &idx) {
 }
 
 /**
- * @brief Store data from a register tile to a destination array in global memory.
+ * @brief Store a register tile to a raw global pointer.
+ *
+ * The addressing half of store() -- turning a gl and a coord into a base
+ * pointer and a row stride -- split out so a caller that already has the
+ * pointer can skip it. A distributed epilogue is the case that needs this: the
+ * destination may be a peer GPU's buffer, which is an ordinary global pointer
+ * but is not describable as a gl, because gl has no default constructor and a
+ * host-only one, so a kernel argument cannot hold an array of them.
+ *
+ * Everything below the pointer is identical to the gl version -- which is the
+ * point, the two share this body rather than duplicating the vectorization
+ * decision.
  *
  * @tparam RT The register tile type.
- * @tparam GL The global layout type.
- * @param[out] dst The destination array in global memory to store data into.
- * @param[in] src The source register tile to store data from.
- * @param[in] idx The index of the tile to store data to.
+ * @tparam U The element type of the destination.
+ * @tparam NT Bypass the cache hierarchy on the way out (see store_at_nt).
+ * @param[out] dst_ptr Where the tile's (0,0) element goes.
+ * @param[in] row_stride Elements between consecutive rows at the destination.
+ * @param[in] src The source register tile.
  */
-template<int axis, ducks::rt::all RT, ducks::gl::all GL, ducks::coord::tile COORD=coord<RT>>
-__device__ inline static void store(const GL &dst, const RT &src, const COORD &idx) {
+template<ducks::rt::all RT, typename U, bool NT = false>
+__device__ inline static void store_at(U *dst_ptr, int row_stride, const RT &src) {
     using T  = typename base_types::packing<typename RT::dtype>::unpacked_type;
-    using U  = typename GL::dtype;
 
     using L    = typename RT::layout;
     using base = rt_base<T, L>;
@@ -123,8 +146,6 @@ __device__ inline static void store(const GL &dst, const RT &src, const COORD &i
     constexpr bool vectorizable = is_row && base::element_stride == 1
                                          && std::is_same_v<T, U> && sizeof(U) == 2;
 
-    U *dst_ptr = (U*)&dst[(idx.template unit_coord<axis, 3>())];
-    const int row_stride = dst.template stride<axis>();
     const int lane = laneid();
     const int l16  = lane & 15;
 
@@ -140,8 +161,17 @@ __device__ inline static void store(const GL &dst, const RT &src, const COORD &i
             const int2 c = rt_base_coord<T, L>(e, lane);
             const T val = (e & 1) ? src.tiles[i][j].data[e>>1].y
                                   : src.tiles[i][j].data[e>>1].x;
-            dst_ptr[(row_base + c.x)*row_stride + col_base + c.y] =
-                base_types::convertor<U, T>::convert(val);
+            U *p = &dst_ptr[(row_base + c.x)*row_stride + col_base + c.y];
+            const U cv = base_types::convertor<U, T>::convert(val);
+            // __builtin_nontemporal_store only accepts native scalar/vector
+            // types, and U is a class (__hip_bfloat16), so go through an
+            // integer of the same width. Pure bit shuffling, no conversion.
+            if constexpr (NT) {
+                using raw = detail::nt_word_t<sizeof(U)>;
+                raw w; __builtin_memcpy(&w, &cv, sizeof(U));
+                __builtin_nontemporal_store(w, reinterpret_cast<raw*>(p));
+            }
+            else *p = cv;
         }
     };
 
@@ -158,7 +188,14 @@ __device__ inline static void store(const GL &dst, const RT &src, const COORD &i
                     for(int h = 0; h < 2; h++) {
                         float4 v;
                         __builtin_memcpy(&v, (const void*)&src.tiles[i][j].data[4*h], sizeof(v));
-                        *reinterpret_cast<float4*>(p + 8*h) = v;
+                        float4 *q = reinterpret_cast<float4*>(p + 8*h);
+                        if constexpr (NT) {
+                            detail::nt_vec4 w;
+                            __builtin_memcpy(&w, &v, sizeof(v));
+                            __builtin_nontemporal_store(
+                                w, reinterpret_cast<detail::nt_vec4*>(q));
+                        }
+                        else *q = v;
                     }
                 }
                 else elementwise(i, j, row_base, col_base);
@@ -166,6 +203,46 @@ __device__ inline static void store(const GL &dst, const RT &src, const COORD &i
             else elementwise(i, j, row_base, col_base);
         }
     }
+}
+
+/**
+ * @brief store_at(), but the stores bypass the cache hierarchy.
+ *
+ * For a destination that is another GPU's memory. gfx1100 maps a peer's HBM
+ * cacheable in the *local* L2, and nothing available to a kernel writes that L2
+ * back: __threadfence_system() compiles to s_waitcnt_vscnt plus L0/L1
+ * invalidates and emits no writeback at all, and a system-scope release store
+ * compiles to a plain global_store_b32 with no cache bits. So an ordinary store
+ * aimed at a peer can sit dirty in my own L2 until something evicts it, which
+ * is long after the barrier has told the peer its data is ready.
+ *
+ * __builtin_nontemporal_store is the one form that carries the bypass bits --
+ * it emits global_store_* ... glc slc dlc -- so the write goes out to the
+ * fabric instead of parking. Only use this for peer destinations: for local
+ * memory it is a pure loss, since the L2 hit is what makes the normal path fast.
+ *
+ * @tparam RT The register tile type.
+ * @tparam U The element type of the destination.
+ */
+template<ducks::rt::all RT, typename U>
+__device__ inline static void store_at_nt(U *dst_ptr, int row_stride, const RT &src) {
+    store_at<RT, U, true>(dst_ptr, row_stride, src);
+}
+
+/**
+ * @brief Store data from a register tile to a destination array in global memory.
+ *
+ * @tparam RT The register tile type.
+ * @tparam GL The global layout type.
+ * @param[out] dst The destination array in global memory to store data into.
+ * @param[in] src The source register tile to store data from.
+ * @param[in] idx The index of the tile to store data to.
+ */
+template<int axis, ducks::rt::all RT, ducks::gl::all GL, ducks::coord::tile COORD=coord<RT>>
+__device__ inline static void store(const GL &dst, const RT &src, const COORD &idx) {
+    using U = typename GL::dtype;
+    store_at<RT, U>((U*)&dst[(idx.template unit_coord<axis, 3>())],
+                    dst.template stride<axis>(), src);
 }
 
 template<ducks::rt::all RT, ducks::gl::all GL, ducks::coord::tile COORD=coord<RT>>

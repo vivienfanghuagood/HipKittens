@@ -482,18 +482,19 @@ void micro_tk(const GL g) {
         // checked it divides, so a warp tile never straddles two owners and no
         // tile has to be split.
         //
-        // g.c_peer is the peer's inbox, already translated to the peer's heap
-        // on the host, so the peer store is an ordinary vectorized global store
-        // to an address that happens to live on another GPU -- no device-side
-        // address arithmetic, and no per-element loop. Being able to do this is
-        // the whole reason symmem.cuh keeps translate() public where Iris does
-        // not.
+        // The destination is chosen per tile, and for world > 2 there are
+        // world-1 possible peers -- so it cannot be a gl. kittens::gl has no
+        // default constructor and only a __host__ one, so a kernel argument can
+        // hold neither an array of them nor one built on the device.
         //
-        // One peer, hence one gl: kittens::gl has no default constructor and
-        // its only constructor is __host__, so an array of them cannot be a
-        // member and a device-side one cannot be built. Supporting more ranks
-        // means passing world-1 named gls or giving gl a device constructor;
-        // two is the size the fabric measurements say is worth fusing anyway.
+        // sym_view is the way out and costs nothing: it is a trivially copyable
+        // table of heap bases, already passed by value to kernels elsewhere, and
+        // translate(p, owner) turns my address for a symmetric object into the
+        // owner's. Pair it with store_at(), which is store() minus the gl->
+        // (pointer, stride) step, and the peer store is still an ordinary
+        // vectorized global store that happens to land on another GPU -- no
+        // per-element loop, and the same code for every world size.
+        //
         // shard_rows is in rows, not tiles, because the tile height is a
         // property of the config the dispatcher picked and the host does not
         // know which one that was. One integer division at the very end of the
@@ -506,9 +507,24 @@ void micro_tk(const GL g) {
             for (int s = 0; s < N_SPLIT; s++)
                 store(g.c, C_accum[s], {0, 0, local_row_tile, col_tile + s});
         } else {
+            // Same addressing the gl path does, done by hand: the inbox is
+            // (shard_rows, N) row-major, so tile (r, c) starts at
+            // r*REG_BLOCK_M*N + c*SPLIT_N and rows are N apart.
+            const int ldc = g.c.cols();
+            bf16 *inbox = g.v.translate(g.c_sym, owner)
+                        + (size_t)local_row_tile * C::REG_BLOCK_M * ldc;
+            // _nt, not plain store_at: this lands in another GPU's memory,
+            // which gfx1100 caches in *my* L2, and no fence a kernel can issue
+            // writes that L2 back. Without the bypass bits the tile sits dirty
+            // on my side long after the barrier has told the peer to read it.
             #pragma unroll
             for (int s = 0; s < N_SPLIT; s++)
-                store(g.c_peer, C_accum[s], {0, 0, local_row_tile, col_tile + s});
+                store_at_nt(inbox + (size_t)(col_tile + s) * C::SPLIT_N, ldc, C_accum[s]);
+            // And the stores have to retire before the wave ends, or the flag
+            // can still get out first -- the tile goes over PCIe to the peer's
+            // HBM while the flag goes to a host page, two paths with nothing
+            // ordering them.
+            __threadfence_system();
         }
     }
 }

@@ -114,9 +114,27 @@ struct sym_view {
     }
 
     // Producer half of a tile handoff: publish everything written so far, then
-    // raise the flag. The release is what makes the payload visible first, and
-    // iris_p2p.hip verified that this holds across PCIe on gfx1100 -- 0
-    // mismatches out of 16.7M words with no host synchronization in between.
+    // raise the flag.
+    //
+    // WARNING: on gfx1100 this pair is NOT sufficient on its own to hand a
+    // payload to a peer. A system-scope release store compiles to a plain
+    // global_store_b32 with no cache bits, and nothing a kernel can execute
+    // writes back or invalidates L2 -- so the producer's tile can sit dirty in
+    // its own L2 after the flag is up, and the consumer can satisfy its read
+    // from a stale line of its own. iris_p2p.hip saw 0 mismatches out of 16.7M
+    // words here, but that was timing, not a guarantee: gemm_rs_mp.hip later
+    // reproduced the corruption on the same primitives. For the payload the
+    // caller needs either a host stream sync on each side of the handoff, or an
+    // uncached destination heap. See the comment in gemm_rs_mp.hip's
+    // run_fused().
+    //
+    // The flag word is not exempt either. A device-resident flag delivered this
+    // way arrives only when something happens to evict it, which is unbounded:
+    // ipc_heap_test's handshake stalls past a 10 s budget in roughly 1 of 6
+    // rank-instances, and a direct probe measured device flags timing out at
+    // 193-200 ms against 0.008-0.018 ms for host-memory flags. That is why the
+    // fused GEMM path uses `host_flags` (shm + hipHostRegister) and not this.
+    // Treat signal/wait as a test-only primitive.
     __device__ __forceinline__ void signal(uint32_t *flag, uint32_t v, int rank) {
         __hip_atomic_store(translate(flag, rank), v, __ATOMIC_RELEASE,
                            __HIP_MEMORY_SCOPE_SYSTEM);
@@ -125,9 +143,16 @@ struct sym_view {
     // pairs with the producer's release. Measured to cost the peer nothing:
     // pushing 64 MB while the owner spins on the flag runs at the same 14.5
     // GB/s as pushing into an idle GPU.
+    //
+    // Unbounded: every caller so far runs under an external `timeout`, which is
+    // the only bound that survives a wedged queue anyway. Do not copy this into
+    // a kernel that ships.
     __device__ __forceinline__ void wait(const uint32_t *flag, uint32_t v) const {
         while (__hip_atomic_load(flag, __ATOMIC_ACQUIRE,
-                                 __HIP_MEMORY_SCOPE_SYSTEM) < v) { }
+                                 __HIP_MEMORY_SCOPE_SYSTEM) < v) {
+            // Keep the spin from being reordered into something clever.
+            __asm__ __volatile__("" ::: "memory");
+        }
     }
 };
 

@@ -68,12 +68,19 @@ using namespace hk_dist;
 static constexpr int WORLD = 2;
 
 // Globals for the fused epilogue. Same a and b as micro_globals; c is now only
-// my shard rather than the whole output, plus where the peer's half goes.
+// my shard rather than the whole output.
+//
+// Where the other ranks' halves go is expressed as (symmetric view, my own
+// inbox address) rather than as a peer gl: the epilogue calls
+// v.translate(c_sym, owner), which is correct for any world size, and a gl
+// could only ever name one peer. This is the same pair of fields the
+// multi-process build passes, so one epilogue serves both heaps.
 struct micro_globals_rs {
     _gl_A a;
     _gl_B b;
-    _gl_C c;        // my shard          (shard_rows, N), local
-    _gl_C c_peer;   // the peer's inbox  (shard_rows, N), on the peer's GPU
+    _gl_C c;        // my shard (shard_rows, N), local
+    sym_view v;     // heap bases of every rank, in my address space
+    bf16 *c_sym;    // my inbox (shard_rows, N); translate() re-points it
     int shard_rows;
     int my_rank;
     hipStream_t stream;
@@ -239,19 +246,17 @@ static bool run_shape(const char *phase, int conc, const char *op,
     }
 
     // ------------------------------------------------------------------- fused
-    // c_peer is built once, on the host: the peer's Inbox address translated
-    // into this rank's address space. Nothing on the device does any address
-    // arithmetic -- the epilogue's peer store is an ordinary vectorized global
-    // store that happens to land on another GPU.
+    // Each rank gets its own view of the heap plus its own inbox address; the
+    // epilogue translates that address into whichever rank owns the tile it is
+    // about to write. The translation is a subtraction against a table already
+    // in registers, so the peer store stays an ordinary vectorized global store
+    // that happens to land on another GPU.
     std::vector<micro_globals_rs> gr;
-    for (int r = 0; r < WORLD; r++) {
-        const int peer = 1 - r;
-        bf16 *peer_inbox = heap.view(r).translate(Inbox[r], peer);
+    for (int r = 0; r < WORLD; r++)
         gr.push_back(micro_globals_rs{
             _gl_A(A[r], 1, 1, M, K_local), _gl_B(B[r], 1, 1, N, K_local),
-            _gl_C(Cout[r], 1, 1, shard, N), _gl_C(peer_inbox, 1, 1, shard, N),
+            _gl_C(Cout[r], 1, 1, shard, N), heap.view(r), Inbox[r],
             shard, r, heap.stream(r)});
-    }
 
     // The sync between the GEMMs and the combines is a real barrier, not an
     // oversight: rank 0's combine reads an inbox that rank 1's GEMM writes, and
