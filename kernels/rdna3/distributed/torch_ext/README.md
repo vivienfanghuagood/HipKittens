@@ -38,7 +38,7 @@ matmul.
 
 Reduce-scatter (the sequence-parallel form, against `F.linear +
 dist.reduce_scatter_tensor`) does better, because its output is local and it
-skips the copy out of the symmetric heap: **1.31–1.58x** across the same prefill
+skips the copy out of the symmetric heap: **1.31–1.59x** across the same prefill
 shapes.
 
 ### What the decode numbers mean

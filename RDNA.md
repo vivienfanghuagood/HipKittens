@@ -5,13 +5,14 @@ A port of HipKittens to AMD's consumer / workstation architectures — gfx11
 supports CDNA3/4/5 only.
 
 This is a fork. Upstream is [HazyResearch/HipKittens](https://github.com/HazyResearch/HipKittens);
-the work here lives on the `rdna` branch, seven commits on top of `de0cddbd`.
+the work here lives on the `rdna` branch, on top of `de0cddbd`.
 
 | | RDNA3 (gfx1100) | RDNA4 (gfx1201) |
 |---|---|---|
 | core library | `include/rdna3`, 68 files | `include/rdna4`, 68 files |
 | unit tests | **1659 passed, 0 failed** on a W7900D | compiles; **never executed** |
 | bf16 GEMM | **77.2 TFLOPs** peak, 77% of the measured WMMA ceiling. 107-119% of the best AMD library *in HipKittens' own layout*; 85-93% of that library when it is free to pick its own | compiles; never executed |
+| distributed | fused GEMM→all-reduce / reduce-scatter, as a torch operator: **1.22-1.31x** and **1.31-1.59x** over hipBLASLt + RCCL at prefill, on 2x W7900D. [Full writeup](kernels/rdna3/distributed/README.md) | not attempted |
 | fp8 | not available in hardware | implemented, all four opcodes, untested |
 
 **Read the second column as "written, not verified."** No gfx12 part was
@@ -89,7 +90,8 @@ The two test trees are the *same sources* — `diff -r` returns only the Makefil
 and the README. That is deliberate and worth preserving: it tells a reader that
 if gfx12 fails, the bug is in `include/rdna4`, not in the tests.
 
-**Kernels**: `kernels/rdna3/gemm/bf16fp32` (measured, see its README) and
+**Kernels**: `kernels/rdna3/gemm/bf16fp32` (measured, see its README),
+`kernels/rdna3/distributed` (measured on two GPUs, see its README), and
 `kernels/rdna4/gemm/bf16fp32` (same source, gfx1201 target, untuned).
 
 ### Not covered
@@ -100,11 +102,15 @@ if gfx12 fails, the bug is in `include/rdna4`, not in the tests.
 - **fp8 as anything but a WMMA operand.** No maps, reductions or vector ops on
   fp8 register tiles. `constants<fp8e4m3>` deliberately has no infinity, so a
   reduction over one is a compile error rather than a silently wrong answer.
-- **Split-K**, which is what the small-shape GEMM numbers are missing.
 - **A 64×64 warp tile in the GEMM.** The LDS→register stage is now pipelined
   (at no register cost — see below), but the wider warp tile rocBLAS uses still
   does not fit in 256 VGPRs on gfx1100. That is the last 10%.
-- **Multi-GPU / distributed**, untouched.
+- **Distributed beyond two GPUs.** The kernels carry no peer count and TP=4/8
+  satisfy their shape constraints, but only two GPUs were free on the shared
+  node, and on a ~36 GB/s PCIe fabric TP>2 is expected to lose to RCCL anyway.
+- **MoE, fp8 and column-parallel** in the distributed path; and its vLLM /
+  SGLang patches are written against the upstream APIs but **never run inside a
+  server**.
 - **RDNA4 on hardware**, at all.
 
 ## Performance
@@ -240,9 +246,47 @@ config sweep is in
 [`kernels/rdna3/gemm/bf16fp32/README.md`](kernels/rdna3/gemm/bf16fp32/README.md).
 
 Small shapes are a separate problem: grid quantization, not the inner loop.
-`dispatch_micro` compiles two tilings and picks by workgroup count. Below about
-64 workgroups even the small tiling falls off (33 TFLOPs at 512×512×4096);
-split-K is still missing and is the next thing for that regime.
+`dispatch_any` compiles seven tilings and picks by workgroup count and by M.
+Below about 64 workgroups even the small tiling falls off (33 TFLOPs at
+512×512×4096).
+
+The extreme of that regime — decode, M ∈ [1, 32] — is now covered by four thin
+configs with split-K, and it is not a compute problem at all but a weight
+streaming one: the whole `mlp_down` WMMA is ~6 µs against a 114 µs floor set by
+reading the weights. Those reach 627–637 GB/s at K_local=8704 (~95% of tuned
+hipBLASLt) and 329–380 at K_local=3072 (~65%); the short-K column is the
+remaining gap. **Split-K is a decode-only tool** — its `[SPLIT_K][M][N]` fp32
+workspace is written and read while the weight traffic is M-independent, so the
+split that wins by 28% at M=8 loses by 22% at M=32. Details and the sweep are in
+[`kernels/rdna3/distributed/README.md`](kernels/rdna3/distributed/README.md#62-decode-is-weight-streaming-not-a-gemv).
+
+## Distributed
+
+A second kernel family fuses the tensor-parallel collective into the GEMM's
+epilogue: each output tile, at the moment its accumulator is complete and still
+in registers, goes either to local memory or straight into its owner's inbox on
+another GPU. Against `F.linear` + RCCL on two W7900D over PCIe, TP=2, Qwen3-27B
+shapes — 30 shapes, every one checked elementwise before it was timed:
+
+| | prefill 2048-8192 | decode 1-32 |
+|---|---|---|
+| all-reduce | **1.22-1.31x** | 1.21-1.38x (mlp_down), 0.92-1.06x (attn_out) |
+| reduce-scatter | **1.31-1.59x** | n/a — M=1 has no row axis to shard |
+
+It is packaged as `torch.ops.hk_dist` with a drop-in `HKRowParallelLinear`, one
+process per rank over IPC-mapped peer memory, which is the model vLLM and SGLang
+actually run. The decode `attn_out` row is a wash and the writeup separates the
+two reasons rather than averaging them.
+
+Three gfx1100 facts drove that design as much as WMMA drove the GEMM, and all
+three are worth knowing before writing any multi-GPU kernel for this part:
+**nothing a shader can execute invalidates L2**, so peer-written data needs a
+host sync to be readable; **device-memory flags are useless as barrier flags
+over PCIe**, measuring round trips in seconds; and **this node's peer bandwidth
+is bimodal per process launch**, which forbids comparing any two numbers
+measured in different runs. Full derivation, measurements and the register-spill
+trap that silently NaNs one accumulator tile:
+[`kernels/rdna3/distributed/README.md`](kernels/rdna3/distributed/README.md).
 
 RDNA4 has not been run. What is known is a register count: the operand tiles
 cost 24 VGPRs there against 48 on gfx1100, and the ported kernel sits at 128
@@ -285,5 +329,7 @@ Things that cost time and are written down so they cost it only once:
 
 Per-area detail lives next to the code: `include/rdna3/ops/warp/register/tile/
 conversions.cuh` opens with the layout derivation the whole port rests on, and
-each of the four READMEs (`tests/unit/rdna{3,4}`, `kernels/rdna{3,4}/gemm/
-bf16fp32`) says what is verified and what is not.
+each of the five READMEs (`tests/unit/rdna{3,4}`, `kernels/rdna{3,4}/gemm/
+bf16fp32`, `kernels/rdna3/distributed`) says what is verified and what is not.
+The distributed one carries its own set of these notes, for the memory model
+rather than the matrix unit.
