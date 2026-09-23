@@ -153,13 +153,18 @@ struct micro_globals {
     _gl_B b;
     _gl_C c;
     hipStream_t stream;   // a: (m, k), b: (n, k), c: (m, n)
+    // Split-K scratch, [SPLIT_K][c.rows()][c.cols()] floats. Only read when the
+    // selected config has SPLIT_K > 1; null otherwise.
+    float *ws = nullptr;
 
-    // The epilogue is selected on this rather than on a template parameter of
+    // The epilogue is selected on these rather than on a template parameter of
     // the kernel, so that a caller with a different output policy supplies a
     // different globals type and nothing else changes. See
-    // kernels/rdna3/distributed/gemm_rs.hip, whose globals set it true to turn
-    // the store into a reduce-scatter push.
+    // kernels/rdna3/distributed/gemm_rs.hip, whose globals set FUSED_RS true to
+    // turn the store into a reduce-scatter push, and gemm_ar_mp.hip, which sets
+    // FUSED_AR for the all-reduce form.
     static constexpr bool FUSED_RS = false;
+    static constexpr bool FUSED_AR = false;
 };
 
 // The command line sets the tunables as macros, and the config struct below
@@ -187,13 +192,22 @@ constexpr int block_m = BLOCK_M, block_n = BLOCK_N, k_step = K_STEP,
 // in README.md and the selection rule in dispatch_micro below.
 template<int _BLOCK_M, int _BLOCK_N, int _K_STEP, int _DOT_SLICE,
          int _NUM_WARPS, int _WARP_ROWS, int _WGM, int _N_SPLIT = 2,
-         int _GPREFETCH = 1, int _WRITE_POS = 2>
+         int _GPREFETCH = 1, int _WRITE_POS = 2, int _SPLIT_K = 1>
 struct config {
     static constexpr int BLOCK_M = _BLOCK_M, BLOCK_N = _BLOCK_N;
     static constexpr int K_STEP  = _K_STEP,  DOT_SLICE = _DOT_SLICE;
     static constexpr int NUM_WARPS = _NUM_WARPS, WARP_ROWS = _WARP_ROWS;
     static constexpr int WGM = _WGM, N_SPLIT = _N_SPLIT;
     static constexpr int GPREFETCH = _GPREFETCH, WRITE_POS = _WRITE_POS;
+    // Split-K: cut the K loop into this many independent slices, each its own
+    // workgroup, and reduce afterwards. Only worth it when the M/N grid alone
+    // cannot fill the device -- decode, where N/BLOCK_N is a couple of dozen
+    // workgroups on 48 CUs and the kernel is latency- rather than
+    // bandwidth-bound. With SPLIT_K > 1 the epilogue writes fp32 partials
+    // instead of C, and a second kernel reduces them; the reduction is
+    // deterministic (a fixed-order sum, not fp32 atomics) because a framework
+    // cannot accept results that change run to run.
+    static constexpr int SPLIT_K = _SPLIT_K;
 
     static constexpr int NUM_THREADS = kittens::WARP_THREADS * NUM_WARPS;
     // Warps tile the block WARP_ROWS (M) by WARP_COLS (N).
@@ -253,7 +267,10 @@ void micro_tk(const GL g) {
     for (int s = 0; s < N_SPLIT; s++) zero(B_tile[s]);
 #endif
 
-    const int m_blocks = g.a.rows() / BLOCK_M;
+    const int M = g.a.rows();
+    // ceil, not floor: a partial last block still has to run. The rows it
+    // covers are fixed up by m_base below rather than by predication.
+    const int m_blocks = (M + BLOCK_M - 1) / BLOCK_M;
     const int n_blocks = g.b.rows() / BLOCK_N;
 
     // L2 swizzle: walk WGM block-rows at a time so that the B panel a group of
@@ -266,10 +283,40 @@ void micro_tk(const GL g) {
     const int row = first_pid_m + ((wgid % wgs_per_group) % group_size_m);
     const int col = (wgid % wgs_per_group) / group_size_m;
 
+    // M remainder, by backing the last block up rather than predicating it.
+    //
+    // The alternative -- masking loads and stores -- is not available cheaply:
+    // global_to_shared's load() is raw pointer arithmetic with no bounds check,
+    // so predication would have to be threaded through the whole staging
+    // pipeline, and the right vmcnt would stop being a compile-time immediate.
+    //
+    // Backing up costs nothing instead. The last block starts at M - BLOCK_M,
+    // so every row it touches is in range and no access needs a predicate. The
+    // rows in the overlap with the previous block are computed twice, but both
+    // workgroups compute them from the same A rows and the same full K, so they
+    // write identical values -- the redundancy is idempotent, not a race.
+    //
+    // M < BLOCK_M cannot back up at all, so it clamps to 0 and the block runs
+    // wider than the data. That is only reachable through the thin config,
+    // whose contract says A and C carry BLOCK_M=16 rows of allocation; the
+    // rows past M compute and store garbage that the caller slices off.
+    const int m_base = M >= BLOCK_M ? min(row * BLOCK_M, M - BLOCK_M) : 0;
+
     const int warp_id  = kittens::warpid();
     const int warp_row = warp_id / WARP_COLS;
     const int warp_col = warp_id % WARP_COLS;
-    const int num_tiles = g.a.cols() / K_STEP;
+
+    // K slice for this workgroup. With SPLIT_K == 1 this collapses to exactly
+    // the old `num_tiles = K / K_STEP` with t_begin folded away at compile
+    // time, so the non-decode configs are untouched.
+    constexpr int SPLIT_K = C::SPLIT_K;
+    const int total_tiles = g.a.cols() / K_STEP;
+    int t_begin = 0, num_tiles = total_tiles;
+    if constexpr (SPLIT_K > 1) {
+        const int per = total_tiles / SPLIT_K;   // dispatch checks divisibility
+        t_begin   = blockIdx.y * per;
+        num_tiles = per;
+    }
 
     // Prefetch staging. There is no global->LDS DMA on RDNA, so the "async
     // copy" is: buffer_load into these VGPRs on one iteration, ds_write them on
@@ -398,13 +445,16 @@ void micro_tk(const GL g) {
     // compile-time immediate. Predicating the issue instead would make the
     // right vmcnt a runtime value, and there is no such instruction.
     auto gload = [&](int d, int t) {
-        const int tt = t < num_tiles ? t : num_tiles - 1;
-        G::load_global_to_register_buffer(buf_a[d], stage_a, g.a, coord<st_a>{0, 0, row, tt}, As[0]);
+        const int tt = t_begin + (t < num_tiles ? t : num_tiles - 1);
+        // A is addressed in elements so the M start can be m_base; B still
+        // tiles exactly, so it keeps the tile-granular coord.
+        G::load_global_to_register_buffer(buf_a[d], stage_a, g.a,
+                                          coord<>{0, 0, m_base, tt * K_STEP}, As[0]);
         G::load_global_to_register_buffer(buf_b[d], stage_b, g.b, coord<st_b>{0, 0, col, tt}, Bs[0]);
     };
 
-    G::load(As[tic], g.a, {0, 0, row, 0});
-    G::load(Bs[tic], g.b, {0, 0, col, 0});
+    G::load(As[tic], g.a, coord<>{0, 0, m_base, t_begin * K_STEP});
+    G::load(Bs[tic], g.b, coord<st_b>{0, 0, col, t_begin});
 #if !ABLATE_GLOBAL
     static_for<GP>([&](auto d) { gload(d, d + 1); });
 #endif
@@ -463,13 +513,67 @@ void micro_tk(const GL g) {
     dot_tile(tic, std::false_type{}, [] {});
 
     // Column coords are in units of the tile width, which is now SPLIT_N.
-    const int row_tile = row * WARP_ROWS + warp_row;   // in REG_BLOCK_M units
+    // Rows are in elements, because m_base need not be a multiple of BLOCK_M.
+    const int m_row    = m_base + warp_row * REG_BLOCK_M;   // elements
     const int col_tile = (col * WARP_COLS + warp_col) * N_SPLIT;
 
-    if constexpr (!GL::FUSED_RS) {
+    if constexpr (C::SPLIT_K > 1) {
+        // fp32 partials, one slice per k-split. Everything downstream -- the
+        // reduction, and in the distributed forms the peer push -- happens in
+        // the follow-up kernel, because that is the first point at which a
+        // column's value is final and therefore the first point at which it is
+        // worth sending anywhere.
+        const int ldn = g.c.cols();
+        float *p = g.ws + ((size_t)blockIdx.y * g.c.rows() + m_row) * ldn;
         #pragma unroll
         for (int s = 0; s < N_SPLIT; s++)
-            store(g.c, C_accum[s], {0, 0, row_tile, col_tile + s});
+            store_at(p + (col_tile + s) * SPLIT_N, ldn, C_accum[s]);
+    } else if constexpr (GL::FUSED_AR) {
+        // Fused all-reduce, sharded along N instead of M.
+        //
+        // The reduce-scatter below shards along M because the framework owns
+        // that axis -- it splits by token, and the kernel has to agree. An
+        // all-reduce has no such obligation: every rank ends up with the whole
+        // M x N, so which axis we shard the *reduction* over is ours to pick,
+        // and N is the better pick for two reasons.
+        //
+        // First, it makes M unconstrained. The M-sharded path needs
+        // shard_rows % REG_BLOCK_M, which is what rejects most decode shapes
+        // outright -- M=1 cannot be row-sharded across ranks at all. Sharding
+        // along N leaves M alone entirely, so the same epilogue serves prefill
+        // and decode.
+        //
+        // Second, for world > 2 it is cheaper. Reducing along N and then
+        // gathering moves 2(w-1)/w of C; having every rank push its whole
+        // partial to everyone moves (w-1).
+        //
+        // Each rank keeps the columns it owns and pushes the rest into the
+        // owner's inbox, at the slot indexed by *my* rank so that no two
+        // senders collide. The owner's slot in its own inbox goes unused; that
+        // wastes 1/world of a buffer that is already only the size of C, which
+        // is cheaper than the arithmetic to compact it.
+        const int n_shard = g.shard_cols;
+        #pragma unroll
+        for (int s = 0; s < N_SPLIT; s++) {
+            const int c0 = (col_tile + s) * SPLIT_N;
+            const int owner = c0 / n_shard;
+            const int local_col = c0 - owner * n_shard;
+            if (owner == g.my_rank) {
+                store_at(g.c_own + (size_t)m_row * n_shard + local_col,
+                         n_shard, C_accum[s]);
+            } else {
+                bf16 *inbox = g.v.translate(g.c_sym, owner)
+                            + (size_t)g.my_rank * g.inbox_stride
+                            + (size_t)m_row * n_shard + local_col;
+                // See the note on the RS push below for why this is _nt.
+                store_at_nt(inbox, n_shard, C_accum[s]);
+            }
+        }
+        __threadfence_system();
+    } else if constexpr (!GL::FUSED_RS) {
+        #pragma unroll
+        for (int s = 0; s < N_SPLIT; s++)
+            store(g.c, C_accum[s], coord<>{0, 0, m_row, (col_tile + s) * SPLIT_N});
     } else {
         // Fused reduce-scatter. Every rank computes a full M x N partial
         // product over its own slice of K, and the final C is the sum of those
@@ -499,20 +603,23 @@ void micro_tk(const GL g) {
         // property of the config the dispatcher picked and the host does not
         // know which one that was. One integer division at the very end of the
         // kernel costs nothing.
-        const int shard_tiles = g.shard_rows / C::REG_BLOCK_M;
-        const int owner = row_tile / shard_tiles;
-        const int local_row_tile = row_tile - owner * shard_tiles;
+        // In elements, so that an M remainder (m_base backed up to M - BLOCK_M)
+        // works here too. A warp tile stays inside one shard as long as
+        // shard_rows and m_base are both multiples of REG_BLOCK_M; the host
+        // checks shard_rows, and m_base inherits it from M % REG_BLOCK_M == 0.
+        const int owner     = m_row / g.shard_rows;
+        const int local_row = m_row - owner * g.shard_rows;
         if (owner == g.my_rank) {
             #pragma unroll
             for (int s = 0; s < N_SPLIT; s++)
-                store(g.c, C_accum[s], {0, 0, local_row_tile, col_tile + s});
+                store(g.c, C_accum[s], coord<>{0, 0, local_row, (col_tile + s) * SPLIT_N});
         } else {
             // Same addressing the gl path does, done by hand: the inbox is
             // (shard_rows, N) row-major, so tile (r, c) starts at
             // r*REG_BLOCK_M*N + c*SPLIT_N and rows are N apart.
             const int ldc = g.c.cols();
             bf16 *inbox = g.v.translate(g.c_sym, owner)
-                        + (size_t)local_row_tile * C::REG_BLOCK_M * ldc;
+                        + (size_t)local_row * ldc;
             // _nt, not plain store_at: this lands in another GPU's memory,
             // which gfx1100 caches in *my* L2, and no fence a kernel can issue
             // writes that L2 back. Without the bypass bits the tile sits dirty
@@ -529,8 +636,51 @@ void micro_tk(const GL g) {
     }
 }
 
+// Reduce the split-K partials. Fixed-order sum rather than fp32 atomics: the
+// result has to be bit-identical run to run for a framework to accept it.
+__global__ void reduce_splitk(bf16 *out, const float *ws, size_t n, int slices) {
+    size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    const size_t stride = (size_t)gridDim.x * blockDim.x;
+    for (; i < n; i += stride) {
+        float acc = 0.f;
+        for (int s = 0; s < slices; s++) acc += ws[(size_t)s * n + i];
+        out[i] = __float2bfloat16(acc);
+    }
+}
+
+// Scratch for the split-K partials, grown on demand and kept for the process.
+// The callers that have their own allocator (the distributed harnesses) fill
+// g.ws themselves and never reach this; it exists so the plain python entry
+// point, whose signature is just (A, B, C), still works.
+static float *splitk_ws(size_t floats) {
+    static float *p = nullptr;
+    static size_t cap = 0;
+    if (floats > cap) {
+        if (p) hipFree(p);
+        hipMalloc(&p, floats * sizeof(float));
+        cap = floats;
+    }
+    return p;
+}
+
+// Scratch for the M-padding path below, same lifetime policy as splitk_ws.
+static bf16 *pad_ws(size_t elems) {
+    static bf16 *p = nullptr;
+    static size_t cap = 0;
+    if (elems > cap) {
+        if (p) hipFree(p);
+        hipMalloc(&p, elems * sizeof(bf16));
+        cap = elems;
+    }
+    return p;
+}
+
 template<typename C, typename GL = micro_globals>
-static void launch(const GL &g) {
+static void launch(const GL &g_in) {
+    GL g = g_in;
+    if constexpr (C::SPLIT_K > 1)
+        if (!g.ws)
+            g.ws = splitk_ws((size_t)C::SPLIT_K * g.c.rows() * g.c.cols());
     const unsigned long mem_size = C::SHARED_BYTES;
     hipFuncSetAttribute((void*)micro_tk<C, GL>, hipFuncAttributeMaxDynamicSharedMemorySize, mem_size);
     // The compiler's occupancy remark counts registers only. LDS is the other
@@ -549,8 +699,21 @@ static void launch(const GL &g) {
                     mem_size, C::NUM_THREADS);
         }
     }
-    micro_tk<C, GL><<<dim3((g.a.rows() / C::BLOCK_M) * (g.b.rows() / C::BLOCK_N)),
+    // ceil on M to match the kernel's m_blocks; a floor here would leave the
+    // tail block unlaunched while the kernel still expects it. The K slices go
+    // on grid.y so the L2 swizzle over blockIdx.x is undisturbed.
+    const int m_blocks = (g.a.rows() + C::BLOCK_M - 1) / C::BLOCK_M;
+    micro_tk<C, GL><<<dim3(m_blocks * (g.b.rows() / C::BLOCK_N), C::SPLIT_K),
                   dim3(C::NUM_THREADS), mem_size, g.stream>>>(g);
+    if constexpr (C::SPLIT_K > 1) {
+        // Only the plain path reduces here. The fused globals carry their own
+        // second kernel, which folds the peer push into this same pass.
+        if constexpr (!GL::FUSED_RS && !GL::FUSED_AR) {
+            const size_t n = (size_t)g.c.rows() * g.c.cols();
+            hipLaunchKernelGGL(reduce_splitk, dim3(1024), dim3(256), 0, g.stream,
+                               (bf16*)g.c.raw_ptr, g.ws, n, C::SPLIT_K);
+        }
+    }
 }
 
 // Three tilings. Two are picked on the number of workgroups the M/N grid
@@ -591,6 +754,59 @@ using big_config   = config<128, 128, 64, 16, 8, 4, 8, 4>;
 using small_config = config<128,  64, 64, 16, 8, 4, 8, 2>;
 using k32_config   = config<128, 128, 32, 16, 8, 4, 8, 4>;
 
+// Decode: M is one to a few dozen tokens, so this is not a compute problem at
+// all, it is weight streaming. The whole mlp_down WMMA is about 6 us against a
+// 114 us floor set by reading the weights, so padding M up to the WMMA's 16
+// rows costs nothing measurable -- the padded rows ride in cache lines that had
+// to be fetched anyway. What matters is keeping enough of B in flight, hence
+// all 8 warps spread along N (WARP_ROWS=1) and the widest BLOCK_N that fits.
+//
+// K_STEP is 32 rather than 64 because at BLOCK_N=256 a 64-deep B tile is 32 KB,
+// and two of those plus A overflow the 64 KB of LDS. REG_BLOCK_N is then 32 and
+// N_SPLIT=2 puts SPLIT_N at the 16 the WMMA needs.
+//
+// Requires A and C to have at least BLOCK_M=16 rows allocated even when M is
+// smaller: the epilogue is unpredicated, so it writes whole 16-row tiles. Rows
+// past M hold garbage and the caller is expected to slice them off.
+// BLOCK_N=128 with 4 warps, measured against 256/8 and 64/4: the wide block
+// starves the grid (N/256 is 20 workgroups on 48 CUs) and the narrow one gives
+// up too much B reuse.
+//
+// SPLIT_K then has to differ by layer, which is why there are three of these.
+// At N=5120 the M/N grid is 40 workgroups however K is cut, so the split is the
+// only source of parallelism -- but each slice also writes a full fp32 partial,
+// and that traffic is pure overhead. Short K has too little work per block to
+// cover latency and wants the deeper split; long K already covers it and just
+// pays. Measured at M=8, N=5120 (GB/s of weight traffic):
+//
+//            SPLIT_K:   1     2     4     8
+//   attn_out K=3072    291   314   342   372
+//   mlp_down K=8704    588   631   633   577
+//
+// Hence: 8 slices below ~128 K-tiles, 4 above.
+using thin_sk1_config = config<16, 128, 32, 16, 4, 1, 8, 2, 1, 2, 1>;
+using thin_config     = config<16, 128, 32, 16, 4, 1, 8, 2, 1, 2, 4>;
+using thin_sk8_config = config<16, 128, 32, 16, 4, 1, 8, 2, 1, 2, 8>;
+
+// BLOCK_M=32, for 16 < M <= 32. BLOCK_M has to cover M: every extra M block
+// re-reads the whole of B, and B is the entire cost here. Running M=32 through
+// the 16-row config reads the weights twice and measured 200 GB/s.
+//
+// This one does NOT split K, because the split-K workspace is [SPLIT_K][M][N]
+// fp32 and is both written and read, so its traffic scales with M while the
+// weight traffic does not. At M=32, K=3072, SPLIT_K=8 that is 10.5 MB of
+// workspace against 31 MB of weights -- a 33% surcharge on a kernel that is
+// purely bandwidth-bound. Measured at M=32, N=5120 (GB/s of weight traffic):
+//
+//            SPLIT_K:   1     2     4     8
+//   attn_out K=3072    329   300   316   258
+//   mlp_down K=8704    628   605   595   458
+//
+// Monotone the other way from the M=8 table above, and SPLIT_K=1 wins outright.
+// WARP_ROWS 1 vs 2 (REG_BLOCK_M 32 vs 16) is a wash once K is not split:
+// 324/640 against 329/628, so the simpler one stays.
+using thin32_config = config<32, 128, 32, 16, 4, 1, 8, 2, 1, 2, 1>;
+
 #ifndef HK_MULTI_CONFIG
 #define HK_MULTI_CONFIG 1
 #endif
@@ -602,13 +818,60 @@ using k32_config   = config<128, 128, 32, 16, 8, 4, 8, 4>;
 // unfused baseline is that the two differ only in the epilogue.
 template<typename GL>
 static void dispatch_any(const GL &g) {
+    // Below one thin block there is nothing to tile with. The kernel always
+    // writes whole BLOCK_M-row tiles and loads them without a predicate, so an
+    // A and C allocated at exactly M rows would be read and *written* past
+    // their ends -- which is how M=1 silently corrupted memory before this. So
+    // stage through a padded copy. The copies are M*K and M*N elements, under
+    // 150 KB at the decode shapes against ~30 MB of weight traffic, so they do
+    // not show up in the measurement; and a caller that already hands us
+    // BLOCK_M rows (the torch wrapper does, since it has to pad anyway) never
+    // takes this path. Only for the plain output policy: the fused epilogues
+    // push to peer inboxes whose geometry the caller owns.
+    constexpr int PAD_M = thin_config::BLOCK_M;
+    if constexpr (!GL::FUSED_RS && !GL::FUSED_AR) {
+        if (g.a.rows() < PAD_M) {
+            const int M = g.a.rows(), K = g.a.cols(), N = g.c.cols();
+            bf16 *pa = pad_ws((size_t)PAD_M * K + (size_t)PAD_M * N);
+            bf16 *pc = pa + (size_t)PAD_M * K;
+            hipMemsetAsync(pa + (size_t)M * K, 0,
+                           (size_t)(PAD_M - M) * K * sizeof(bf16), g.stream);
+            hipMemcpyAsync(pa, g.a.raw_ptr, (size_t)M * K * sizeof(bf16),
+                           hipMemcpyDeviceToDevice, g.stream);
+            GL gp = g;
+            gp.a = kittens::make_gl<_gl_A>((uint64_t)pa, 1, 1, PAD_M, K);
+            gp.c = kittens::make_gl<_gl_C>((uint64_t)pc, 1, 1, PAD_M, N);
+            dispatch_any(gp);   // gp.a.rows() == PAD_M, so this cannot recurse
+            hipMemcpyAsync(g.c.raw_ptr, pc, (size_t)M * N * sizeof(bf16),
+                           hipMemcpyDeviceToDevice, g.stream);
+            return;
+        }
+    }
+    // Decode: below one full M block the 128-row configs would be mostly
+    // padding, and the thin configs exist precisely for this range.
+    if (g.a.rows() < big_config::BLOCK_M &&
+        g.b.rows() % thin_config::BLOCK_N == 0 &&
+        g.a.cols() % thin_config::K_STEP == 0) {
+        const int tiles = g.a.cols() / thin_config::K_STEP;
+        const bool deep = tiles <= 128 && tiles % 8 == 0;   // short K wants 8 slices
+        const bool quad = tiles % 4 == 0;
+        if (g.a.rows() <= thin_config::BLOCK_M) {
+            if (deep)      launch<thin_sk8_config>(g);
+            else if (quad) launch<thin_config>(g);
+            else           launch<thin_sk1_config>(g);
+        } else {
+            launch<thin32_config>(g);   // split-K does not pay at M > 16
+        }
+        return;
+    }
     // num_tiles is a plain division, so a K-tile that does not divide K would
     // silently drop the tail.
     if (g.a.cols() % big_config::K_STEP != 0) {
         launch<k32_config>(g);
         return;
     }
-    const int blocks = (g.a.rows() / big_config::BLOCK_M) * (g.b.rows() / big_config::BLOCK_N);
+    const int blocks = ((g.a.rows() + big_config::BLOCK_M - 1) / big_config::BLOCK_M)
+                     * (g.b.rows() / big_config::BLOCK_N);
     // Fall back to `big` on shapes `small` cannot tile; its BLOCK_N is the
     // smaller of the two, so this only triggers on N not divisible by 128.
     if (blocks <= 64 && g.b.rows() % small_config::BLOCK_N == 0) {

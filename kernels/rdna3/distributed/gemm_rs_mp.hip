@@ -520,15 +520,18 @@ int main(int argc, char **argv) {
         const int K_local = K / world, shard = M / world;
         const size_t c_elems = (size_t)M * N, s_elems = (size_t)shard * N;
 
-        // Two separate limits, worth distinguishing because only one is about
-        // the fusion: M % BLOCK_M is the GEMM having no M-remainder path at all
-        // (which is what rules out every decode shape), while shard %
-        // REG_BLOCK_M is the fused epilogue assigning ownership one warp tile
-        // at a time, so a shard boundary inside a tile would split it.
+        // What is left after the M-remainder path. The GEMM no longer needs
+        // M % BLOCK_M -- the last block backs up to M - BLOCK_M and recomputes
+        // the overlap idempotently -- but it does still need M >= BLOCK_M for
+        // that backup to stay in range, and the fused epilogue still assigns
+        // ownership one warp tile at a time, so neither the shard boundary nor
+        // the backed-up M start may fall inside a tile. m_base inherits its
+        // alignment from M, hence the M % REG_BLOCK_M check.
         constexpr int BM = big_config::BLOCK_M, RBM = big_config::REG_BLOCK_M;
         const char *why = nullptr;
         if (K % world || M % world)            why = "K or M does not split across ranks";
-        else if (M % BM)                       why = "M is not a multiple of BLOCK_M";
+        else if (M < BM)                       why = "M < BLOCK_M (decode regime)";
+        else if (M % RBM)                      why = "M is not a multiple of REG_BLOCK_M";
         else if (shard % RBM)                  why = "the shard boundary falls inside a warp tile";
         else if (N % big_config::BLOCK_N)      why = "N does not tile";
         else if (K_local % big_config::K_STEP) why = "K_local does not tile";
