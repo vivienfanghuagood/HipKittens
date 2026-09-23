@@ -86,6 +86,10 @@ struct micro_globals_rs {
     hipStream_t stream;
 
     static constexpr bool FUSED_RS = true;
+    // This policy is reduce-scatter; the all-reduce one lives in
+    // gemm_ar_mp.hip. Both flags exist on every globals struct so the
+    // shared epilogue can select on them without a trait.
+    static constexpr bool FUSED_AR = false;
 };
 
 // A and B are generated from their *global* indices rather than copied from a

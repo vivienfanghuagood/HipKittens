@@ -552,22 +552,51 @@ void micro_tk(const GL g) {
         // senders collide. The owner's slot in its own inbox goes unused; that
         // wastes 1/world of a buffer that is already only the size of C, which
         // is cheaper than the arithmetic to compact it.
+        //
+        // The ownership test is per *warp tile*, not per N_SPLIT chunk, and
+        // that is load-bearing rather than tidiness. Deciding per chunk puts a
+        // branch with two store bodies inside the N_SPLIT loop, and on
+        // big_config that costs enough registers to matter: 209 VGPRs and no
+        // spill becomes 256 VGPRs, 8 VGPR spills and 36 bytes/lane of scratch.
+        // The kernel does not survive that. Its LDS pipeline hand-manages
+        // s_waitcnt counts -- lds_wait<N>() leaves N operations outstanding on
+        // purpose -- and the spill/reload traffic the compiler interleaves is
+        // counted by the same hardware counters, so the waits stop meaning what
+        // they were written to mean. The symptom was precise and silent: every
+        // s == N_SPLIT-1 tile, and only those, came out NaN, on prefill shapes
+        // only (the decode configs are far enough from the register ceiling
+        // that they never spilled). Keep this branch out of the loop.
+        //
+        // A warp tile is REG_BLOCK_N contiguous columns starting at a multiple
+        // of REG_BLOCK_N, so it lies in one shard as long as the shard width
+        // does too. The host checks that; see the constraint block in
+        // gemm_ar_mp.hip.
+        // The host cannot see which config the dispatcher picked, so it checks
+        // the loosest sufficient width. This keeps that honest.
+        static_assert(64 % REG_BLOCK_N == 0,
+                      "the fused all-reduce host check assumes a warp tile is "
+                      "at most 64 columns and divides 64");
         const int n_shard = g.shard_cols;
-        #pragma unroll
-        for (int s = 0; s < N_SPLIT; s++) {
-            const int c0 = (col_tile + s) * SPLIT_N;
-            const int owner = c0 / n_shard;
-            const int local_col = c0 - owner * n_shard;
-            if (owner == g.my_rank) {
-                store_at(g.c_own + (size_t)m_row * n_shard + local_col,
-                         n_shard, C_accum[s]);
-            } else {
-                bf16 *inbox = g.v.translate(g.c_sym, owner)
-                            + (size_t)g.my_rank * g.inbox_stride
-                            + (size_t)m_row * n_shard + local_col;
-                // See the note on the RS push below for why this is _nt.
-                store_at_nt(inbox, n_shard, C_accum[s]);
-            }
+        const int c_base = col_tile * SPLIT_N;
+        const int owner = c_base / n_shard;
+        const size_t off = (size_t)m_row * n_shard + (c_base - owner * n_shard);
+        if (owner == g.my_rank) {
+            bf16 *dst = g.c_own + off;
+            #pragma unroll
+            for (int s = 0; s < N_SPLIT; s++)
+                store_at(dst + s * SPLIT_N, n_shard, C_accum[s]);
+        } else {
+            // c_sym is already *my slot*; translate() re-points it at the
+            // owner without changing which slot it is, exactly as in the RS
+            // path. Adding my_rank*inbox_stride here as well would offset it
+            // twice -- which is what it did at first, putting rank 1's tiles a
+            // slot past where rank 0 looked for them and, at prefill M, a whole
+            // output past the end of the inbox.
+            bf16 *inbox = g.v.translate(g.c_sym, owner) + off;
+            // See the note on the RS push below for why this is _nt.
+            #pragma unroll
+            for (int s = 0; s < N_SPLIT; s++)
+                store_at_nt(inbox + s * SPLIT_N, n_shard, C_accum[s]);
         }
         __threadfence_system();
     } else if constexpr (!GL::FUSED_RS) {
@@ -648,6 +677,44 @@ __global__ void reduce_splitk(bf16 *out, const float *ws, size_t n, int slices) 
     }
 }
 
+// The all-reduce form of the above. When the dispatcher picks a split-K config
+// the register epilogue cannot push to peers -- it has fp32 partials, not an
+// answer -- so the scatter moves here, into the pass that turns the partials
+// into one. That is the right place for it anyway: this pass already touches
+// every output element exactly once, so the push costs only the difference
+// between a local store and a peer store.
+//
+// Templated on the globals rather than taking the fields one by one because
+// sym_view is declared in distributed/ipc_heap.cuh, which includes *this* file
+// and so cannot be named from it. A template is only instantiated once GL is
+// complete, which is after the include has closed.
+template<typename GL>
+__global__ void reduce_splitk_scatter_n(GL g, int slices) {
+    const int N = g.c.cols(), ns = g.shard_cols;
+    const size_t n = (size_t)g.c.rows() * N;
+    size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    const size_t stride = (size_t)gridDim.x * blockDim.x;
+    for (; i < n; i += stride) {
+        float acc = 0.f;
+        for (int s = 0; s < slices; s++) acc += g.ws[(size_t)s * n + i];
+        const int row = (int)(i / N), col = (int)(i % N);
+        const int owner = col / ns, local_col = col - owner * ns;
+        const bf16 v = __float2bfloat16(acc);
+        const size_t off = (size_t)row * ns + local_col;
+        if (owner == g.my_rank) {
+            g.c_own[off] = v;
+        } else {
+            bf16 *inbox = g.v.translate(g.c_sym, owner) + off;
+            // Nontemporal for the same reason the register epilogue's peer
+            // store is: this lands in the owner's HBM but gfx1100 caches it in
+            // *my* L2, and nothing a kernel can issue writes that L2 back.
+            unsigned short w; __builtin_memcpy(&w, &v, sizeof(w));
+            __builtin_nontemporal_store(w, reinterpret_cast<unsigned short *>(inbox));
+        }
+    }
+    __threadfence_system();
+}
+
 // Scratch for the split-K partials, grown on demand and kept for the process.
 // The callers that have their own allocator (the distributed harnesses) fill
 // g.ws themselves and never reach this; it exists so the plain python entry
@@ -706,9 +773,11 @@ static void launch(const GL &g_in) {
     micro_tk<C, GL><<<dim3(m_blocks * (g.b.rows() / C::BLOCK_N), C::SPLIT_K),
                   dim3(C::NUM_THREADS), mem_size, g.stream>>>(g);
     if constexpr (C::SPLIT_K > 1) {
-        // Only the plain path reduces here. The fused globals carry their own
-        // second kernel, which folds the peer push into this same pass.
-        if constexpr (!GL::FUSED_RS && !GL::FUSED_AR) {
+        if constexpr (GL::FUSED_AR) {
+            // Same pass, but it scatters instead of storing. See the kernel.
+            hipLaunchKernelGGL((reduce_splitk_scatter_n<GL>), dim3(1024),
+                               dim3(256), 0, g.stream, g, C::SPLIT_K);
+        } else {
             const size_t n = (size_t)g.c.rows() * g.c.cols();
             hipLaunchKernelGGL(reduce_splitk, dim3(1024), dim3(256), 0, g.stream,
                                (bf16*)g.c.raw_ptr, g.ws, n, C::SPLIT_K);
@@ -849,6 +918,13 @@ static void dispatch_any(const GL &g) {
     }
     // Decode: below one full M block the 128-row configs would be mostly
     // padding, and the thin configs exist precisely for this range.
+    //
+    // Not for the reduce-scatter policy. Its epilogue decides ownership from
+    // the row, so it needs M >= world * REG_BLOCK_M to shard at all -- M=1
+    // cannot be row-sharded -- and a split-K config would hand it fp32 partials
+    // with nothing downstream to reduce them. All-reduce shards along N and has
+    // neither problem, which is why decode goes through that one.
+    if constexpr (!GL::FUSED_RS)
     if (g.a.rows() < big_config::BLOCK_M &&
         g.b.rows() % thin_config::BLOCK_N == 0 &&
         g.a.cols() % thin_config::K_STEP == 0) {
