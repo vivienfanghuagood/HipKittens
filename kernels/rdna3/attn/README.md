@@ -24,7 +24,7 @@ This directory is a single-GPU flash-attention forward that is not.
    49920          56.9 TF         20.1 TF        57.5 TF     <- 480p/5s of H3
 ```
 
-The target is [MiniMax H3](#the-shape-that-drove-every-decision), a video+audio
+The target is [MiniMax H3](#1-the-shape-that-drove-every-decision), a video+audio
 diffusion transformer, where softmax attention is more than 85% of the
 transformer's runtime at the lengths a real clip produces.
 
@@ -527,7 +527,7 @@ skip above, which saves the *math* but not the *staging* — a skipping wave has
 already paid for the K and Vᵀ it will not read, and `Q_TILE` is six `KV_BLOCK`s
 wide, so there can be six such blocks per workgroup. That third one is the
 largest and it is why causal comes out a few percent behind the Triton baseline
-where non-causal is ahead; [§9](#causal) measures it.)
+where non-causal is ahead; [§9](#causal--where-this-loses) measures it.)
 
 ### GQA
 
@@ -659,7 +659,7 @@ in — but a 4096-token workload is a tie, not a win, and the honest summary is
 "2.7–3.0× the backend a Radeon actually uses today, and level-to-slightly-ahead
 of the best thing you could write in Triton."
 
-### Causal
+### Causal — where this loses
 
 Same harness, `--causal`, same discipline — one process, one run, interleaved.
 TFLOPs count half the non-causal work for all three backends alike, which
