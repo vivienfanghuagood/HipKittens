@@ -27,9 +27,14 @@ SHAPES = [
 ]
 
 
+# Causal and non-causal are separate template instantiations with separate
+# register footprints, so a tiling change can help one and spill the other.
+CAUSAL = os.environ.get("QB_CAUSAL", "0") == "1"
+
+
 def hk(q, k, v):
     o = torch.empty_like(q)
-    tk_kernel.dispatch_micro(q, k, v, o, 0.0, False)
+    tk_kernel.dispatch_micro(q, k, v, o, 0.0, CAUSAL)
     return o
 
 
@@ -44,7 +49,7 @@ def timed(b, h, n):
 if __name__ == "__main__":
     if "--no-check" not in sys.argv:
         q, k, v = make_qkv(*CHECK)
-        ok, msg = check("quickbench", hk(q, k, v), reference(q, k, v))
+        ok, msg = check("quickbench", hk(q, k, v), reference(q, k, v, causal=CAUSAL))
         del q, k, v
         torch.cuda.empty_cache()
         if not ok:

@@ -104,14 +104,82 @@ using namespace kittens;
 // Larger batches more ds_read_b128 before the first s_waitcnt, which is what
 // hides LDS latency under the WMMAs; smaller leaves room for Q and the
 // accumulator, which are 128 VGPRs between them and cannot move.
+//
+// PV_TILES was 4 and is now 2, which is worth 13-16% on causal and 2%
+// non-causal. The VGPR allocation granule here is 24, so occupancy 6 needs
+// <= 240 VGPRs; PV_TILES=4 put the *causal* instantiation at 252 and dropped it
+// to 5 waves/SIMD, while the non-causal one squeaked in at 238. That, and not
+// the staging overrun this file used to blame, is most of why causal was
+// slower than the Triton baseline. PV_TILES=1 measures the same as 2 (both 227
+// VGPRs), so 2 is the knee: it is the deepest LDS read batch that still fits.
 #ifndef QK_TILES
 #define QK_TILES 2
 #endif
 #ifndef PV_TILES
-#define PV_TILES 4
+#define PV_TILES 2
 #endif
 #ifndef MIN_BLOCKS_PER_CU
 #define MIN_BLOCKS_PER_CU 1
+#endif
+
+// Prefetch the next KV block's global reads into registers, one KV block ahead.
+//
+// gfx11 has no global->LDS DMA, so every staged byte passes through a VGPR
+// anyway; the only question is *when* the LDS write happens relative to the
+// math. Without this the sequence is global -> (stall on vmcnt) -> LDS -> wait
+// -> barrier -> math, and the global latency is exposed: staging measures 27.7%
+// of the runtime and none of it overlaps anything. With it, block kb+1's
+// buffer_loads are issued immediately after kb's LDS commit and land while kb's
+// WMMAs run; the vmcnt wait is paid at the top of kb+1, by which time the data
+// is there.
+//
+// This costs registers that stay live across the whole math body -- stage_calls
+// float4s for K plus one bf16 fragment per V band -- and the kernel is at 217 of
+// 256 VGPRs, so it is a knob and not a given. Build with GPREFETCH=0 to compare.
+// Same pattern as the GEMM's GPREFETCH; see the note above gload() there.
+#ifndef GPREFETCH
+#define GPREFETCH 1
+#endif
+
+// Double-buffer the K and V^T tiles in LDS, so that block kb+1 is written into
+// one buffer while block kb's math reads the other.
+//
+// GPREFETCH alone only hides the *global* latency; it measured +1.5%, because
+// the rest of staging -- the transposes and the ds_writes -- still sat alone
+// between two barriers with nothing to overlap. The barriers are the real cost:
+// with a single buffer the write has to wait for every wave to finish reading,
+// so all NUM_WARPS waves are lockstepped twice per KV block and a SIMD has
+// nothing to switch to while one of its waves stages.
+//
+// With two buffers the commit targets a buffer nobody is reading and the
+// mid-block barrier disappears -- one barrier per KV block instead of two.
+// Nothing is reordered within a wave (every LDS access here is volatile asm);
+// the win is that waves are free to drift apart, so one wave's ds_writes issue
+// under another wave's WMMAs. It also gives the prefetched global reads a full
+// iteration to land instead of a partial one.
+//
+// Costs 16 KB more LDS and ~16 v_xor per KV block. Build with DBUF=0 to compare.
+//
+// DBUF and GPREFETCH are independent, and at HEAD_DIM=128 they do not fit
+// together: holding buf_k and v_rows live across the math is ~21 VGPRs on a
+// kernel already at 238 of 256, and turning both on spills 383 of them (which on
+// a kernel that hand-manages s_waitcnt is wrong, not slow). They also overlap in
+// what they buy. GPREFETCH exists to cover the global latency *within* a wave,
+// because with a single buffer the wave in front of a barrier has nothing else
+// to do; under DBUF there is no barrier between the math and the staging, so the
+// SIMD covers that latency with another wave's WMMAs and the registers are
+// better spent elsewhere. DBUF=1 GPREFETCH=0 is the shipped combination.
+//
+// Measured, and off by default: it is worth +1.5-2% causal and -0.5%
+// non-causal, which does not pay for 16 KB of LDS and the buffer-parity
+// bookkeeping. The reason it disappoints is the finding itself -- staging is not
+// latency-bound or barrier-bound, it is issue-bound. The transposes and the
+// ds_writes are real work competing with the WMMAs for the same SIMD, and
+// overlapping them better cannot remove them. Kept because the measurement is
+// the useful part, and because it is the right structure if staging ever gets
+// cheaper (a wider KV_BLOCK, or an architecture with global->LDS DMA).
+#ifndef DBUF
+#define DBUF 0
 #endif
 
 // Ablation switches. Each makes the result wrong on purpose; they exist to time
@@ -238,6 +306,16 @@ template<typename ST> struct lds_granules {
         #pragma unroll
         for (int x = 0; x < NG; x++) g[x] = ST::idx(p, int2{l16, 8 * x});
     }
+    // Move every address to the other LDS buffer. The two buffers differ in one
+    // bit by construction (see config::LDS_XOR), so this is NG v_xor and keeps
+    // the addresses in the registers they were already in -- re-deriving them
+    // would redo the swizzle. With X == 0 it compiles away.
+    template<uint32_t X> __device__ inline void swap() {
+        if constexpr (X != 0) {
+            #pragma unroll
+            for (int x = 0; x < NG; x++) g[x] ^= X;
+        }
+    }
 };
 
 // One 16x16 bf16 operand fragment out of a shared tile, at tile coords (R, C).
@@ -351,11 +429,28 @@ struct config {
     using st_vt = st_bf<HEAD_DIM, KV_BLOCK>;
     using G     = kittens::group<NUM_WARPS>;
 
-    // Single-buffered. Double-buffering both of these is 64 KB on a part that
-    // has exactly 64 KB per workgroup, which puts occupancy at one workgroup per
-    // CU; the prefetch that buys is worth less than the waves that costs.
-    static constexpr size_t SHARED_BYTES = sizeof(st_k) + sizeof(st_vt);
+    // At KV_BLOCK=32, HEAD_DIM=128 each of these is exactly 8 KB, so double
+    // buffering is 32 KB and two workgroups per WGP is 64 KB -- the whole
+    // budget, and exactly the occupancy the 238-VGPR register footprint allows
+    // anyway (6 waves/SIMD = 24 waves = 2 workgroups of 12). It is free. An
+    // earlier version of this comment ruled double buffering out as "64 KB";
+    // that was written when KV_BLOCK was 64 and both tiles were 16 KB.
+    static constexpr int LDS_STAGES = DBUF ? 2 : 1;
+    static constexpr size_t SHARED_BYTES = LDS_STAGES * (sizeof(st_k) + sizeof(st_vt));
     static_assert(SHARED_BYTES <= MAX_SHARED_MEMORY, "block does not fit in 64KB of LDS");
+
+    // The two buffers are swapped by XOR-ing one bit into every LDS address the
+    // kernel holds, rather than by re-deriving them. That needs the two tiles to
+    // be the same power-of-two size and to be allocated in the order k0, k1, v0,
+    // v1 from an aligned base, so that buffer 1 of each pair differs from buffer
+    // 0 in exactly the sizeof(st_k) bit. Both hold for every config in this file;
+    // the static_asserts are here so that a config where they do not hold fails
+    // to compile instead of silently reading the wrong half.
+    static constexpr uint32_t LDS_XOR = DBUF ? (uint32_t)sizeof(st_k) : 0u;
+    static_assert(!DBUF || sizeof(st_k) == sizeof(st_vt),
+                  "the XOR buffer swap needs K and V^T to be the same size");
+    static_assert(!DBUF || (sizeof(st_k) & (sizeof(st_k) - 1)) == 0,
+                  "the XOR buffer swap needs a power-of-two tile");
 };
 
 // The tiling knobs are shared across head dimensions; only HEAD_DIM varies, and
@@ -385,10 +480,34 @@ void micro_tk(const GL g) {
     using st_vt = typename C::st_vt;
     using G     = typename C::G;
 
+    constexpr int LDS_STAGES = C::LDS_STAGES;
+    constexpr uint32_t LDS_XOR = C::LDS_XOR;
+
+    // Allocated k0, k1, v0, v1 so that buffer 1 of each pair is sizeof(st_k)
+    // above buffer 0 -- which is what makes the XOR swap in lds_granules::swap
+    // legal. With LDS_STAGES == 1 the two entries of each array are the same
+    // tile and every swap below is a no-op.
     extern __shared__ alignment_dummy __shm[];
     shared_allocator al((int*)&__shm[0]);
-    st_k  (&k_smem)  = al.allocate<st_k>();
-    st_vt (&vt_smem) = al.allocate<st_vt>();
+    // Named references, not an array of pointers. A two-element pointer array
+    // here -- captured by reference into the staging lambdas -- defeats SROA, and
+    // the array lands in scratch: 508 bytes/lane and 383 spilled VGPRs, identical
+    // for every QK_TILES/PV_TILES setting, which is how it was identified as
+    // structural rather than pressure. On a kernel that hand-manages s_waitcnt a
+    // spill is wrong, not slow.
+    st_k  &k_smem0  = al.template allocate<st_k>();
+#if DBUF
+    st_k  &k_smem1  = al.template allocate<st_k>();
+#else
+    st_k  &k_smem1  = k_smem0;
+#endif
+    st_vt &vt_smem0 = al.template allocate<st_vt>();
+#if DBUF
+    st_vt &vt_smem1 = al.template allocate<st_vt>();
+#else
+    st_vt &vt_smem1 = vt_smem0;
+#endif
+    (void)&vt_smem1;
 
     const int N       = g.q.rows();
     const int warp_id = kittens::warpid();
@@ -459,8 +578,29 @@ void micro_tk(const GL g) {
 
     // Nine VGPRs of LDS addressing for the whole kernel. See the note above
     // lds_granules.
-    lds_granules<st_k>  kg; kg.init(k_smem);
-    lds_granules<st_vt> vg; vg.init(vt_smem);
+    // The read granules start on buffer *1*, not 0, so that the preamble below is
+    // already the steady state: commit_kv writes V through `vg ^ LDS_XOR`, which
+    // is buffer 0, and K through k_wr, which is also buffer 0. Initializing both
+    // to buffer 0 is the obvious thing to write and it is wrong -- K lands in
+    // buffer 0 and V in buffer 1, so the first block's math reads a V buffer
+    // nobody wrote and the output is non-finite. With LDS_STAGES == 1 the two
+    // buffers are the same tile and this reads as buffer 0 either way.
+    lds_granules<st_k>  kg; kg.init(k_smem1);
+    lds_granules<st_vt> vg; vg.init(vt_smem1);
+    // The K buffer the *next* block is staged into. V needs no equivalent:
+    // commit_kv toggles `vg` across its writes and back, which is eight more
+    // v_xor per KV block and four fewer VGPRs than a second granule set. K cannot
+    // do the same because its commit goes through the library's
+    // store_register_buffer_to_shared, which addresses off the tile itself.
+    st_k *k_wr = &k_smem0;
+
+    // One swap at the bottom of each iteration moves everything to the other
+    // buffer. With LDS_XOR == 0 (single-buffered) all of this vanishes.
+    auto swap_buffers = [&]() {
+        kg.template swap<LDS_XOR>();
+        vg.template swap<LDS_XOR>();
+        if constexpr (LDS_STAGES == 2) k_wr = (k_wr == &k_smem0) ? &k_smem1 : &k_smem0;
+    };
 
     // Stage one KV block into LDS: K straight in, V transposed.
     //
@@ -483,23 +623,60 @@ void micro_tk(const GL g) {
     // a row is a runtime addend that all eight writes share. Written the other
     // way each write needs its own address, and those addresses are invariant
     // across the KV loop, so LLVM hoists eight of them and spills three.
-    auto stage_vt = [&](int kv_start) {
-        constexpr int D_CHUNKS = HEAD_DIM / VT_D_CHUNK;
-        constexpr int SB = st_vt::swizzle_bytes;
-        rt_bf<16, VT_D_CHUNK, row_l> v_rows;
-        rt_bf<VT_D_CHUNK, 16, row_l> v_t;
-        static_for<KV_BLOCK / 16>([&](auto w) {
-            constexpr int W = decltype(w)::value;
-            for (int c = warp_id; c < D_CHUNKS; c += NUM_WARPS) {
-                load(v_rows, g.v, coord<>{batch, head_kv, kv_start + 16 * W, c * VT_D_CHUNK});
-                transpose_sep(v_t, v_rows);
-                const uint32_t row_off = (uint32_t)(SB * VT_D_CHUNK) * (uint32_t)c;
-                static_for<VT_D_CHUNK / 16>([&](auto t) {
-                    lds_write_frag<16 * decltype(t)::value, 16 * W>(
-                        vg, row_off, v_t.tiles[decltype(t)::value][0]);
+    // Staging is split in two halves so a prefetch can put the math between
+    // them: load_kv() issues the global reads into registers and waits for
+    // nothing, commit_kv() does the transpose and the LDS writes. With
+    // GPREFETCH=0 they are called back to back and the pair behaves exactly like
+    // the single stage_vt this replaced.
+    constexpr int D_CHUNKS = HEAD_DIM / VT_D_CHUNK;
+    // Bands of V^T one warp owns. At HEAD_DIM=128, VT_D_CHUNK=16 and 12 warps
+    // this is 1 and the last four warps idle; it is a ceiling so that a config
+    // with more bands than warps still works, and it is compile-time so that
+    // v_rows[] is indexed by a constant. A runtime index puts it in scratch,
+    // which on a kernel that hand-manages s_waitcnt is silently wrong, not slow.
+    constexpr int V_ITERS = (D_CHUNKS + NUM_WARPS - 1) / NUM_WARPS;
+    constexpr int V_BANDS = KV_BLOCK / 16;
+    constexpr int stage_k = G::template stage_calls<st_k>;
+
+    float4 buf_k[stage_k];
+    rt_bf<16, VT_D_CHUNK, row_l> v_rows[V_ITERS][V_BANDS];
+
+    auto load_kv = [&](int kv_start) {
+        G::load_global_to_register_buffer(buf_k, stage_k, g.k,
+                                          coord<>{batch, head_kv, kv_start, 0}, *k_wr);
+        static_for<V_ITERS>([&](auto i) {
+            const int c = warp_id + decltype(i)::value * NUM_WARPS;
+            if (c < D_CHUNKS) {
+                static_for<V_BANDS>([&](auto w) {
+                    load(v_rows[decltype(i)::value][decltype(w)::value], g.v,
+                         coord<>{batch, head_kv,
+                                 kv_start + 16 * decltype(w)::value, c * VT_D_CHUNK});
                 });
             }
         });
+    };
+
+    auto commit_kv = [&]() {
+        G::template store_register_buffer_to_shared<false>(*k_wr, buf_k, stage_k);
+        // vg addresses the buffer being *read*; the writes go to the other one.
+        vg.template swap<LDS_XOR>();
+        constexpr int SB = st_vt::swizzle_bytes;
+        rt_bf<VT_D_CHUNK, 16, row_l> v_t;
+        static_for<V_ITERS>([&](auto i) {
+            const int c = warp_id + decltype(i)::value * NUM_WARPS;
+            if (c < D_CHUNKS) {
+                const uint32_t row_off = (uint32_t)(SB * VT_D_CHUNK) * (uint32_t)c;
+                static_for<V_BANDS>([&](auto w) {
+                    constexpr int W = decltype(w)::value;
+                    transpose_sep(v_t, v_rows[decltype(i)::value][W]);
+                    static_for<VT_D_CHUNK / 16>([&](auto t) {
+                        lds_write_frag<16 * decltype(t)::value, 16 * W>(
+                            vg, row_off, v_t.tiles[decltype(t)::value][0]);
+                    });
+                });
+            }
+        });
+        vg.template swap<LDS_XOR>();
     };
 
     // KV blocks, with the last one backed up the same way the Q blocks are --
@@ -519,6 +696,33 @@ void micro_tk(const GL g) {
         ? min(kv_blocks_all, (q_tile_start + Q_TILE + KV_BLOCK - 1) / KV_BLOCK)
         : kv_blocks_all;
 
+    // Where block kb actually reads from, with the tail backed up. Used for the
+    // prefetch as well, which is why it is a function of kb rather than a value
+    // computed inside the loop: the prefetch needs block kb+1's start, and it has
+    // to be clamped to a real block -- the warp-level load() below goes through
+    // raw pointers, not a buffer descriptor, so an out-of-range prefetch would be
+    // an out-of-bounds read rather than a harmless zero.
+    auto block_start = [&](int kb) {
+        return min(min(kb, kv_blocks - 1) * KV_BLOCK, N - KV_BLOCK);
+    };
+
+#if DBUF && !ABLATE_STAGE
+    // Stage block 0 into buffer 0, swap so the loop reads it and writes buffer 1,
+    // then issue block 1's globals. From here the invariant at the top of every
+    // iteration kb is: buffer `kg`/`vg` holds block kb and is published; buffer
+    // `k_wr`/`vgw` is untouched by any wave; block kb+1's globals are in flight.
+    load_kv(block_start(0));
+    commit_kv();
+    swap_buffers();
+#if GPREFETCH
+    load_kv(block_start(1));
+#endif
+    lds_wait<0>();
+    __builtin_amdgcn_s_barrier();
+#elif GPREFETCH && !ABLATE_STAGE
+    load_kv(block_start(0));
+#endif
+
     for (int kb = 0; kb < kv_blocks; kb++) {
         const int kv_lo    = kb * KV_BLOCK;                 // first kv this block owns
         const int kv_start = min(kv_lo, N - KV_BLOCK);      // where it actually reads
@@ -528,17 +732,35 @@ void micro_tk(const GL g) {
         // math to do. On the diagonal block that is most of the workgroup.
         const bool warp_skip = CAUSAL && (kv_lo > q_row + Q_BLOCK - 1);
 
+#if !DBUF
         // Previous iteration's reads must retire before this one overwrites the
         // buffers. Single-buffered, so this barrier is the whole hazard.
         __builtin_amdgcn_s_barrier();
 #if !ABLATE_STAGE
-        G::load(k_smem, g.k, coord<>{batch, head_kv, kv_start, 0});
-        stage_vt(kv_start);
+#if GPREFETCH
+        // The global reads for this block were issued one iteration ago and have
+        // been in flight under the previous block's WMMAs. This is where their
+        // vmcnt is paid -- inside store_register_buffer_to_shared, at the first
+        // use of each float4 -- and by now there is usually nothing to pay.
+        commit_kv();
+#else
+        load_kv(kv_start);
+        commit_kv();
+#endif
 #endif
         // s_barrier does not order memory; the LDS writes above have to be
         // retired explicitly or the next warp's ds_reads race them.
         lds_wait<0>();
         __builtin_amdgcn_s_barrier();
+
+#if GPREFETCH && !ABLATE_STAGE
+        // Issue the next block's global reads *before* this block's math, and
+        // after the barrier that published this block. Nothing below touches
+        // buf_k or v_rows until the next iteration's commit_kv(), so the loads
+        // have the whole math body to land in.
+        if (kb + 1 < kv_blocks) load_kv(block_start(kb + 1));
+#endif
+#endif  // !DBUF
 
 #if HK_DUMP == 5 || HK_DUMP == 6
         // Same readback as 1/2, but through the library's own load(). Splits
@@ -546,10 +768,10 @@ void micro_tk(const GL g) {
         if (blockIdx.x == 0 && warp_id == 0) {
 #if HK_DUMP == 5
             rt_bf<KV_BLOCK, HEAD_DIM, row_l> dbg;
-            load(dbg, k_smem);
+            load(dbg, k_smem0);
 #else
             rt_bf<HEAD_DIM, KV_BLOCK, row_l> dbg;
-            load(dbg, vt_smem);
+            load(dbg, vt_smem0);
 #endif
             store(g.o, dbg, coord<>{batch, head, 0, 0});
         }
@@ -588,12 +810,31 @@ void micro_tk(const GL g) {
         return;
 #endif
 
-        // Every wave in the workgroup has now staged and hit both barriers, so
-        // a wave with nothing above the diagonal can leave -- it rejoins at the
-        // next iteration's barrier. Skipping is exactly a no-op and not an
+        // A wave with nothing above the diagonal does no math this block. It
+        // still falls through to the staging and the barrier at the bottom --
+        // that is a workgroup-wide operation and its share of the next block is
+        // nobody else's to do. Skipping the math is exactly a no-op and not an
         // approximation: an all -inf S^T gives m_new == m_old, alpha == 1 and a
         // zero P^T, so l_run and o_t would come out unchanged.
-        if (warp_skip) continue;
+        // The predicate is made opaque so that this is a real branch even when
+        // CAUSAL is false and warp_skip folds to a constant.
+        //
+        // It is not a branch we want taken -- non-causal it never is. It is a
+        // control-flow boundary, and the register allocator needs one here. With
+        // the math and the staging in a single straight-line region the allocator
+        // has to hold both live at once and gives up: 256 VGPRs and 472-508
+        // bytes/lane of scratch, identical for every QK_TILES/PV_TILES setting,
+        // which is what ruled out simple pressure as the cause. The causal
+        // instantiation, which has this branch for real, fits in 249 with no
+        // scratch. Adding it back non-causal costs one VGPR and a never-taken
+        // s_cbranch, and drops scratch to zero.
+        //
+        // Scratch is not a slowdown in this kernel, it is a wrong answer: the
+        // LDS schedule hand-manages s_waitcnt and a spill breaks what the waits
+        // mean. See the note at lds_bind.
+        int do_math = warp_skip ? 0 : 1;
+        asm volatile("" : "+v"(do_math));
+        if (do_math) {
 
         // ---- S^T = K . Q^T ----------------------------------------------
         // A QK_TILES-tall, 16-wide window of K at a time. Q is already resident,
@@ -777,6 +1018,46 @@ void micro_tk(const GL g) {
             });
         }
 #endif
+        }  // if (do_math)
+
+#if DBUF
+        // Stage block kb+1 into the buffer nobody is reading, and issue kb+2's
+        // global reads. There is deliberately no barrier in front of this: the
+        // buffer being written was last read in iteration kb-1, and *that*
+        // iteration's closing barrier already guarantees every wave is done with
+        // it. That is the whole saving -- one barrier per KV block rather than
+        // two -- and it is what lets a wave still in its WMMAs and a wave already
+        // in its ds_writes share a SIMD.
+        // Keep the scheduler from hoisting the staging up into the math. Under
+        // CAUSAL the `if (!warp_skip)` above is a real branch and provides this
+        // boundary for free, which is why the causal instantiation fits at 249
+        // VGPRs; non-causal it folds away, the whole iteration becomes one
+        // straight-line region, and the hoisted staging loads overlap the entire
+        // math body -- 256 VGPRs and 480 bytes/lane of scratch. The overlap this
+        // gives up was never the point: the staging is hidden *across* waves, by
+        // the SIMD having another wave to run, not within one.
+        __builtin_amdgcn_sched_barrier(0);
+#if !ABLATE_STAGE
+        if (kb + 1 < kv_blocks) {
+#if GPREFETCH
+            // buf_k/v_rows were filled an iteration ago; this pays their vmcnt.
+            commit_kv();
+            load_kv(block_start(kb + 2));
+#else
+            // Issued and consumed here. The vmcnt stall is real but it is this
+            // wave's alone -- no barrier stands between it and the other waves'
+            // math -- and it costs no registers across the math body.
+            load_kv(block_start(kb + 1));
+            commit_kv();
+#endif
+        }
+#endif
+        // s_barrier does not order memory; the LDS writes above have to be
+        // retired explicitly or the next iteration's ds_reads race them.
+        lds_wait<0>();
+        __builtin_amdgcn_s_barrier();
+        swap_buffers();
+#endif
     }
 
     div_col(o_t, o_t, l_run);
@@ -862,7 +1143,15 @@ void dispatch_micro(micro_globals g) {
 }
 
 #ifndef HK_ATTN_NO_PYBIND
-PYBIND11_MODULE(tk_kernel, m) {
+// Overridable so that two builds with different tiling knobs can be imported
+// into one process and timed against each other. They have to be: bench() warns
+// that clock and power state drift between runs on this node, and a cross-
+// process A/B on this part manufactures double-digit differences that do not
+// exist. ab.py is the harness.
+#ifndef TK_MODULE_NAME
+#define TK_MODULE_NAME tk_kernel
+#endif
+PYBIND11_MODULE(TK_MODULE_NAME, m) {
     m.doc() = "tk_kernel python module";
     py::bind_function<dispatch_micro>(m, "dispatch_micro",
                                       &micro_globals::q, &micro_globals::k,

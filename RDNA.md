@@ -13,7 +13,7 @@ the work here lives on the `rdna` branch, on top of `de0cddbd`.
 | unit tests | **1659 passed, 0 failed** on a W7900D | compiles; **never executed** |
 | bf16 GEMM | **77.2 TFLOPs** peak, 77% of the measured WMMA ceiling. 107-119% of the best AMD library *in HipKittens' own layout*; 85-93% of that library when it is free to pick its own | compiles; never executed |
 | distributed | fused GEMM→all-reduce / reduce-scatter, as a torch operator: **1.22-1.31x** and **1.31-1.59x** over hipBLASLt + RCCL at prefill, on 2x W7900D. [Full writeup](kernels/rdna3/distributed/README.md) | not attempted |
-| attention | single-GPU SDPA forward, as a torch operator and an `F.scaled_dot_product_attention` drop-in: **59-60 TFLOPs**, **2.7-3.0x** the aotriton kernel every Radeon framework actually reaches, and level with a hand-written Triton FA-2. [Full writeup](kernels/rdna3/attn/README.md) | not attempted |
+| attention | single-GPU SDPA forward, as a torch operator and an `F.scaled_dot_product_attention` drop-in: **62-63 TFLOPs**, **2.8-3.2x** the aotriton kernel every Radeon framework actually reaches, and 4-11% ahead of a hand-written Triton FA-2. [Full writeup](kernels/rdna3/attn/README.md) | not attempted |
 | fp8 | not available in hardware | implemented, all four opcodes, untested |
 
 **Read the second column as "written, not verified."** No gfx12 part was
@@ -314,28 +314,39 @@ The comparison that matters is not against a paper. Every framework that runs
 attention on a Radeon — diffusers, comfyUI, vLLM, SGLang — calls
 `F.scaled_dot_product_attention`, and on ROCm/gfx1100 both the `FLASH` and the
 `EFFICIENT` backend land in the same aotriton kernel, `attn_fwd` (confirmed with
-the profiler, not inferred). That kernel is **flat at 19.8–21.2 TFLOPs from
+the profiler, not inferred). That kernel is **flat at 20.0–21.1 TFLOPs from
 N=4096 to N=65536** — 21% of this chip's measured WMMA ceiling, and it does not
 improve with length. B=1, H=56, D=128, all three backends in one process:
 
 | | N=4096 | N=16384 | 49920 (480p/5s) | N=65536 |
 |---|---|---|---|---|
-| HipKittens | 56.9 TF | **59.9 TF** | 59.2 TF | 59.0 TF |
-| vs aotriton | 2.68× | 2.87× | 2.91× | 2.91× |
-| vs a hand-written Triton FA-2 | 0.99× | 1.02× | 1.03× | 1.03× |
+| HipKittens | 59.3 TF | 62.4 TF | 63.3 TF | **63.4 TF** |
+| vs aotriton | 2.81× | 3.00× | 3.15× | 3.14× |
+| vs a hand-written Triton FA-2 | 1.04× | 1.07× | 1.10× | 1.11× |
 
-The Triton row is reported as measured: at N=4096 the Triton baseline is still
-1% ahead, and the gap only reverses from N=8192 up. The honest summary is
-"2.7–3.0× the backend a Radeon actually uses today, and level-to-slightly-ahead
-of the best thing you could write in Triton."
+At 62–63 TF this is 63% of the chip's WMMA ceiling and within 7% of the best
+bf16 GEMM measured on it — for an operation with a softmax in the middle. The
+margin over Triton widens with length as staging amortizes; the two are close to
+level at N=4096. The honest summary is "2.8–3.2× the backend a Radeon actually
+uses today, and 4–11% ahead of the best thing you could write in Triton."
 
-**With causal masking the two rows move in opposite directions:** 3.7–3.9×
+**With causal masking the margin over Triton nearly disappears:** 3.8–4.1×
 aotriton (which loses efficiency per surviving FLOP when the mask goes on) but
-**0.91–0.99× the Triton baseline** — a loss of 1–9%. The cause is identified and
-not fixed: the KV loop bound must be uniform across a workgroup, so it is taken
-from the last query in a 192-query tile, and waves holding earlier queries stage
-up to six KV blocks whose scores they then skip. H3 is non-causal, which is why
-that was left.
+only **1.00–1.03× the Triton baseline**. The cause is identified and not fixed:
+the KV loop bound must be uniform across a workgroup, so it is taken from the
+last query in a 192-query tile, and waves holding earlier queries stage up to six
+KV blocks whose scores they then skip. H3 is non-causal, which is why that was
+left.
+
+Both tables are a correction of earlier ones that had non-causal at 59–60 TF and
+causal *behind* Triton. The kernel was leaving ~5% on the floor to an occupancy
+cliff that only the causal instantiation fell off — gfx1100's VGPR allocation
+granule is 24, so 6 waves/SIMD needs ≤ 240 registers, and the tiling had been
+chosen by a sweep that only ever timed the non-causal build. Finding it also
+meant discarding a set of A/B measurements taken across separate processes,
+which on this node invents differences of 13–16%; the
+[writeup](kernels/rdna3/attn/README.md#the-sweep-measured-the-wrong-instantiation)
+describes both mistakes, since both are easy to repeat.
 
 Almost none of this is a transcription of the CUDA or CDNA flash attention.
 gfx11's WMMA fragment layouts are different enough that the *shape of the

@@ -19,9 +19,9 @@ This directory is a single-GPU flash-attention forward that is not.
               can actually run today
 
        N        HipKittens      aotriton      triton FA-2
-    4096          56.0 TF         21.2 TF        57.6 TF
-   16384          59.7 TF         20.9 TF        58.6 TF
-   49920          56.9 TF         20.1 TF        57.5 TF     <- 480p/5s of H3
+    4096          59.3 TF         21.1 TF        57.2 TF
+   16384          62.4 TF         20.8 TF        58.5 TF
+   49920          63.3 TF         20.1 TF        57.4 TF     <- 480p/5s of H3
 ```
 
 The target is [MiniMax H3](#1-the-shape-that-drove-every-decision), a video+audio
@@ -409,7 +409,7 @@ Q_BLOCK=32 KV_BLOCK=32  QK=2 PV=2            | vgpr=221 spill=0  scr=0  occ=6 | 
 
 `NUM_WARPS` is also the Q tile — `Q_TILE = Q_BLOCK · NUM_WARPS` — and every warp
 in the workgroup reads the same staged K and Vᵀ. So it is the knob that
-amortizes staging, which [§6](#6-where-the-time-goes) puts at 28% of the runtime:
+amortizes staging, which [§6](#6-where-the-time-goes) puts at 18% of the runtime:
 global K/V traffic is `N / Q_TILE` complete passes over K and V, and a wider
 workgroup divides that down.
 
@@ -429,12 +429,71 @@ slots, and the loss swamps the staging they save. Among the divisors, 12 wins
 because it stages half as often as 8. 24 divides it too, but leaves one
 workgroup per WGP with nothing to cover its barriers.
 
-Shipped: `Q_BLOCK=16, KV_BLOCK=32, NUM_WARPS=12, VT_D_CHUNK=16, QK_TILES=2,
-PV_TILES=4` → 217 VGPRs, 0 spill, 0 scratch, occupancy 6, **59.7 TF at N=16384**.
-
 The cost is coverage at the bottom: `Q_TILE` is 192 rather than 128, so the
 kernel needs N ≥ 192 and the drop-in falls back below that. For H3, where N is
 tens of thousands, that is free.
+
+### The sweep measured the wrong instantiation
+
+The table above has a defect worth describing, because it cost a real 13% and
+hid inside a harness that was otherwise careful. **Every line of it is
+non-causal.** `CAUSAL` is a template parameter, so the file compiles four
+kernels, and a sweep that times one of them picks a configuration for all four.
+
+`PV_TILES` is the knob where that mattered. It is the depth of the LDS read
+batch feeding the PV stage — deeper batches hide more LDS latency and cost more
+live registers. Non-causal, `PV_TILES=4` measures 57.3 against `PV_TILES=2`'s
+56.8, so the sweep took 4. But the causal instantiation carries the mask
+predicates and the wave-skip bookkeeping on top of the same tiles, and at
+`PV_TILES=4` it landed at **252 VGPRs — occupancy 5 — while the non-causal one
+it was chosen by sat at 238 and occupancy 6.**
+
+The cliff is sharp and it is not where a 256-register budget suggests:
+
+```
+  gfx1100 VGPR allocation granule = 24
+    240 VGPRs -> 6 waves/SIMD        241 VGPRs -> 5 waves/SIMD
+```
+
+Allocation rounds up to a multiple of 24, so 6 waves needs ≤ 240, not ≤ 256.
+Nothing in the resource-usage remarks says "granule"; it reports VGPRs and
+occupancy, and the occupancy line is the only warning you get. `PV_TILES=2`
+brings causal to 240 — exactly on the cliff edge — and buys back the sixth wave.
+`PV_TILES=1` measures identically (both 227 VGPRs non-causal), so 2 is the knee:
+the deepest read batch that still fits.
+
+Together with `GPREFETCH=1` (a register prefetch of the next KV block's global
+reads; gfx11 has no global→LDS DMA, so those bytes pass through a VGPR anyway),
+measured **interleaved in one process** against the previously shipped build:
+
+```
+                              non-causal            causal        causal
+                           n=4096  n=16384    n=4096  n=16384      occ.
+  previously shipped        56.67    59.42     47.53    53.81       6
+  + GPREFETCH scaffolding   59.73    62.30     43.91    48.45       5   <- cliff
+  + PV_TILES=2              59.85    62.45     49.42    56.44       6
+                            +5.6%    +5.1%     +4.0%    +4.9%
+```
+
+The middle row is the cliff being crossed and is why this is in the README at
+all: adding the prefetch helped non-causal by 5% and *hurt* causal by 10%, for
+no reason visible in the source. The extra live values pushed the causal
+instantiation from 238 VGPRs past 240, and one lost wave per SIMD cost more than
+the prefetch gained. `PV_TILES=2` gives the registers back and both directions
+move together.
+
+Shipped: `Q_BLOCK=16, KV_BLOCK=32, NUM_WARPS=12, VT_D_CHUNK=16, QK_TILES=2,
+PV_TILES=2, GPREFETCH=1, DBUF=0` → 227 VGPRs non-causal / 240 causal, 0 spill,
+0 scratch, occupancy 6 for both, **62.4 TF at N=16384**.
+
+`fwd/ab.py` exists because of this measurement and is the harness to use for the
+next one. Driving `quickbench.py` from a shell loop rebuilds the `.so` between
+variants and therefore times each in a **separate process**, which `bench()`'s
+own docstring forbids on this node — clock and power state drift between runs.
+Done that way, `PV_TILES=2` first appeared to be worth 13–16% on causal, which
+was three times the truth. `ab.py` loads every variant as a separately-named
+module and interleaves them round-robin, so whatever drift remains is charged to
+all of them equally.
 
 ### Two knobs that are not usable
 
@@ -459,31 +518,56 @@ which is the one measurement that separates "LDS-bound" from "WMMA-bound". No
 combination of the per-stage switches can do that, because each of those removes
 a stage's reads and its math together.
 
-At N=16384, as a share of runtime:
+Each variant is built as its own module and all six are **interleaved in one
+process** by `fwd/ab.py` — these are ratios between builds, which is exactly the
+comparison that goes wrong when it spans processes (§5). At N=16384, non-causal,
+as a share of runtime:
 
 ```
-  staging (global -> LDS, incl. the Vᵀ transpose)   27.7%
-  QK stage                                          32.1%
-  PV stage                                          35.0%
-  online softmax                                     8.4%
+                                                    TF with the stage deleted
+  staging (global -> LDS, incl. the Vᵀ transpose)   76.6    18.3%
+  QK stage                                          95.9    34.7%
+  PV stage                                         103.1    39.3%
+  online softmax                                    68.3     8.4%
+                                                           ------
+                                            (full: 62.6)   100.7%
   ----
-  all LDS reads, both stages                        18.3%
-  => WMMA + fp32->bf16 conversion                  ~49%
+  all LDS reads, both stages                        77.2    18.9%
+  => WMMA + fp32->bf16 conversion                           ~55%
 ```
 
-The read side is already well hidden: the WMMAs are roughly half the runtime and
-the machine's WMMA ceiling is ~100 TF, so at 59.7 TF the matmul stages are
-running near peak. The largest remaining lever is **staging**, which is still
-fully serialized with the math (`G::load` → `lds_wait<0>` → barrier). See §12.
+Two things to read off this. **The matmuls are now most of the kernel**: QK and
+PV together are 74% of the runtime, and stripping the LDS reads out of both
+leaves ~55% that is WMMA and fp32→bf16 conversion. Against a ~100 TF WMMA
+ceiling, 62.6 TF means the inner loop is running close to what the machine can
+issue.
+
+**Staging is down to 18.3% from the 27.7% this section used to report**, and the
+difference is `GPREFETCH` (§5). What remains is not hideable: see
+[§12](#12-notes-for-anyone-continuing-this) item 1, where the other overlap
+strategy — real LDS double-buffering — was implemented, measured at +0.7%, and
+left off. The V transposes and `ds_write`s are real instructions competing with
+the WMMAs for issue slots, so the way to get the rest is to issue fewer of them,
+not to hide them better.
 
 ---
 
 ## 7. Coverage: causal, GQA, head_dim 64
 
 None of these are what H3 needs; all three are what makes the kernel usable by an
-LLM serving stack as well. Each is a template parameter, and the non-causal
-D=128 path was re-measured afterwards at the same **217 VGPRs, occupancy 6,
-ScratchSize 0** — byte for byte the budget it had before.
+LLM serving stack as well. Each is a template parameter, so a `make` produces
+four kernels and prints four sets of resource numbers:
+
+```
+  D=128 non-causal   227 VGPRs   occupancy 6      all four: spill 0, scratch 0
+  D=128 causal       240 VGPRs   occupancy 6
+  D= 64 non-causal   155 VGPRs   occupancy 9
+  D= 64 causal       170 VGPRs   occupancy 8
+```
+
+Reading all four of those lines, and not only the one belonging to the variant
+being timed, is the discipline [§5](#the-sweep-measured-the-wrong-instantiation)
+exists to teach: 240 is one register below an occupancy cliff.
 
 ### Causal
 
@@ -511,23 +595,23 @@ Two levels of skipping:
   not an approximation: an all `-inf` `Sᵀ` gives `m_new == m_old`, `α == 1` and a
   zero `Pᵀ`, so `l_run` and `o_t` would come out unchanged.
 
-Measured, B=1 H=56 D=128:
+Measured, B=1 H=56 D=128, from the two [§9](#9-results) runs:
 
 ```
      N     non-causal          causal          wall-clock
-  4096    8.71 ms  55.2 TF   5.17 ms  46.5 TF     1.68x
-  8192   32.69 ms  58.9 TF  18.59 ms  51.8 TF     1.76x
- 16384  129.04 ms  59.6 TF  71.47 ms  53.8 TF     1.81x
+  4096    8.12 ms  59.3 TF   4.96 ms  48.5 TF     1.64x
+  8192   31.20 ms  61.7 TF  17.69 ms  54.4 TF     1.76x
+ 16384  123.26 ms  62.4 TF  68.73 ms  56.0 TF     1.79x
 ```
 
-(Causal TFLOPs use the usual halved-FLOP convention. 1.81× against an ideal 2× is
+(Causal TFLOPs use the usual halved-FLOP convention. 1.79× against an ideal 2× is
 three things: the diagonal blocks, which are computed whole; the load imbalance
 of a static grid where workgroup *i* does *i*+1 KV blocks; and the wave-level
 skip above, which saves the *math* but not the *staging* — a skipping wave has
 already paid for the K and Vᵀ it will not read, and `Q_TILE` is six `KV_BLOCK`s
 wide, so there can be six such blocks per workgroup. That third one is the
-largest and it is why causal comes out a few percent behind the Triton baseline
-where non-causal is ahead; [§9](#causal--where-this-loses) measures it.)
+largest, and it is why causal holds only 90% of the non-causal rate where the
+Triton baseline holds 95%; [§9](#causal--the-narrow-one) measures it.)
 
 ### GQA
 
@@ -550,8 +634,9 @@ and picks on `q.size(3)`.
 
 D=64 is *cheaper per byte* than D=128, which is worth stating because it is the
 opposite of the usual intuition: `q` and `o_t` are half the registers, so the
-kernel drops to **145 VGPRs and occupancy 9** (167 / 9 for the causal variant)
-against 217 / 6. The D=128 shape is the tight one.
+kernel drops to **155 VGPRs and occupancy 9** (170 / 8 for the causal variant)
+against 227 / 6. The D=128 shape is the tight one, and it is the only one
+anywhere near the cliff.
 
 ---
 
@@ -624,42 +709,43 @@ a mis-dispatch cannot show up here as our number.
 
 ```
  shape          B   H       N     hk ms   hk TF  aotri ms  aotri TF  triton ms  triton TF
- N=4096         1  56    4096     8.458    56.9    22.686      21.2      8.363       57.5
- N=8192         1  56    8192    32.535    59.1    92.376      20.8     32.948       58.4
- N=16384        1  56   16384   128.542    59.9   368.640      20.9    131.282       58.6
- N=32768        1  56   32768   518.621    59.4  1552.183      19.8    532.580       57.8
- 480p/5s        1  56   49920  1207.556    59.2  3512.293      20.3   1243.151       57.5
- N=65536        1  56   65536  2086.834    59.0  6073.892      20.3   2150.806       57.3
- N=16384 cfg    2  56   16384   256.923    59.9   735.965      20.9    262.041       58.7
+ N=4096         1  56    4096     8.116    59.3    22.793      21.1      8.406       57.2
+ N=8192         1  56    8192    31.200    61.7    92.501      20.8     33.045       58.2
+ N=16384        1  56   16384   123.257    62.4   369.788      20.8    131.544       58.5
+ N=32768        1  56   32768   487.330    63.2  1542.351      20.0    534.019       57.7
+ 480p/5s        1  56   49920  1128.293    63.3  3558.576      20.1   1245.482       57.4
+ N=65536        1  56   65536  1943.072    63.4  6094.315      20.2   2148.842       57.3
+ N=16384 cfg    2  56   16384   245.389    62.7   738.767      20.8    263.033       58.5
 ```
 
 | | vs aotriton (what diffusers/comfyUI run) | vs the Triton FA-2 (the vLLM/SGLang stand-in) |
 |---|---|---|
-| N=4096 | 2.68× | **0.99×** |
-| N=8192 | 2.84× | 1.01× |
-| N=16384 | 2.87× | 1.02× |
-| N=32768 | 2.99× | 1.03× |
-| 480p/5s (49920) | 2.91× | 1.03× |
-| N=65536 | 2.91× | 1.03× |
-| N=16384 CFG | 2.86× | 1.02× |
+| N=4096 | 2.81× | 1.04× |
+| N=8192 | 2.97× | 1.06× |
+| N=16384 | 3.00× | 1.07× |
+| N=32768 | 3.16× | 1.10× |
+| 480p/5s (49920) | 3.15× | **1.10×** |
+| N=65536 | 3.14× | 1.11× |
+| N=16384 CFG | 3.01× | 1.07× |
 
 Two things worth saying plainly about that table.
 
-**aotriton does not scale, and this does.** aotriton is flat at 19.8–21.2 TF
-across a 16× range of sequence length. Ours holds 59–60 TF from N=8192 to
-N=65536, which on a machine whose measured WMMA ceiling is ~100 TF is about 59%
+**aotriton does not scale, and this does.** aotriton is flat at 20.0–21.1 TF
+across a 16× range of sequence length. Ours holds 62–63 TF from N=8192 to
+N=65536, which on a machine whose measured WMMA ceiling is ~100 TF is about 63%
 of peak — for an operation that is not a GEMM and has a softmax in the middle of
 it. For reference, hipBLASLt's 4096³ bf16 GEMM on this chip is 67.6 TF and our
-own GEMM is 77.2.
+own GEMM is 77.2. Attention here is within 7% of this machine's *best measured
+GEMM*, which is the number that says the inner loop is close to done.
 
-**The Triton baseline is genuinely good, and at N=4096 it is still 1% ahead.**
-That is reported rather than rounded away. The gap closes and reverses by
-N=8192 and stays reversed through N=65536, which is the regime H3 actually runs
-in — but a 4096-token workload is a tie, not a win, and the honest summary is
-"2.7–3.0× the backend a Radeon actually uses today, and level-to-slightly-ahead
+**The Triton baseline is genuinely good, and the margin over it is single-digit
+percent.** 4–11%, widening with sequence length: the two are level at N=4096 and
+we pull away as staging amortizes. That is a real but modest win, and it is the
+one that decides whether a serving stack would bother switching. The honest
+summary is "2.8–3.2× the backend a Radeon actually uses today, and 4–11% ahead
 of the best thing you could write in Triton."
 
-### Causal — where this loses
+### Causal — the narrow one
 
 Same harness, `--causal`, same discipline — one process, one run, interleaved.
 TFLOPs count half the non-causal work for all three backends alike, which
@@ -668,45 +754,55 @@ as empty), but flatters them identically.
 
 ```
  shape          B   H       N     hk ms   hk TF  aotri ms  aotri TF  triton ms  triton TF
- N=4096         1  56    4096     5.127    46.9    18.882      12.7      4.652       51.7
- N=8192         1  56    8192    18.381    52.3    69.886      13.8     17.781       54.1
- N=16384        1  56   16384    71.895    53.5   272.449      14.1     69.107       55.7
- N=32768        1  56   32768   281.281    54.7  1099.156      14.0    274.216       56.1
- 480p/5s        1  56   49920   649.637    55.0  2547.582      14.0    641.538       55.7
- N=65536        1  56   65536  1136.448    54.2  4376.786      14.1   1112.219       55.4
- N=16384 cfg    2  56   16384   140.964    54.6   548.910      14.0    136.977       56.2
+ N=4096         1  56    4096     4.960    48.5    18.954      12.7      5.041       47.7
+ N=8192         1  56    8192    17.694    54.4    69.993      13.7     17.765       54.2
+ N=16384        1  56   16384    68.734    56.0   271.424      14.2     68.980       55.8
+ N=32768        1  56   32768   268.407    57.4  1099.765      14.0    276.668       55.6
+ 480p/5s        1  56   49920   622.927    57.4  2547.595      14.0    641.359       55.7
+ N=65536        1  56   65536  1088.885    56.5  4371.985      14.1   1110.056       55.5
+ N=16384 cfg    2  56   16384   134.956    57.0   545.927      14.1    136.839       56.2
 ```
 
 | | vs aotriton | vs the Triton FA-2 |
 |---|---|---|
-| N=4096 | 3.68× | 0.91× |
-| N=8192 | 3.80× | 0.97× |
-| N=16384 | 3.79× | 0.96× |
-| N=32768 | 3.91× | 0.97× |
-| 480p/5s (49920) | 3.92× | **0.99×** |
-| N=65536 | 3.85× | 0.98× |
-| N=16384 CFG | 3.89× | 0.97× |
+| N=4096 | 3.82× | 1.02× |
+| N=8192 | 3.97× | **1.00×** |
+| N=16384 | 3.94× | 1.00× |
+| N=32768 | 4.10× | 1.03× |
+| 480p/5s (49920) | 4.10× | 1.03× |
+| N=65536 | 4.01× | 1.02× |
+| N=16384 CFG | 4.04× | 1.01× |
 
 **Against aotriton the causal margin is larger, and that is aotriton's doing,
 not ours.** It falls from ~20.5 TF to ~14 TF when the mask is switched on — it
 gets *less* efficient per surviving FLOP, so halving its work does not halve its
 time.
 
-**Against the Triton baseline, causal is a loss: 1–9%, consistently.** Non-causal
-we are 1–3% ahead of it; causal we are 1–3% behind, and 9% behind at N=4096. The
-kernel keeps 89% of its non-causal throughput (59.9 → 53.5 TF at N=16384) where
-Triton keeps 95%, and the reason is the staging this shape does for blocks it
-then throws away. `Q_TILE` is `NUM_WARPS × Q_BLOCK` = 192 queries, six times
-`KV_BLOCK`; the KV loop bound has to be uniform across the workgroup, so it is
-taken from the *last* query in the tile, and the waves holding earlier queries
-stage and barrier through up to six KV blocks whose scores they will skip
-entirely. With staging at 27.7% of the runtime (§6), that is roughly the size of
-the gap. It is fixable — a smaller `Q_TILE` under causal, or a wave-major work
-assignment that puts the whole workgroup on the same diagonal — and it has not
-been done, because the target is non-causal.
+**Against the Triton baseline, causal is a tie to a 3% win, and that is worth
+stating as the weak result it is.** Non-causal we are 4–11% ahead; causal the
+margin collapses to 0–3%. The kernel keeps 90% of its non-causal throughput
+(62.4 → 56.0 TF at N=16384) where Triton keeps 95%, and the remaining cause is
+the staging this shape does for blocks it then throws away. `Q_TILE` is
+`NUM_WARPS × Q_BLOCK` = 192 queries, six times `KV_BLOCK`; the KV loop bound has
+to be uniform across the workgroup, so it is taken from the *last* query in the
+tile, and the waves holding earlier queries stage and barrier through up to six
+KV blocks whose scores they will skip entirely. It is fixable — a smaller
+`Q_TILE` under causal, or a wave-major work assignment that puts the whole
+workgroup on the same diagonal — and it has not been done, because the target is
+non-causal.
 
-So the one-line causal summary is: **3.7–3.9× the backend a Radeon actually
-runs, and a few percent behind a good Triton FA-2.**
+This table is a correction of an earlier one that had causal 1–9% *behind*
+Triton and blamed that deficit on the skipped-block staging above. Two things
+were wrong with it. The larger was a tiling bug found later and fixed —
+`PV_TILES` was set from a sweep that only ever measured non-causal, and the
+causal instantiation it produced sat one VGPR granule over an occupancy cliff
+(§5). The smaller was measurement: the old table's Triton N=4096 number, 51.7
+TF, does not reproduce — two fresh runs put it at 46.8 and 47.7 — so the
+headline "9% behind" was mostly that one noisy cell. The staging explanation
+survives, but as the *residual* rather than the whole story.
+
+So the one-line causal summary is: **3.8–4.1× the backend a Radeon actually
+runs, and level with a good Triton FA-2.**
 
 ### Coverage
 
@@ -753,10 +849,24 @@ cd fwd && make 2>&1 | grep -E 'VGPRs|Scratch|Occupancy'
 #   ScratchSize must be 0.  See §4 -- a spill here is wrong, not slow.
 
 # the tiling sweep that picked the shipped config
+#   NOTE: every line of it is non-causal, and that is the defect described in
+#   section 5.  Check the occupancy of all four instantiations, not just this one.
 cd fwd && ./sweep.sh
 
-# per-stage attribution
-cd fwd && make EXTRA_HIPFLAGS=-DABLATE_LDS_READ=1 && python3 quickbench.py --no-check
+# A/B two tilings.  Build each as its own module, then interleave them in ONE
+# process -- see section 5; a shell loop around quickbench.py compares across
+# processes and on this node that invents double-digit differences.
+cd fwd && make TARGET=mod_a EXTRA_HIPFLAGS='-DPV_TILES=4 -DTK_MODULE_NAME=mod_a'
+cd fwd && make TARGET=mod_b EXTRA_HIPFLAGS='-DPV_TILES=2 -DTK_MODULE_NAME=mod_b'
+cd fwd && AB_CAUSAL=1 python3 ab.py mod_a mod_b
+
+# per-stage attribution: same harness, with the correctness gate off because
+# the ABLATE_* builds are wrong on purpose
+cd fwd && for v in STAGE QK SOFTMAX PV LDS_READ; do lv=$(echo $v | tr A-Z a-z); \
+    make TARGET=abl_$lv EXTRA_HIPFLAGS="-DABLATE_$v=1 -DTK_MODULE_NAME=abl_$lv"; done
+cd fwd && make TARGET=abl_full EXTRA_HIPFLAGS=-DTK_MODULE_NAME=abl_full
+cd fwd && AB_CHECK=0 AB_SHAPES=1x56x16384 \
+    python3 ab.py abl_full abl_stage abl_qk abl_softmax abl_pv abl_lds_read
 
 # the torch op and the drop-in: every shape, every fallback branch
 cd torch_ext && make && python3 test_torch_ext.py
@@ -776,30 +886,53 @@ every launch in `timeout --signal=KILL`.
 
 In rough order of how much is left on the table.
 
-1. **Staging is 27.7% of the runtime and is fully serialized with the math.**
-   `G::load` → `lds_wait<0>` → barrier, then all the WMMAs, then the next block.
-   Double-buffering K and Vᵀ is 64 KB on a part with exactly 64 KB per workgroup,
-   which drops occupancy to one workgroup per WGP — the prefetch that buys is
-   worth less than the waves it costs, which is why it is not there. A **register
-   prefetch** of the next KV block (the GEMM's `GPREFETCH` approach; gfx11 has no
-   global→LDS DMA, so every byte goes through a VGPR anyway) is the version that
-   might work, and it has not been tried.
+0. **Check the occupancy line of every instantiation, not just the one you are
+   timing.** This is first because it is the cheapest and it has already been
+   missed once (§5). The gfx1100 VGPR allocation granule is 24, so 6 waves/SIMD
+   needs ≤ 240 registers and 241 costs a wave. `CAUSAL` and `HEAD_DIM` are
+   template parameters, so a `make` prints four sets of numbers; a change that is
+   free in the one you are measuring can cross the cliff in another. And time
+   variants with `fwd/ab.py`, never with a shell loop around `quickbench.py` —
+   the loop rebuilds between variants and so compares across processes, which is
+   how the same `PV_TILES` change first measured as 13–16% instead of 5%.
+
+1. **Staging is 18% of the runtime, and what is left of it is issue-bound rather
+   than latency-bound.** This is the finding that closes off the obvious
+   approach. Both overlap strategies were implemented and measured:
+   * **`GPREFETCH`** — register prefetch of the next KV block's global reads,
+     the GEMM's approach, since gfx11 has no global→LDS DMA and every byte goes
+     through a VGPR anyway. Worth ~5% non-causal, and it is what took staging
+     from 27.7% of the runtime to 18.3%. It is on.
+   * **`DBUF`** — genuine double-buffering of K and Vᵀ in LDS, 32 KB per
+     workgroup, which still fits two workgroups per WGP. It removes one of the
+     two barriers per KV block and lets waves drift apart. Measured at +0.7%
+     causal and −0.2% non-causal. It is implemented, correct, and **off**,
+     because that does not pay for 16 KB of LDS and the buffer-parity
+     bookkeeping.
+
+   The reason `DBUF` disappoints is the finding itself: the V transposes and the
+   `ds_write`s are *real work* competing with the WMMAs for the same SIMD issue
+   slots, so no amount of overlapping removes them. Getting this 28% back means
+   issuing fewer instructions to stage a byte, not hiding the ones there are —
+   which points at `Q_BLOCK=32` below, the only knob that reduces staged bytes
+   per FLOP.
 
 2. **Fix `Q_BLOCK=32`.** It halves LDS traffic per FLOP, which is the only knob
-   that does. It needs the `.tiles[r][0]` hardcoding removed *and* Q moved to
-   LDS, because `q` and `o_t` both double.
+   that does, and per item 1 that is now the *only* remaining lever on staging.
+   It needs the `.tiles[r][0]` hardcoding removed *and* Q moved to LDS, because
+   `q` and `o_t` both double.
 
-3. **Causal: stop staging blocks the waves are going to skip.** This is the one
-   place the kernel is measurably behind the Triton baseline (1–9%, §9), and it
-   is one cause: the KV loop bound is uniform across the workgroup and therefore
-   taken from the *last* query in a 192-query tile, so waves holding earlier
-   queries stage up to six KV blocks they then skip. A smaller `Q_TILE` when
-   `CAUSAL` (fewer waves per workgroup, so a tighter uniform bound) is the
-   cheapest fix and needs no restructuring — it is a template parameter already.
-   Separately, the static grid leaves workgroup *i* doing *i*+1 KV blocks;
-   pairing block *i* with block *n-1-i* is the standard fix for that, and both
-   together are worth most of the gap between the measured 1.81× and the ideal
-   2×.
+3. **Causal: stop staging blocks the waves are going to skip.** Causal is the
+   narrow result (level with Triton, against 4–11% ahead non-causal, §9) and this
+   is the cause that survives: the KV loop bound is uniform across the workgroup
+   and therefore taken from the *last* query in a 192-query tile, so waves
+   holding earlier queries stage up to six KV blocks they then skip. A smaller
+   `Q_TILE` when `CAUSAL` (fewer waves per workgroup, so a tighter uniform bound)
+   is the cheapest fix and needs no restructuring — it is a template parameter
+   already. Separately, the static grid leaves workgroup *i* doing *i*+1 KV
+   blocks; pairing block *i* with block *n-1-i* is the standard fix for that, and
+   both together are worth most of the gap between the measured 1.79× and the
+   ideal 2×.
 
 4. **fp16.** One more instantiation.
 
@@ -821,6 +954,7 @@ common.py                   shapes, timing, the chunked fp32 reference, check()
 fwd/attn.cpp                the kernel: config, micro_tk, launch, dispatch
 fwd/test.py                 correctness gate, 24 shapes
 fwd/quickbench.py           one check + two timings, small enough to sit in a sweep
+fwd/ab.py                   interleave N builds in ONE process -- the only valid A/B
 fwd/sweep.sh                build+measure one tiling per line
 fwd/dump.py                 numpy models of each HK_DUMP level
 fwd/Makefile
