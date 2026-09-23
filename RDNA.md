@@ -13,7 +13,7 @@ the work here lives on the `rdna` branch, on top of `de0cddbd`.
 | unit tests | **1659 passed, 0 failed** on a W7900D | compiles; **never executed** |
 | bf16 GEMM | **77.2 TFLOPs** peak, 77% of the measured WMMA ceiling. 107-119% of the best AMD library *in HipKittens' own layout*; 85-93% of that library when it is free to pick its own | compiles; never executed |
 | distributed | fused GEMM→all-reduce / reduce-scatter, as a torch operator: **1.22-1.31x** and **1.31-1.59x** over hipBLASLt + RCCL at prefill, on 2x W7900D. [Full writeup](kernels/rdna3/distributed/README.md) | not attempted |
-| attention | single-GPU SDPA forward, as a torch operator and an `F.scaled_dot_product_attention` drop-in: **62-63 TFLOPs**, **2.8-3.2x** the aotriton kernel every Radeon framework actually reaches, and 4-11% ahead of a hand-written Triton FA-2. [Full writeup](kernels/rdna3/attn/README.md) | not attempted |
+| attention | single-GPU SDPA forward, as a torch operator and an `F.scaled_dot_product_attention` drop-in: **64-65 TFLOPs**, **2.8-3.3x** the aotriton kernel every Radeon framework actually reaches, and 4-14% ahead of a hand-written Triton FA-2 (causal: 4.4x and 3-12%). [Full writeup](kernels/rdna3/attn/README.md) | not attempted |
 | fp8 | not available in hardware | implemented, all four opcodes, untested |
 
 **Read the second column as "written, not verified."** No gfx12 part was
@@ -320,23 +320,25 @@ improve with length. B=1, H=56, D=128, all three backends in one process:
 
 | | N=4096 | N=16384 | 49920 (480p/5s) | N=65536 |
 |---|---|---|---|---|
-| HipKittens | 59.3 TF | 62.4 TF | 63.3 TF | **63.4 TF** |
-| vs aotriton | 2.81× | 3.00× | 3.15× | 3.14× |
-| vs a hand-written Triton FA-2 | 1.04× | 1.07× | 1.10× | 1.11× |
+| HipKittens | 59.8 TF | 63.9 TF | 65.0 TF | **64.8 TF** |
+| vs aotriton | 2.83× | 3.07× | 3.25× | 3.21× |
+| vs a hand-written Triton FA-2 | 1.04× | 1.09× | 1.13× | 1.14× |
 
-At 62–63 TF this is 63% of the chip's WMMA ceiling and within 7% of the best
+At 63–65 TF this is 65% of the chip's WMMA ceiling and within 4% of the best
 bf16 GEMM measured on it — for an operation with a softmax in the middle. The
 margin over Triton widens with length as staging amortizes; the two are close to
-level at N=4096. The honest summary is "2.8–3.2× the backend a Radeon actually
-uses today, and 4–11% ahead of the best thing you could write in Triton."
+level at N=4096. The honest summary is "2.8–3.3× the backend a Radeon actually
+uses today, and 4–14% ahead of the best thing you could write in Triton."
 
-**With causal masking the margin over Triton nearly disappears:** 3.8–4.1×
-aotriton (which loses efficiency per surviving FLOP when the mask goes on) but
-only **1.00–1.03× the Triton baseline**. The cause is identified and not fixed:
-the KV loop bound must be uniform across a workgroup, so it is taken from the
-last query in a 192-query tile, and waves holding earlier queries stage up to six
-KV blocks whose scores they then skip. H3 is non-causal, which is why that was
-left.
+**With causal masking the picture is now the same:** 3.9–4.4× aotriton (which
+loses efficiency per surviving FLOP when the mask goes on) and **1.03–1.12× the
+Triton baseline** — 49.1 / 59.5 / 61.8 / 61.7 TF at those four lengths. Causal
+used to be the weak result at 1.00–1.03× Triton; three things moved it, and the
+largest was a one-line change to dispatch order. Under causal the grid is a
+ramp (workgroup *i* does *i*+1 KV blocks) and workgroups reach the WGPs roughly
+in index order, so the machine drains with a tail of the longest ones.
+Reversing the q index is longest-processing-time-first and is worth **+3.6%**,
+at zero register cost and provably inert for non-causal.
 
 Both tables are a correction of earlier ones that had non-causal at 59–60 TF and
 causal *behind* Triton. The kernel was leaving ~5% on the floor to an occupancy
@@ -347,6 +349,16 @@ meant discarding a set of A/B measurements taken across separate processes,
 which on this node invents differences of 13–16%; the
 [writeup](kernels/rdna3/attn/README.md#the-sweep-measured-the-wrong-instantiation)
 describes both mistakes, since both are easy to repeat.
+
+The second general lesson from tuning this, which cost two wrong predictions: an
+**ablation share measures work deleted, not time recoverable.** Staging is 18%
+of the runtime by ablation, and halving the staged bytes returned ~1%, because
+the co-resident workgroup on the same WGP was already covering it. The
+prediction from the same table that *did* pay out was the softmax line — most
+of which is one rescale multiply over all 64 accumulator registers, on every KV
+block, that is exactly a no-op whenever the running max did not grow. Guarding
+it with an exact equality test (not a tolerance — the output is bit-identical)
+returned ~2%.
 
 Almost none of this is a transcription of the CUDA or CDNA flash attention.
 gfx11's WMMA fragment layouts are different enough that the *shape of the

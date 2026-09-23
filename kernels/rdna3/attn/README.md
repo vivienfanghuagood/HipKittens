@@ -19,9 +19,9 @@ This directory is a single-GPU flash-attention forward that is not.
               can actually run today
 
        N        HipKittens      aotriton      triton FA-2
-    4096          59.3 TF         21.1 TF        57.2 TF
-   16384          62.4 TF         20.8 TF        58.5 TF
-   49920          63.3 TF         20.1 TF        57.4 TF     <- 480p/5s of H3
+    4096          59.8 TF         21.1 TF        57.4 TF
+   16384          63.9 TF         20.8 TF        58.4 TF
+   49920          65.0 TF         20.0 TF        57.4 TF     <- 480p/5s of H3
 ```
 
 The target is [MiniMax H3](#1-the-shape-that-drove-every-decision), a video+audio
@@ -194,7 +194,7 @@ a row/col operand pair is bit-identical on gfx11 (see the note above
 choice is purely about which layout *tag* the tiles get to carry — which is to
 say, purely about which of them is allowed to be read with `ds_read_b128`.
 
-### 2.4 Two small things that follow
+### 2.4 Three small things that follow
 
 **`exp2`, not `exp`.** One hardware instruction instead of a sequence. `log2(e)`
 is folded into the softmax scale. The scale is applied to the *fp32 scores*, not
@@ -211,6 +211,24 @@ twice in the softmax denominator. That masking is free — a row of `Sᵀ` is a 
 index, which is the element axis, so it is register-local with no cross-lane
 traffic. This is the same asymmetry as in the GEMM's M and K remainders, for the
 same reason.
+
+**The rescale is skipped when it is exactly a no-op** (`RESCALE_SKIP`, on). The
+online softmax's `mul_col(o_t, o_t, alpha)` is the largest single VALU item in
+the inner loop — `o_t` is `HEAD_DIM/16 = 8` fp32 col base tiles of 8 registers,
+so 64 `v_mul_f32` against the block's 32 WMMAs, every KV block. But `col_max`
+writes `m_new = max(m_old, block_max)`, so a block that raises no row's max
+leaves `m_new` **bitwise** identical to `m_old`, `alpha = exp2(0) = 1` exactly,
+and all 64 multiplies are a guaranteed no-op that the kernel pays for anyway.
+After the first few KV blocks the running max is usually already the global max,
+so most blocks are in that case. Guarding the rescale with a wave-uniform
+`__any(m_new != m_old)` is worth **+2.4% / +1.6% non-causal** and **+2.1% /
++1.8% causal** (N=4096/16384, interleaved), at zero register cost — all four
+instantiations compile to the same VGPR counts.
+
+Note what this is *not*: the CDNA4 kernel's `RESCALE_THRESHOLD` skips when
+`alpha` is merely *close* to 1, which changes the answer. This test is an
+equality on floats that were produced by a `max` of each other, so it is exact
+and the output is bit-identical to the unguarded kernel.
 
 ---
 
@@ -483,8 +501,10 @@ the prefetch gained. `PV_TILES=2` gives the registers back and both directions
 move together.
 
 Shipped: `Q_BLOCK=16, KV_BLOCK=32, NUM_WARPS=12, VT_D_CHUNK=16, QK_TILES=2,
-PV_TILES=2, GPREFETCH=1, DBUF=0` → 227 VGPRs non-causal / 240 causal, 0 spill,
-0 scratch, occupancy 6 for both, **62.4 TF at N=16384**.
+PV_TILES=2, GPREFETCH=1, DBUF=0, RESCALE_SKIP=1, CAUSAL_LPT=1` → 227 VGPRs
+non-causal / 240 causal, 0 spill, 0 scratch, occupancy 6 for both, **63.9 TF at
+N=16384** (59.5 causal). The last two knobs were added after this sweep and cost
+no registers; they are §2.4 and §9.
 
 `fwd/ab.py` exists because of this measurement and is the harness to use for the
 next one. Driving `quickbench.py` from a shell loop rebuilds the `.so` between
@@ -550,6 +570,15 @@ left off. The V transposes and `ds_write`s are real instructions competing with
 the WMMAs for issue slots, so the way to get the rest is to issue fewer of them,
 not to hide them better.
 
+**A caveat on how to read this table, which cost two wrong predictions before it
+was written down.** These shares are *work deleted*, not *time recoverable*.
+Halving the staged bytes (`NUM_WARPS=24`, §12 item 1) should have been worth ~9%
+if staging's 18.3% were time the kernel spends waiting; it was worth ~1%,
+because the co-resident workgroup on the same WGP already covers it. The one
+prediction from this table that *did* pay out was the softmax line — 8.4% of
+which `mul_col(o_t, o_t, alpha)` is most, and skipping it when it is a no-op
+(§2.4) returned ~2%, in the right proportion.
+
 ---
 
 ## 7. Coverage: causal, GQA, head_dim 64
@@ -599,19 +628,20 @@ Measured, B=1 H=56 D=128, from the two [§9](#9-results) runs:
 
 ```
      N     non-causal          causal          wall-clock
-  4096    8.12 ms  59.3 TF   4.96 ms  48.5 TF     1.64x
-  8192   31.20 ms  61.7 TF  17.69 ms  54.4 TF     1.76x
- 16384  123.26 ms  62.4 TF  68.73 ms  56.0 TF     1.79x
+  4096    8.05 ms  59.8 TF   4.90 ms  49.1 TF     1.64x
+  8192   30.55 ms  63.0 TF  16.79 ms  57.3 TF     1.82x
+ 16384  120.41 ms  63.9 TF  64.72 ms  59.5 TF     1.86x
 ```
 
-(Causal TFLOPs use the usual halved-FLOP convention. 1.79× against an ideal 2× is
+(Causal TFLOPs use the usual halved-FLOP convention. 1.86× against an ideal 2× is
 three things: the diagonal blocks, which are computed whole; the load imbalance
 of a static grid where workgroup *i* does *i*+1 KV blocks; and the wave-level
 skip above, which saves the *math* but not the *staging* — a skipping wave has
 already paid for the K and Vᵀ it will not read, and `Q_TILE` is six `KV_BLOCK`s
-wide, so there can be six such blocks per workgroup. That third one is the
-largest, and it is why causal holds only 90% of the non-causal rate where the
-Triton baseline holds 95%; [§9](#causal--the-narrow-one) measures it.)
+wide, so there can be six such blocks per workgroup. The second of those is
+addressed by `CAUSAL_LPT`, which reverses the q index so the long workgroups are
+dispatched first (+3.6%, and 1.86× is *after* it). The third resisted the
+obvious fix — halving `Q_TILE` made things worse, see [§9](#causal).)
 
 ### GQA
 
@@ -709,43 +739,51 @@ a mis-dispatch cannot show up here as our number.
 
 ```
  shape          B   H       N     hk ms   hk TF  aotri ms  aotri TF  triton ms  triton TF
- N=4096         1  56    4096     8.116    59.3    22.793      21.1      8.406       57.2
- N=8192         1  56    8192    31.200    61.7    92.501      20.8     33.045       58.2
- N=16384        1  56   16384   123.257    62.4   369.788      20.8    131.544       58.5
- N=32768        1  56   32768   487.330    63.2  1542.351      20.0    534.019       57.7
- 480p/5s        1  56   49920  1128.293    63.3  3558.576      20.1   1245.482       57.4
- N=65536        1  56   65536  1943.072    63.4  6094.315      20.2   2148.842       57.3
- N=16384 cfg    2  56   16384   245.389    62.7   738.767      20.8    263.033       58.5
+ N=4096         1  56    4096     8.048    59.8    22.832      21.1      8.381       57.4
+ N=8192         1  56    8192    30.550    63.0    92.555      20.8     33.053       58.2
+ N=16384        1  56   16384   120.406    63.9   369.913      20.8    131.704       58.4
+ N=32768        1  56   32768   475.444    64.8  1547.554      19.9    533.458       57.7
+ 480p/5s        1  56   49920  1099.301    65.0  3567.731      20.0   1245.248       57.4
+ N=65536        1  56   65536  1899.398    64.8  6082.032      20.2   2170.865       56.7
+ N=16384 cfg    2  56   16384   239.453    64.3   738.995      20.8    262.873       58.6
 ```
 
 | | vs aotriton (what diffusers/comfyUI run) | vs the Triton FA-2 (the vLLM/SGLang stand-in) |
 |---|---|---|
-| N=4096 | 2.81× | 1.04× |
-| N=8192 | 2.97× | 1.06× |
-| N=16384 | 3.00× | 1.07× |
-| N=32768 | 3.16× | 1.10× |
-| 480p/5s (49920) | 3.15× | **1.10×** |
-| N=65536 | 3.14× | 1.11× |
-| N=16384 CFG | 3.01× | 1.07× |
+| N=4096 | 2.83× | 1.04× |
+| N=8192 | 3.03× | 1.08× |
+| N=16384 | 3.07× | 1.09× |
+| N=32768 | 3.26× | 1.12× |
+| 480p/5s (49920) | 3.25× | **1.13×** |
+| N=65536 | 3.21× | 1.14× |
+| N=16384 CFG | 3.09× | 1.10× |
 
 Two things worth saying plainly about that table.
 
-**aotriton does not scale, and this does.** aotriton is flat at 20.0–21.1 TF
-across a 16× range of sequence length. Ours holds 62–63 TF from N=8192 to
-N=65536, which on a machine whose measured WMMA ceiling is ~100 TF is about 63%
+**aotriton does not scale, and this does.** aotriton is flat at 19.9–21.1 TF
+across a 16× range of sequence length. Ours holds 63–65 TF from N=8192 to
+N=65536, which on a machine whose measured WMMA ceiling is ~100 TF is about 65%
 of peak — for an operation that is not a GEMM and has a softmax in the middle of
 it. For reference, hipBLASLt's 4096³ bf16 GEMM on this chip is 67.6 TF and our
-own GEMM is 77.2. Attention here is within 7% of this machine's *best measured
+own GEMM is 77.2. Attention here is within 4% of this machine's *best measured
 GEMM*, which is the number that says the inner loop is close to done.
 
 **The Triton baseline is genuinely good, and the margin over it is single-digit
-percent.** 4–11%, widening with sequence length: the two are level at N=4096 and
-we pull away as staging amortizes. That is a real but modest win, and it is the
-one that decides whether a serving stack would bother switching. The honest
-summary is "2.8–3.2× the backend a Radeon actually uses today, and 4–11% ahead
-of the best thing you could write in Triton."
+percent — low double digits at the long end.** 4–14%, widening with sequence
+length: the two are close at N=4096 and we pull away as staging amortizes. That
+is the margin that decides whether a serving stack would bother switching. The
+honest summary is "2.8–3.3× the backend a Radeon actually uses today, and 4–14%
+ahead of the best thing you could write in Triton."
 
-### Causal — the narrow one
+Run-to-run caution, since this margin is small enough for it to matter: the
+Triton baseline itself moves ~±3% between processes even though all three
+backends are interleaved *within* each process. One run of the table above
+returned 53.4–56.2 TF for Triton instead of 56.7–58.6, which would have turned
+"4–14%" into "12–22%". Two runs agreeing on 56.7–58.6 is why the smaller
+number is the one published. Cross-variant ratios inside one process are
+trustworthy (§5); a single run's absolute numbers are not.
+
+### Causal
 
 Same harness, `--causal`, same discipline — one process, one run, interleaved.
 TFLOPs count half the non-causal work for all three backends alike, which
@@ -754,55 +792,61 @@ as empty), but flatters them identically.
 
 ```
  shape          B   H       N     hk ms   hk TF  aotri ms  aotri TF  triton ms  triton TF
- N=4096         1  56    4096     4.960    48.5    18.954      12.7      5.041       47.7
- N=8192         1  56    8192    17.694    54.4    69.993      13.7     17.765       54.2
- N=16384        1  56   16384    68.734    56.0   271.424      14.2     68.980       55.8
- N=32768        1  56   32768   268.407    57.4  1099.765      14.0    276.668       55.6
- 480p/5s        1  56   49920   622.927    57.4  2547.595      14.0    641.359       55.7
- N=65536        1  56   65536  1088.885    56.5  4371.985      14.1   1110.056       55.5
- N=16384 cfg    2  56   16384   134.956    57.0   545.927      14.1    136.839       56.2
+ N=4096         1  56    4096     4.897    49.1    18.986      12.7      5.038       47.7
+ N=8192         1  56    8192    16.794    57.3    70.215      13.7     18.015       53.4
+ N=16384        1  56   16384    64.721    59.5   271.794      14.2     69.199       55.6
+ N=32768        1  56   32768   251.007    61.3  1092.933      14.1    276.396       55.7
+ 480p/5s        1  56   49920   578.328    61.8  2537.221      14.1    641.645       55.7
+ N=65536        1  56   65536   998.690    61.7  4367.527      14.1   1114.480       55.2
+ N=16384 cfg    2  56   16384   128.521    59.9   544.103      14.1    136.475       56.4
 ```
 
 | | vs aotriton | vs the Triton FA-2 |
 |---|---|---|
-| N=4096 | 3.82× | 1.02× |
-| N=8192 | 3.97× | **1.00×** |
-| N=16384 | 3.94× | 1.00× |
-| N=32768 | 4.10× | 1.03× |
-| 480p/5s (49920) | 4.10× | 1.03× |
-| N=65536 | 4.01× | 1.02× |
-| N=16384 CFG | 4.04× | 1.01× |
+| N=4096 | 3.87× | 1.03× |
+| N=8192 | 4.18× | 1.07× |
+| N=16384 | 4.19× | 1.07× |
+| N=32768 | 4.35× | 1.10× |
+| 480p/5s (49920) | 4.38× | **1.11×** |
+| N=65536 | 4.37× | 1.12× |
+| N=16384 CFG | 4.25× | 1.06× |
 
 **Against aotriton the causal margin is larger, and that is aotriton's doing,
 not ours.** It falls from ~20.5 TF to ~14 TF when the mask is switched on — it
 gets *less* efficient per surviving FLOP, so halving its work does not halve its
 time.
 
-**Against the Triton baseline, causal is a tie to a 3% win, and that is worth
-stating as the weak result it is.** Non-causal we are 4–11% ahead; causal the
-margin collapses to 0–3%. The kernel keeps 90% of its non-causal throughput
-(62.4 → 56.0 TF at N=16384) where Triton keeps 95%, and the remaining cause is
-the staging this shape does for blocks it then throws away. `Q_TILE` is
-`NUM_WARPS × Q_BLOCK` = 192 queries, six times `KV_BLOCK`; the KV loop bound has
-to be uniform across the workgroup, so it is taken from the *last* query in the
-tile, and the waves holding earlier queries stage and barrier through up to six
-KV blocks whose scores they will skip entirely. It is fixable — a smaller
-`Q_TILE` under causal, or a wave-major work assignment that puts the whole
-workgroup on the same diagonal — and it has not been done, because the target is
-non-causal.
+**Against the Triton baseline, causal is now 3–12% ahead, in line with
+non-causal.** This section used to be titled "the narrow one" and reported a tie.
+Three fixes moved it, and the order they were found in is the interesting part:
 
-This table is a correction of an earlier one that had causal 1–9% *behind*
-Triton and blamed that deficit on the skipped-block staging above. Two things
-were wrong with it. The larger was a tiling bug found later and fixed —
-`PV_TILES` was set from a sweep that only ever measured non-causal, and the
-causal instantiation it produced sat one VGPR granule over an occupancy cliff
-(§5). The smaller was measurement: the old table's Triton N=4096 number, 51.7
-TF, does not reproduce — two fresh runs put it at 46.8 and 47.7 — so the
-headline "9% behind" was mostly that one noisy cell. The staging explanation
-survives, but as the *residual* rather than the whole story.
+1. **`PV_TILES`** (§5). The sweep that set it only ever measured *non-causal*,
+   and the causal instantiation it produced sat one VGPR granule over an
+   occupancy cliff. This was the whole of the original "causal is behind Triton"
+   result, and it was a measurement error, not an algorithmic one.
+2. **The rescale skip** (§2.4), ~2%, which is not causal-specific.
+3. **Longest-processing-time-first dispatch**, `CAUSAL_LPT`, **+3.6%** and the
+   largest single win in this round. Under causal, workgroup *i* does *i*+1 KV
+   blocks — the grid is a ramp — and workgroups reach WGPs roughly in index
+   order, so the machine drains with a tail of the longest ones. Reversing the q
+   index starts the long workgroups first and lets the short ones fill the slots
+   they free. It is one line, it costs no registers, and it is provably inert
+   for non-causal (measured: 0.999× and 1.000×, i.e. noise).
 
-So the one-line causal summary is: **3.8–4.1× the backend a Radeon actually
-runs, and level with a good Triton FA-2.**
+What did *not* work, and is worth recording because it was the standing
+hypothesis: **narrowing `Q_TILE` under causal.** The KV loop bound must be
+uniform across the workgroup, so it is taken from the *last* query in a
+192-query tile, and waves holding earlier queries stage and barrier through up
+to six KV blocks whose scores they then skip. Halving the tile (`NUM_WARPS=8`,
+`Q_TILE=128`) halves that waste — and measured **−4.6% causal** at N=16384
+(59.60 → 56.88) and −6% non-causal. The staging it saves does not pay for the
+amortization it gives up, which is the same lesson as §12 item 1: staging on
+this part is covered by the co-resident workgroup, so removing staging work does
+not return time. The residual causal gap is real but it is not reachable this
+way.
+
+So the one-line causal summary is: **3.9–4.4× the backend a Radeon actually
+runs, and 3–12% ahead of a good Triton FA-2.**
 
 ### Coverage
 
@@ -860,6 +904,13 @@ cd fwd && make TARGET=mod_a EXTRA_HIPFLAGS='-DPV_TILES=4 -DTK_MODULE_NAME=mod_a'
 cd fwd && make TARGET=mod_b EXTRA_HIPFLAGS='-DPV_TILES=2 -DTK_MODULE_NAME=mod_b'
 cd fwd && AB_CAUSAL=1 python3 ab.py mod_a mod_b
 
+# the same recipe against the two knobs added last, both of which are on by
+# default and both of which should be re-measured before any retuning:
+cd fwd && make TARGET=v_rs0 EXTRA_HIPFLAGS='-DRESCALE_SKIP=0 -DTK_MODULE_NAME=v_rs0'
+cd fwd && make TARGET=v_lpt0 EXTRA_HIPFLAGS='-DCAUSAL_LPT=0 -DTK_MODULE_NAME=v_lpt0'
+cd fwd && make TARGET=v_ship EXTRA_HIPFLAGS=-DTK_MODULE_NAME=v_ship
+cd fwd && AB_CAUSAL=1 python3 ab.py v_ship v_rs0 v_lpt0
+
 # per-stage attribution: same harness, with the correctness gate off because
 # the ABLATE_* builds are wrong on purpose
 cd fwd && for v in STAGE QK SOFTMAX PV LDS_READ; do lv=$(echo $v | tr A-Z a-z); \
@@ -912,27 +963,64 @@ In rough order of how much is left on the table.
 
    The reason `DBUF` disappoints is the finding itself: the V transposes and the
    `ds_write`s are *real work* competing with the WMMAs for the same SIMD issue
-   slots, so no amount of overlapping removes them. Getting this 28% back means
-   issuing fewer instructions to stage a byte, not hiding the ones there are —
-   which points at `Q_BLOCK=32` below, the only knob that reduces staged bytes
-   per FLOP.
+   slots, so no amount of overlapping removes them.
 
-2. **Fix `Q_BLOCK=32`.** It halves LDS traffic per FLOP, which is the only knob
-   that does, and per item 1 that is now the *only* remaining lever on staging.
-   It needs the `.tiles[r][0]` hardcoding removed *and* Q moved to LDS, because
-   `q` and `o_t` both double.
+   **But the 18% is not recoverable time either, and that is the more useful
+   half of the finding.** The other way to attack staging is to stage less
+   often, by widening `Q_TILE = Q_BLOCK * NUM_WARPS` — the global K/V traffic is
+   `N / Q_TILE` passes over all of K and V. `NUM_WARPS=24` doubles `Q_TILE` and
+   therefore *halves the staged bytes*, which should be worth ~9% if the 18%
+   ablation share were time that could be won back. Interleaved in one process:
 
-3. **Causal: stop staging blocks the waves are going to skip.** Causal is the
-   narrow result (level with Triton, against 4–11% ahead non-causal, §9) and this
-   is the cause that survives: the KV loop bound is uniform across the workgroup
-   and therefore taken from the *last* query in a 192-query tile, so waves
-   holding earlier queries stage up to six KV blocks they then skip. A smaller
-   `Q_TILE` when `CAUSAL` (fewer waves per workgroup, so a tighter uniform bound)
-   is the cheapest fix and needs no restructuring — it is a template parameter
-   already. Separately, the static grid leaves workgroup *i* doing *i*+1 KV
-   blocks; pairing block *i* with block *n-1-i* is the standard fix for that, and
-   both together are worth most of the gap between the measured 1.79× and the
-   ideal 2×.
+   | variant | N=4096 | N=16384 |
+   |---|---|---|
+   | 12 warps (shipped) | 59.93 | 62.52 |
+   | 12 warps + `DBUF` | 59.90 | 62.41 |
+   | 24 warps | 59.69 | 61.82 |
+   | 24 warps + `DBUF` | 60.99 | 63.01 |
+
+   +1.8% / +0.8%, and only with `DBUF` back on. At 12 warps there are **two
+   workgroups per WGP and the co-resident one already covers staging**; 24 warps
+   buys the amortization but gives up the cover, and `DBUF` only claws back the
+   barrier half of what that costs. Not shipped — it also doubles `Q_TILE` to
+   384, below which the drop-in falls back.
+
+   The general lesson, which cost two wrong models before it was stated: **an
+   ablation share measures work *deleted*, not time *recoverable*.** Deleting a
+   stage tells you what it costs to execute; it does not tell you that anything
+   was waiting on it.
+
+2. **`Q_BLOCK=32` is dead at `HEAD_DIM=128`.** An earlier draft of this list had
+   it as the top remaining lever. It is not available, and the arithmetic is
+   short enough to settle it: at `Q_BLOCK=32`, `o_t` is 32×128 fp32 col = 128
+   VGPRs and `q` is 32×128 bf16 row = 128 more. `o_t` cannot leave registers, so
+   the only escape is Q in LDS, at `NUM_WARPS * 32 * 128 * 2` bytes:
+
+   | warps | Q in LDS | + K/Vᵀ | `Q_TILE` | |
+   |---|---|---|---|---|
+   | 12 | 96 KB | — | 384 | busts the 64 KB budget |
+   | 8 | 64 KB | 80 KB | 256 | busts it |
+   | 6 | 48 KB | 64 KB | 192 | fits, but `Q_TILE` is what it is today |
+
+   Every row either exceeds the 64 KB/workgroup limit or fails to raise `Q_TILE`
+   at all. And per item 1, raising `Q_TILE` is worth ~1% anyway. At
+   `HEAD_DIM=64` all four numbers halve and the 12-warp row fits, so this is a
+   live option *there* — which is the instantiation that is already fastest.
+
+3. **Causal: stop staging blocks the waves are going to skip.** Two of the three
+   causes listed in §7 have now been dealt with — the grid imbalance by
+   `CAUSAL_LPT` (+3.6%) and the `PV_TILES` occupancy cliff (§5) — and causal is
+   no longer the narrow result (3–12% ahead of Triton, against 4–14%
+   non-causal). What is left is this one: the KV loop bound is uniform across
+   the workgroup and therefore taken from the *last* query in a 192-query tile,
+   so waves holding earlier queries stage up to six KV blocks they then skip.
+
+   **The obvious fix has been tried and is negative.** A smaller `Q_TILE` under
+   causal (`NUM_WARPS=8`) halves the wasted staging and measures −4.6% causal at
+   N=16384. Do not retry it. What is left untried is a work assignment that puts
+   the whole workgroup on the same diagonal, which removes the waste without
+   giving up `Q_TILE` — that needs the KV bound to stop being a workgroup-wide
+   scalar, which is a real restructuring of the staging loop, not a knob.
 
 4. **fp16.** One more instantiation.
 

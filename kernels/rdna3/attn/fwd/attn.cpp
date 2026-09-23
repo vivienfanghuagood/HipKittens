@@ -63,14 +63,14 @@ using namespace kittens;
 #endif
 // Warps per workgroup, which is also the Q tile: Q_TILE = Q_BLOCK * NUM_WARPS,
 // and every warp in the workgroup reads the same staged K and V^T. So this is
-// the knob that amortizes staging, which the ablation table puts at 28% of the
+// the knob that amortizes staging, which the ablation table puts at 18% of the
 // runtime -- the global K/V traffic is (N / Q_TILE) passes over the whole of K
 // and V, so a wider workgroup divides it down.
 //
 // The measured shape of this knob is not "wider is better", it is a comb:
 //
 //     warps    8    10    12    14    16    24
-//     TF    56.8  51.2  59.7  43.5  49.5  56.2   (N=16384)
+//     TF    56.8  51.2  59.7  43.5  49.5  56.2   (N=16384, cross-process)
 //
 // At 221 VGPRs the occupancy limit is 6 waves/SIMD, i.e. 24 waves per CU, and
 // what matters is whether NUM_WARPS divides that. 8 and 12 do (3 and 2
@@ -78,6 +78,23 @@ using namespace kittens;
 // the loss swamps the staging they save. Among the divisors, 12 wins because it
 // stages half as often as 8. 24 divides it too but leaves one workgroup per CU,
 // with nothing to cover its barriers.
+//
+// That comb was measured one build per process, which ab.py exists to say is
+// not comparable; the ranking survived a single-process rerun but the spreads
+// did not. Interleaved (ab.py, N=4096/16384 non-causal):
+//
+//     warps 12       59.93  62.52      <- shipped
+//     warps 12 +DBUF 59.90  62.41
+//     warps 24       59.69  61.82
+//     warps 24 +DBUF 60.99  63.01      <- +1.8% / +0.8%
+//
+// So the whole Q_TILE lever is worth about 1%, not the 9% that halving the
+// staged bytes should buy if staging's 18% ablation share were recoverable
+// time. It is not: at 12 warps there are two workgroups per WGP and the
+// co-resident one already covers staging. 24 warps buys the amortization but
+// gives up the cover (one workgroup per WGP), and DBUF only claws back the
+// barrier half of what that costs. Not shipped: it also doubles Q_TILE to 384,
+// which the drop-in would have to fall back below.
 //
 // The cost is coverage at the bottom end: Q_TILE is 192 rather than 128, so the
 // kernel needs N >= 192 and the drop-in falls back below that. For H3, where N
@@ -105,8 +122,10 @@ using namespace kittens;
 // hides LDS latency under the WMMAs; smaller leaves room for Q and the
 // accumulator, which are 128 VGPRs between them and cannot move.
 //
-// PV_TILES was 4 and is now 2, which is worth 13-16% on causal and 2%
-// non-causal. The VGPR allocation granule here is 24, so occupancy 6 needs
+// PV_TILES was 4 and is now 2, which is worth 5% on causal and 2% non-causal.
+// (The first measurement of this said 13-16% on causal. That was one build per
+// process -- see ab.py. Interleaved against git HEAD in a single process it is
+// 5%.) The VGPR allocation granule here is 24, so occupancy 6 needs
 // <= 240 VGPRs; PV_TILES=4 put the *causal* instantiation at 252 and dropped it
 // to 5 waves/SIMD, while the non-causal one squeaked in at 238. That, and not
 // the staging overrun this file used to blame, is most of why causal was
@@ -180,6 +199,30 @@ using namespace kittens;
 // cheaper (a wider KV_BLOCK, or an architecture with global->LDS DMA).
 #ifndef DBUF
 #define DBUF 0
+#endif
+
+// Skip the accumulator rescale on KV blocks that did not raise any row's max.
+//
+// col_max writes m_new = max(m_old, block_max), so a block that raises nothing
+// leaves m_new *bitwise* identical to m_old, alpha = exp2(0) = 1 exactly, and
+// both mul(l_run, alpha) and mul_col(o_t, alpha) are exact no-ops. The test is
+// an equality, not a tolerance, so this changes no bit of the output -- unlike
+// the CDNA4 kernel's RESCALE_THRESHOLD, which skips when alpha is merely close
+// to 1 and is therefore an approximation.
+//
+// Worth doing because mul_col(o_t, ...) is the single largest VALU item in the
+// inner loop: o_t is HEAD_DIM/16 = 8 fp32 col base tiles of 8 registers, so 64
+// v_mul_f32 against the block's 32 WMMAs. After the first few KV blocks the
+// running max is usually already the global max and every one of those 64 is
+// wasted.
+#ifndef RESCALE_SKIP
+#define RESCALE_SKIP 1
+#endif
+
+// Longest-processing-time-first dispatch order for the causal grid. See the
+// note at q_block in micro_tk.
+#ifndef CAUSAL_LPT
+#define CAUSAL_LPT 1
 #endif
 
 // Ablation switches. Each makes the result wrong on purpose; they exist to time
@@ -527,7 +570,20 @@ void micro_tk(const GL g) {
     // overlap are computed twice from identical inputs and written twice with
     // identical values -- idempotent, not a race. The same trick is in the GEMM;
     // see the long note there.
-    const int q_tile_start = min((int)blockIdx.x * Q_TILE, N - Q_TILE);
+    // Under CAUSAL the work per workgroup is not uniform: workgroup i does i+1
+    // KV blocks, so the dispatch is a ramp. Workgroups are handed to WGPs
+    // roughly in index order, which means the *last* ones dispatched are the
+    // longest and the machine drains with a tail of them. Reversing the q index
+    // is longest-processing-time-first: the long workgroups start while there is
+    // still short work left to fill the slots they free. It is an index
+    // permutation within one head, so it does not disturb the grid's K/V
+    // locality (x is still the fastest-varying axis; see the launch).
+#if CAUSAL_LPT
+    const int q_block      = CAUSAL ? (gridDim.x - 1 - (int)blockIdx.x) : (int)blockIdx.x;
+#else
+    const int q_block      = (int)blockIdx.x;
+#endif
+    const int q_tile_start = min(q_block * Q_TILE, N - Q_TILE);
     const int q_row        = q_tile_start + warp_id * Q_BLOCK;
 
     // exp2 rather than exp: one hardware instruction. log2(e) is folded into the
@@ -965,6 +1021,24 @@ void micro_tk(const GL g) {
         sub_col(s_t, s_t, m_new);
         exp2(s_t, s_t);                  // s_t is P^T from here
 
+#if RESCALE_SKIP
+        // Wave-uniform: every lane holds the whole q range of this warp's tile
+        // in m_*, so the branch is taken or not taken for the wave as a whole.
+        bool grew = false;
+        #pragma unroll
+        for (int o = 0; o < rv_t::outer_dim; o++)
+            #pragma unroll
+            for (int i = 0; i < rv_t::inner_dim; i++)
+                grew |= (m_new.data[o][i] != m_old.data[o][i]);
+        if (__any(grew)) {
+            sub(alpha, m_old, m_new);
+            exp2(alpha, alpha);          // 0 on the first block, where m_old = -inf
+            mul(l_run, l_run, alpha);
+            mul_col(o_t, o_t, alpha);
+        }
+        col_sum(l_run, s_t, l_run);
+        copy(m_old, m_new);
+#else
         sub(alpha, m_old, m_new);
         exp2(alpha, alpha);              // 0 on the first block, where m_old = -inf
 
@@ -972,6 +1046,7 @@ void micro_tk(const GL g) {
         col_sum(l_run, s_t, l_run);
         mul_col(o_t, o_t, alpha);
         copy(m_old, m_new);
+#endif
 #endif
 
 #if HK_DUMP == 4
