@@ -13,6 +13,7 @@ the work here lives on the `rdna` branch, on top of `de0cddbd`.
 | unit tests | **1659 passed, 0 failed** on a W7900D | compiles; **never executed** |
 | bf16 GEMM | **77.2 TFLOPs** peak, 77% of the measured WMMA ceiling. 107-119% of the best AMD library *in HipKittens' own layout*; 85-93% of that library when it is free to pick its own | compiles; never executed |
 | distributed | fused GEMM→all-reduce / reduce-scatter, as a torch operator: **1.22-1.31x** and **1.31-1.59x** over hipBLASLt + RCCL at prefill, on 2x W7900D. [Full writeup](kernels/rdna3/distributed/README.md) | not attempted |
+| attention | single-GPU SDPA forward, as a torch operator and an `F.scaled_dot_product_attention` drop-in: **59-60 TFLOPs**, **2.7-3.0x** the aotriton kernel every Radeon framework actually reaches, and level with a hand-written Triton FA-2. [Full writeup](kernels/rdna3/attn/README.md) | not attempted |
 | fp8 | not available in hardware | implemented, all four opcodes, untested |
 
 **Read the second column as "written, not verified."** No gfx12 part was
@@ -91,14 +92,20 @@ and the README. That is deliberate and worth preserving: it tells a reader that
 if gfx12 fails, the bug is in `include/rdna4`, not in the tests.
 
 **Kernels**: `kernels/rdna3/gemm/bf16fp32` (measured, see its README),
-`kernels/rdna3/distributed` (measured on two GPUs, see its README), and
+`kernels/rdna3/distributed` (measured on two GPUs, see its README),
+`kernels/rdna3/attn/fwd` (measured on one GPU, see its README), and
 `kernels/rdna4/gemm/bf16fp32` (same source, gfx1201 target, untuned).
 
 ### Not covered
 
-- **Attention.** The library primitive it needs most — accumulator→operand
-  layout conversion via `permlanex16` — is implemented and tested on RDNA3, so
-  the road is open, but no attention kernel is written.
+- **Attention backward, paged/KV-cache attention, and fp16.** The forward
+  covers causal and non-causal, MHA and GQA, head_dim 64 and 128, bf16 — which
+  is inference, and only inference, for a dense model. Nothing here trains, and
+  nothing here reads a block table.
+- **Any end-to-end pipeline.** The attention kernel is compared against the
+  backends diffusers / comfyUI / vLLM / SGLang dispatch to, at the operator
+  level, on the shapes MiniMax H3 produces. No framework was run: the pod has
+  no network and no H3 weights.
 - **fp8 as anything but a WMMA operand.** No maps, reductions or vector ops on
   fp8 register tiles. `constants<fp8e4m3>` deliberately has no infinity, so a
   reduction over one is a compile error rather than a silently wrong answer.
@@ -295,10 +302,77 @@ could not use, and double-buffering costs one occupancy step there instead of
 two. fp8 will *not* help the math rate: gfx12's fp8 WMMA is 16×16×16, the same
 shape as bf16, not CDNA's K=32. One WMMA is one WMMA.
 
+## Attention
+
+A third kernel family: single-GPU SDPA forward, bf16 in and fp32 accumulate,
+targeting [MiniMax H3](kernels/rdna3/attn/README.md#1-the-shape-that-drove-every-decision) —
+a video+audio diffusion transformer, where softmax attention is over 85% of the
+transformer's runtime at the sequence lengths a real clip produces (a 480p/5s
+generation is 49 920 tokens).
+
+The comparison that matters is not against a paper. Every framework that runs
+attention on a Radeon — diffusers, comfyUI, vLLM, SGLang — calls
+`F.scaled_dot_product_attention`, and on ROCm/gfx1100 both the `FLASH` and the
+`EFFICIENT` backend land in the same aotriton kernel, `attn_fwd` (confirmed with
+the profiler, not inferred). That kernel is **flat at 19.8–21.2 TFLOPs from
+N=4096 to N=65536** — 21% of this chip's measured WMMA ceiling, and it does not
+improve with length. B=1, H=56, D=128, all three backends in one process:
+
+| | N=4096 | N=16384 | 49920 (480p/5s) | N=65536 |
+|---|---|---|---|---|
+| HipKittens | 56.9 TF | **59.9 TF** | 59.2 TF | 59.0 TF |
+| vs aotriton | 2.68× | 2.87× | 2.91× | 2.91× |
+| vs a hand-written Triton FA-2 | 0.99× | 1.02× | 1.03× | 1.03× |
+
+The Triton row is reported as measured: at N=4096 the Triton baseline is still
+1% ahead, and the gap only reverses from N=8192 up. The honest summary is
+"2.7–3.0× the backend a Radeon actually uses today, and level-to-slightly-ahead
+of the best thing you could write in Triton."
+
+**With causal masking the two rows move in opposite directions:** 3.7–3.9×
+aotriton (which loses efficiency per surviving FLOP when the mask goes on) but
+**0.91–0.99× the Triton baseline** — a loss of 1–9%. The cause is identified and
+not fixed: the KV loop bound must be uniform across a workgroup, so it is taken
+from the last query in a 192-query tile, and waves holding earlier queries stage
+up to six KV blocks whose scores they then skip. H3 is non-causal, which is why
+that was left.
+
+Almost none of this is a transcription of the CUDA or CDNA flash attention.
+gfx11's WMMA fragment layouts are different enough that the *shape of the
+algorithm* changes: **S is computed transposed** (Sᵀ = K·Qᵀ), because in the
+fp32 `col` accumulator the kv axis is the cheap element axis and the q axis is
+the lane axis, so online-softmax's max and sum over kv become eight in-lane
+steps plus one `permlanex16` instead of a four-step butterfly; **O is
+accumulated transposed** for the same reason; and **V is transposed on the way
+into LDS**, because only `row`-layout bf16 operands reach the vectorized
+`ds_read_b128` path and the `col` fallback costs 8× the instructions. Each of
+those falls out of a table in the library, not out of a choice. The derivation
+is [§2](kernels/rdna3/attn/README.md#2-the-derivation).
+
+Coverage is causal and non-causal, MHA and GQA, head_dim 64 and 128, sequence
+lengths that divide nothing — 24 shapes checked elementwise against an fp32
+reference. It ships as `torch.ops.hk_attn` plus a drop-in whose signature
+matches `F.scaled_dot_product_attention` exactly and which forwards to torch for
+anything it cannot take (masks, dropout, fp16, cross-attention, backward), so a
+framework integration is one import. Full writeup, including the tiling sweep
+and the per-stage ablation:
+[`kernels/rdna3/attn/README.md`](kernels/rdna3/attn/README.md).
+
 ## Notes for anyone continuing this
 
 Things that cost time and are written down so they cost it only once:
 
+- **`s_waitcnt` carries no register dependence, so `lds_wait<0>()` does not
+  keep a `v_wmma` below it.** This is the most expensive thing found in the
+  whole port. `lds_wait` is a bare `asm volatile("s_waitcnt lgkmcnt(0)")` with
+  no operands; the scheduler is free to hoist the consuming WMMA above it, and
+  then the fragment is read while the `ds_read` filling it is still in flight.
+  The symptom is a result that is wrong *sometimes*, with `ScratchSize` 0 and
+  nothing in the ISA looking out of place. The fix is a compiler-level data
+  dependence — `lds_bind` / `lds_wait_for` in `include/rdna3`, an empty
+  `asm volatile` tying the wait to the fragment registers — and it costs zero
+  instructions. It was silently corrupting the GEMM here too. Derivation and
+  the ISA diff: [`kernels/rdna3/attn/README.md#4`](kernels/rdna3/attn/README.md#4-the-bug-that-was-not-in-this-kernel).
 - **`s_waitcnt` is split on gfx12** into `s_wait_dscnt` / `s_wait_loadcnt` /
   `s_wait_storecnt` / `s_wait_kmcnt`. The trap is that the combined legacy
   `s_waitcnt lgkmcnt(0)` still *assembles* for gfx1201 — LLVM just never emits

@@ -24,8 +24,11 @@ We support CDNA3 and CDNA 4.
 > **This fork adds RDNA3 and RDNA4.** `include/rdna3` is complete and green on a
 > W7900 — 1659 unit tests, and a bf16 GEMM at 77% of the measured WMMA ceiling
 > that is **107-119% of the best AMD BLAS library in HipKittens' own layout**
-> (85-93% of it when the library is free to pick its own). `include/rdna4` is
-> written but has never run on hardware.
+> (85-93% of it when the library is free to pick its own). On top of it: a
+> **single-GPU SDPA forward at 2.7-3.0x the aotriton kernel** every Radeon
+> framework actually reaches, and **fused GEMM→all-reduce / reduce-scatter at
+> 1.22-1.59x** over hipBLASLt + RCCL, both shipped as torch operators.
+> `include/rdna4` is written but has never run on hardware.
 > See **[RDNA.md](RDNA.md)** for the state of it, what is verified and what is
 > not, and the three hardware facts the whole port is derived from.
 
