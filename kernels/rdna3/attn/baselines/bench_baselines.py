@@ -24,6 +24,7 @@ import warnings
 
 import torch
 import torch.nn.functional as F
+import triton
 from torch.nn.attention import SDPBackend, sdpa_kernel
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -97,6 +98,12 @@ def main():
     print(f"gpu     {torch.cuda.get_device_properties(0).gcnArchName}, "
           f"{torch.cuda.get_device_properties(0).multi_processor_count} WGPs")
     print(f"torch   {torch.__version__}")
+    # The Triton version belongs in the banner: triton_fa.py is JIT-compiled and
+    # autotuned by whatever is installed, and the ROCm backend moves between
+    # releases, so a triton-fa number is only comparable to another one from the
+    # same version. aotriton is *not* affected -- it is compiled ahead of time
+    # into the torch ROCm wheel and the installed triton package never sees it.
+    print(f"triton  {triton.__version__}  (triton-fa only; aotriton is AOT in the torch wheel)")
     print(f"clocks  {clocks()}")
     print(f"causal  {args.causal}\n")
 

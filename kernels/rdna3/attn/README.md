@@ -106,6 +106,21 @@ The second one turned out to matter a great deal. aotriton is easy to beat by
 2.7×; the hand-written Triton is not, and it is what the interesting part of the
 tuning work was actually against.
 
+**Versions, because the Triton number depends on them and the aotriton one does
+not.** Everything here runs `torch 2.10.0+rocm7.2.4` with
+**`triton 3.6.0+rocm7.2.4.git4ed88892`** — the wheel's own Triton, and the newer
+of the two relevant releases; 3.6 improved the ROCm backend measurably over 3.5.
+So `triton-fa` is being given the *favourable* version, which is the right way
+round for a baseline. An older Triton would make our margin look better and
+would not be a fair test; it also could not be installed here, since the pod has
+no network.
+
+aotriton is a different kind of artifact and is unaffected by any of this: it is
+compiled **ahead of time into the torch ROCm wheel**, and `F.sdpa` dispatches
+into it without the installed `triton` package ever being involved. Its flat
+~20 TF is a property of the ROCm 7.2.4 build, not of Triton 3.6.
+`bench_baselines.py` prints both versions in its banner for this reason.
+
 ---
 
 ## 2. The derivation
