@@ -935,6 +935,15 @@ static void dispatch_any(const GL &g) {
             if (deep)      launch<thin_sk8_config>(g);
             else if (quad) launch<thin_config>(g);
             else           launch<thin_sk1_config>(g);
+        } else if (g.a.rows() < thin32_config::BLOCK_M) {
+            // 17..31. The 32-row config would be the faster one, but the
+            // last-block backup that makes M remainders work needs
+            // M >= BLOCK_M: below that m_base pins to 0 and the kernel writes
+            // a whole 32-row tile into an M-row buffer, past its end. The
+            // 16-row config has two blocks here and keeps m_base in
+            // {0, M-16}, both in range. (M < 16 never reaches this branch;
+            // the padded staging above catches it.)
+            launch<thin_sk1_config>(g);
         } else {
             launch<thin32_config>(g);   // split-K does not pay at M > 16
         }

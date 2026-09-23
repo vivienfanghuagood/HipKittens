@@ -42,6 +42,7 @@
 #include "../gemm/bf16fp32/gemm.cpp"
 
 #include "ipc_heap.cuh"
+#include "fused.cuh"   // micro_globals_rs, combine_n, dev_barrier
 
 #include <chrono>
 #include <cstdio>
@@ -51,28 +52,6 @@
 #include <unistd.h>
 
 using namespace hk_dist;
-
-// Globals for the fused epilogue, identical to gemm_rs.hip's. c is my shard of
-// the output; v and c_sym say where everyone else's shard of my partial goes.
-// Nothing here mentions a peer count: v.translate(c_sym, owner) is correct for
-// any world, which is the whole reason the epilogue takes a sym_view rather
-// than a gl.
-struct micro_globals_rs {
-    _gl_A a;
-    _gl_B b;
-    _gl_C c;        // my shard (shard_rows, N), local
-    sym_view v;
-    bf16 *c_sym;    // my slot of the inbox; translate() re-points it at an owner
-    int shard_rows;
-    int my_rank;
-    hipStream_t stream;
-
-    static constexpr bool FUSED_RS = true;
-    // This policy is reduce-scatter; the all-reduce one lives in
-    // gemm_ar_mp.hip. Both flags exist on every globals struct so the
-    // shared epilogue can select on them without a trait.
-    static constexpr bool FUSED_AR = false;
-};
 
 // The generators from gemm_rs.hip, unchanged. A and B are built from *global*
 // indices, so a rank can materialise its own K-slice and also the whole matrix
@@ -110,41 +89,6 @@ __global__ void fill_b(bf16 *p, int rows, int k_local, int k_off) {
     const size_t n = (size_t)rows * k_local;
     for (; i < n; i += stride)
         p[i] = __float2bfloat16(gen_b((int)(i / k_local), k_off + (int)(i % k_local)));
-}
-
-// out += every other rank's partial of it, accumulated in fp32. The partials
-// are bf16 because that is what the GEMM epilogue emits; summing world-1 of
-// them in bf16 would throw away most of what little mantissa there is, and the
-// pass is entirely memory-bound so the wider accumulator is free.
-//
-// Slot me is skipped rather than zeroed: my own tiles went straight to `out`.
-//
-// The inbox loads are nontemporal, and that is a correctness requirement, not a
-// hint. The inbox lives in my HBM but is written by a peer over PCIe, and that
-// write does not invalidate my L2 -- so the zeros I memset into the inbox
-// myself, which are still sitting in my L2, are what an ordinary load returns,
-// and the peer's partial contributes nothing. It cost rel 0.6 on rank 1 while
-// every after-the-fact comparison of the same bytes read rel 0, because by then
-// the lines had aged out. __builtin_nontemporal_load emits the glc/slc/dlc
-// bypass bits; nothing else available here does. No locality is lost -- each
-// inbox element is read exactly once.
-__device__ inline float inbox_load(const bf16 *p) {
-    unsigned short w = __builtin_nontemporal_load(
-        reinterpret_cast<const unsigned short *>(p));
-    bf16 v; __builtin_memcpy(&v, &w, sizeof(v));
-    return __bfloat162float(v);
-}
-
-__global__ void combine_n(bf16 *out, const bf16 *inbox, size_t n,
-                          int world, int me) {
-    size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
-    const size_t stride = (size_t)gridDim.x * blockDim.x;
-    for (; i < n; i += stride) {
-        float acc = __bfloat162float(out[i]);
-        for (int r = 0; r < world; r++)
-            if (r != me) acc += inbox_load(inbox + (size_t)r * n + i);
-        out[i] = __float2bfloat16(acc);
-    }
 }
 
 __global__ void err_scale(const bf16 *got, const bf16 *ref, size_t n,
@@ -202,6 +146,7 @@ __global__ void err_scale(const bf16 *got, const bf16 *ref, size_t n,
 // workgroup on one WGP is the floor. Whatever it does cost is charged honestly,
 // since the gemm_only baseline runs without it.
 //
+// dev_barrier itself is in fused.cuh, with the argument for host flags.
 // The deadline is not optional. The failure mode of a rank that died is every
 // survivor spinning in a kernel nothing will ever satisfy, and on this node the
 // cure for that is a device reset. A bounded wait turns it into a printed
@@ -210,22 +155,6 @@ __global__ void err_scale(const bf16 *got, const bf16 *ref, size_t n,
 // with its high word forced to zero, making every deadline built on it
 // meaningless. wall_clock64() is a real 64-bit counter at
 // hipDeviceAttributeWallClockRate.
-#define SPIN_TICK __asm__ __volatile__("" ::: "memory")
-
-__global__ void dev_barrier(uint32_t *flags, uint32_t epoch, int world, int me,
-                            long long budget, unsigned *timed_out) {
-    const int r = threadIdx.x;
-    if (r >= world) return;
-    if (r == me)
-        __hip_atomic_store(flags + me, epoch, __ATOMIC_RELEASE,
-                           __HIP_MEMORY_SCOPE_SYSTEM);
-    const long long t0 = wall_clock64();
-    while (__hip_atomic_load(flags + r, __ATOMIC_ACQUIRE,
-                             __HIP_MEMORY_SCOPE_SYSTEM) < epoch) {
-        SPIN_TICK;
-        if (wall_clock64() - t0 > budget) { atomicExch(timed_out, epoch); return; }
-    }
-}
 
 // Two things were tried here and did not work, both worth not retrying.
 //
