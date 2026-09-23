@@ -193,6 +193,61 @@ template<int N=0> __device__ inline void lds_wait() {
     asm volatile("s_waitcnt lgkmcnt(%0)" :: "i"(N) : "memory");
 }
 
+namespace detail {
+typedef float bind_v4f __attribute__((ext_vector_type(4)));
+
+// The offset is a template parameter, not a loop index, so every access is a
+// constant offset in the IR that SROA sees -- an object reached through a
+// runtime offset would be forced to scratch, which on a hand-waited kernel is
+// worse than the bug this is fixing.
+template<int I, int N, typename T> __device__ inline void bind_regs(T &x) {
+    if constexpr (I < N) {
+        bind_v4f v;
+        __builtin_memcpy(&v, (const char *)&x + I * sizeof(bind_v4f), sizeof(v));
+        asm volatile("" : "+v"(v));
+        __builtin_memcpy((char *)&x + I * sizeof(bind_v4f), &v, sizeof(v));
+        bind_regs<I + 1, N>(x);
+    }
+}
+}  // namespace detail
+
+/**
+ * @brief Re-establish the register dependence that s_waitcnt does not carry.
+ *
+ * `load_shared_vec4_async` writes its destination through an inline-asm *output*
+ * operand, so LLVM believes the value is ready the instant the asm statement
+ * ends. `lds_wait` is a separate volatile asm sharing no operands with it, and
+ * `v_wmma` is a pure builtin with no memory effect -- so nothing in the IR stops
+ * the scheduler from hoisting the consuming WMMA above the wait, and it does,
+ * nondeterministically, as soon as register pressure shifts. It is not a spill:
+ * ScratchSize stays 0 while the answer changes run to run.
+ *
+ * Binding the destination after the wait puts the missing edge back. The bind
+ * cannot move above the wait (volatile asm is ordered against volatile asm) and
+ * the consumer cannot move above the bind (it reads the bind's outputs). It
+ * costs nothing at runtime: "+v" ties each output to its own input register, so
+ * no instruction is emitted.
+ *
+ * Any tile loaded with `load<false>` and waited on by hand has to go through
+ * this (or through `lds_wait_for`, which does both) before it is used.
+ */
+template<typename T> __device__ inline void lds_bind(T &x) {
+    static_assert(sizeof(T) % sizeof(detail::bind_v4f) == 0,
+                  "lds_bind takes whole 128-bit register groups");
+    detail::bind_regs<0, sizeof(T) / sizeof(detail::bind_v4f)>(x);
+}
+
+/**
+ * @brief `lds_wait<N>()` followed by `lds_bind` on each tile it retires.
+ *
+ * The form to reach for: the wait alone is not enough to order a WMMA against
+ * the reads it is waiting on. See lds_bind.
+ */
+template<int N=0, typename... Ts> __device__ inline void lds_wait_for(Ts&... xs) {
+    lds_wait<N>();
+    (lds_bind(xs), ...);
+}
+
 /**
  * @brief Wait until at most `N` vector-memory loads are still outstanding.
  *

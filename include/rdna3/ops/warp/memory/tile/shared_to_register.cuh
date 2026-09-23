@@ -143,6 +143,11 @@ __device__ inline static void load(RT &dst, const ST &src) {
 
 /**
  * @brief Issue a tile's LDS reads without waiting for them. See load<false>.
+ *
+ * The caller owes this tile a `lds_wait_for<N>(dst)` -- not a bare `lds_wait`.
+ * The reads land through an inline-asm output operand, so nothing in the IR
+ * ties them to the wait, and a consuming WMMA will be scheduled above it. See
+ * `lds_bind` in memory/util/util.cuh.
  */
 template<ducks::rt::all RT, ducks::st::all ST>
 __device__ inline static void load_async(RT &dst, const ST &src) { load<false>(dst, src); }

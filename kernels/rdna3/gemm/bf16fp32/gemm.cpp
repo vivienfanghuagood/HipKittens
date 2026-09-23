@@ -348,6 +348,16 @@ void micro_tk(const GL g) {
     // chunks s+1.. are still moving. Chunk s's WMMAs then issue on top of them.
     // No tile is duplicated: the reads that overlap the math are reads this
     // slice had to do anyway, just not fenced in front of it.
+    //
+    // The waits below are lds_wait_for, not lds_wait, and that is a correctness
+    // requirement rather than a style: s_waitcnt carries no register dependence,
+    // so a v_wmma -- a pure builtin, with no memory effect for the "memory"
+    // clobber to order it against -- can be and is scheduled above the wait for
+    // the ds_read that feeds it. lds_wait_for binds the operand tiles after the
+    // wait and puts that edge back, at zero instructions. This kernel was
+    // shipping without it and was correct only by scheduling luck; the attention
+    // kernel next door is where the luck ran out. See lds_bind in
+    // include/rdna3/ops/warp/memory/util/util.cuh.
     auto load_A = [&](int buf, int k) {
         load<false>(A_tile, subtile_inplace<REG_BLOCK_M, DOT_SLICE>(As[buf], {warp_row, k}));
     };
@@ -389,7 +399,7 @@ void micro_tk(const GL g) {
             load_A(buf, k);
             static_for<N_SPLIT>([&](auto c) { load_B(buf, k, c); });
             static_for<N_SPLIT>([&](auto c) {
-                lds_wait<(N_SPLIT - 1 - c) * CHUNK_READS>();
+                lds_wait_for<(N_SPLIT - 1 - c) * CHUNK_READS>(A_tile, B_tile[c]);
                 mma_chunk(c);
             });
         }
@@ -411,7 +421,8 @@ void micro_tk(const GL g) {
                 // Slice NUM_SLICES-1's reads were all issued before the store,
                 // so its waits are the ones that have to count the writes.
                 constexpr int extra = (k == NUM_SLICES - 1) ? TAIL_OPS : 0;
-                lds_wait<reads_in_flight(k, c, N_SPLIT, NUM_SLICES, CHUNK_READS) + extra>();
+                lds_wait_for<reads_in_flight(k, c, N_SPLIT, NUM_SLICES, CHUNK_READS) + extra>(
+                    A_tile, B_tile[c]);
                 mma_chunk(c);
                 if constexpr (k + 1 < NUM_SLICES) {
                     if constexpr (c == N_SPLIT - 1) load_A(buf, k + 1);
