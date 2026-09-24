@@ -1,4 +1,29 @@
-# The write-up
+---
+name: kernel-writeup
+description: >
+  Write or review the README for a high-performance GPU kernel, using the
+  twelve-section structure the HipKittens RDNA3 kernels share: derivation from
+  hardware constraints, measured facts, the bug that took longest, the
+  register/LDS budget, the attribution table with its caveat, coverage, the
+  integration surface, results with baseline versions and ceiling percentages,
+  levers that were measured and are NOT levers, explicit scope limits,
+  reproduction commands, and a ranked list for whoever continues. Use when
+  documenting a finished or in-progress kernel, reviewing a kernel README for
+  what it is missing, or recording a negative result so it is not retried blind.
+  Usage: /kernel-writeup [<kernel-dir>]
+allowed-tools: Read Write Edit Bash Grep Glob
+---
+
+# Kernel Write-up
+
+## Pick the right skill first
+
+| Question | Skill |
+|---|---|
+| How do I document this kernel? | **this skill** |
+| What should the results table be? | `/kernel-ab-bench`, `/kernel-resource-check` |
+| What should the "where the time goes" table be? | `/kernel-attribution` |
+| What goes in the hardware-facts section for this hardware? | `/rdna3-kernel-facts` |
 
 The three kernels in `kernels/rdna3/` (GEMM, fused GEMM+collective, attention)
 share one README structure. It is not a template for its own sake: each section
@@ -46,7 +71,7 @@ a budget that will break when someone adds a shape.
 The ablation table, with the caveat attached to it in the same section: these
 are *shares of work deleted*, not *time recoverable*. Without the caveat in the
 table's own section, the next reader will treat the largest row as headroom.
-See `measurement.md` §3.
+See `/kernel-attribution`.
 
 **6. Coverage.**
 What shapes, dtypes, layouts, and flags are actually tested — and the shapes
@@ -88,13 +113,13 @@ on a capability that was never measured. A reader who discovers a limit
 themselves stops trusting the results section too.
 
 **11. Reproducing.**
-Exact commands, including the A/B recipes for each knob, so a claim in §8 or §9
+Exact commands, including the A/B recipes for each knob, so a claim in section 8 or 9
 can be re-run rather than believed.
 
 **12. Notes for anyone continuing.**
 The ranked list of what is left, each with what is known about it — including
 the ideas that are *structural* rather than knobs, so they are not mistaken for
-quick wins. Mark the ones already disproven with a pointer to §9.
+quick wins. Mark the ones already disproven with a pointer to section 9.
 
 ## Two rules for the prose
 
