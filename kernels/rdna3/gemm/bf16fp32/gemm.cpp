@@ -501,6 +501,18 @@ void micro_tk(const GL g) {
                 } else if constexpr (C::WRITE_POS == 1) {
                     dot_tile(tic, std::false_type{}, nop);
                     store_tile();
+                    // Same reason as the WRITE_POS == 2 branch below, and here
+                    // it is not nearly free: the writes were issued on the line
+                    // above, so this really does stall. It is still not
+                    // optional. store_register_buffer_to_shared<false> leaves
+                    // the ds_writes in flight, nothing after it retires them,
+                    // and past the barrier the *other* warps read the half of
+                    // As[toc]/Bs[toc] that this one just wrote. Within a wave
+                    // LDS is ordered and the bug hides; across the workgroup it
+                    // does not. That this path costs a full drain while
+                    // WRITE_POS == 2 hides it behind a K-slice of WMMAs is the
+                    // entire argument for WRITE_POS == 2 being the default.
+                    lds_wait<0>();
                 } else {
                     dot_tile(tic, std::true_type{}, store_tile);
                     // dot_tile's last chunk stops at lgkmcnt(TAIL_OPS), so the
