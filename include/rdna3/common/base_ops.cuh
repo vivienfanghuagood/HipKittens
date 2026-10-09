@@ -271,6 +271,72 @@ template<> __device__ inline float2 dgelu::op<float2>(const float2 &x) {
 }
 
 /**
+ * @brief Square root.
+ *
+ * Float only, deliberately: the normalization kernels that need this
+ * accumulate in fp32 regardless of the tensor's storage type, and a packed
+ * 16-bit sqrt would invite computing a variance in bf16, which has eight
+ * mantissa bits and loses the small differences a variance is made of.
+ *
+ * @tparam T The data type of the input and output values.
+ * @param x[in] The input value.
+ * @return The square root of the input.
+ */
+struct sqrt {
+    template<typename T> static __device__ inline T op(const T &x);
+};
+template<> __device__ inline float  sqrt::op<float> (const float &x ) { return __builtin_amdgcn_sqrtf(x); }
+template<> __device__ inline float2 sqrt::op<float2>(const float2 &x) {
+    return float2{__builtin_amdgcn_sqrtf(x.x), __builtin_amdgcn_sqrtf(x.y)};
+}
+
+/**
+ * @brief Reciprocal square root, 1/sqrt(x).
+ *
+ * `v_rsq_f32` in one instruction, which is the whole reason this exists as an
+ * op rather than as a divide by a sqrt: the tail of every RMSNorm and
+ * LayerNorm is one of these per row, and the divide form is three instructions
+ * and a different rounding.
+ *
+ * ~1 ulp, like every other transcendental here (see exp, which uses
+ * `v_exp_f32` for the same reason). Do not use it where the exact IEEE result
+ * matters.
+ *
+ * @tparam T The data type of the input and output values.
+ * @param x[in] The input value.
+ * @return 1/sqrt of the input.
+ */
+struct rsqrt {
+    template<typename T> static __device__ inline T op(const T &x);
+};
+template<> __device__ inline float  rsqrt::op<float> (const float &x ) { return __builtin_amdgcn_rsqf(x); }
+template<> __device__ inline float2 rsqrt::op<float2>(const float2 &x) {
+    return float2{__builtin_amdgcn_rsqf(x.x), __builtin_amdgcn_rsqf(x.y)};
+}
+
+/**
+ * @brief Sigmoid linear unit, x * sigmoid(x), also called swish.
+ *
+ * Written as x / (1 + exp(-x)) using the hardware exp2, i.e. exp(-x) is
+ * exp2(-x * log2(e)). Fusing it saves the three temporaries the composed form
+ * needs, which on a kernel that is already register-bound is the difference
+ * between one occupancy step and the next.
+ *
+ * @tparam T The data type of the input and output values.
+ * @param x[in] The input value.
+ * @return x * sigmoid(x).
+ */
+struct silu {
+    template<typename T> static __device__ inline T op(const T &x);
+};
+template<> __device__ inline float silu::op<float>(const float &x) {
+    return x * __builtin_amdgcn_rcpf(1.f + __builtin_amdgcn_exp2f(-x * 1.44269504088896340736f));
+}
+template<> __device__ inline float2 silu::op<float2>(const float2 &x) {
+    return float2{silu::op<float>(x.x), silu::op<float>(x.y)};
+}
+
+/**
  * @brief Copy operation.
  *
  * This operation returns the input value unchanged.

@@ -475,6 +475,40 @@ __device__ static inline void relu(T &dst, const T &src) {
     unary_map<base_ops::relu, T>(dst, src);
 }
 /**
+ * @brief Takes the square root of each element of a tile. Float tiles only.
+ *
+ * @tparam T Tile type.
+ * @param dst[out] Destination tile where the result is stored.
+ * @param src[in] Source tile.
+ */
+template<ducks::rt::all T>
+__device__ static inline void sqrt(T &dst, const T &src) {
+    unary_map<base_ops::sqrt, T>(dst, src);
+}
+/**
+ * @brief Takes the reciprocal square root of each element of a tile. Float
+ * tiles only, and ~1 ulp -- it is v_rsq_f32.
+ *
+ * @tparam T Tile type.
+ * @param dst[out] Destination tile where the result is stored.
+ * @param src[in] Source tile.
+ */
+template<ducks::rt::all T>
+__device__ static inline void rsqrt(T &dst, const T &src) {
+    unary_map<base_ops::rsqrt, T>(dst, src);
+}
+/**
+ * @brief Applies x*sigmoid(x) to each element of a tile. Float tiles only.
+ *
+ * @tparam T Tile type.
+ * @param dst[out] Destination tile where the result is stored.
+ * @param src[in] Source tile.
+ */
+template<ducks::rt::all T>
+__device__ static inline void silu(T &dst, const T &src) {
+    unary_map<base_ops::silu, T>(dst, src);
+}
+/**
  * @brief Applies the GELU function (tanh approximation) to each element of a tile.
  *
  * @tparam T Tile type.

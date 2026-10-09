@@ -21,6 +21,54 @@ template<> struct nt_word<2> { using type = unsigned short; };
 template<> struct nt_word<4> { using type = unsigned int;   };
 template<int Bytes> using nt_word_t = typename nt_word<Bytes>::type;
 using nt_vec4 = unsigned int __attribute__((ext_vector_type(4)));
+
+/**
+ * @brief Assemble the dwords of one contiguous destination run that a lane
+ *        shares with its wave-half partner.
+ *
+ * Why this exists: the f32 accumulator layout is *interleaved*, not mirrored.
+ * rt_base_coord puts element e of lane l at column `2e + (l>>4)`, so lane l and
+ * lane l+16 hold alternating columns of the same 16-wide run and neither owns a
+ * contiguous byte range. Nothing the compiler can do merges that -- a store of
+ * an f32 tile into an int8 global came out as 32 `global_store_b8` per tile and
+ * ran 3.8x slower than the same kernel writing bf16 (measured, 16384x4096: 2.25
+ * ms vs 0.59 ms for twice the bytes). The 2-byte `T == U` path above never hits
+ * this because it is the *operand* layout, where element_stride is 1.
+ *
+ * So do the interleave in registers instead of in the memory system: each lane
+ * places its E values at their byte offsets within the run, ORs in the
+ * partner's copy of the same dwords, and both lanes then store the completed
+ * run. They write identical bytes, which is the same benign duplicate the
+ * mirrored operand path already relies on.
+ *
+ * `__shfl_xor(..., 16, 32)` is the exchange; on gfx11 wave32 that is the two
+ * halves of the wave, which is exactly the pairing `halves_interleave`
+ * describes.
+ *
+ * @tparam U Destination element type (narrower than, or equal to, the tile's).
+ * @tparam E Elements one lane holds per base tile.
+ * @param[in] val This lane's E values, already converted to U.
+ * @param[in] half `laneid() >> 4`.
+ * @param[out] w The run's dwords, identical in both lanes of the pair.
+ */
+template<typename U, int E>
+__device__ inline void pack_interleaved_run(const U (&val)[E], int half,
+                                            unsigned int (&w)[2*E*sizeof(U)/4]) {
+    constexpr int NW = 2*E*sizeof(U)/4;
+    #pragma unroll
+    for(int k = 0; k < NW; k++) w[k] = 0u;
+    #pragma unroll
+    for(int e = 0; e < E; e++) {
+        // Byte offset of this element inside the run. `2*e + half` is the
+        // column, straight out of rt_base_coord.
+        const int byte = (2*e + half) * int(sizeof(U));
+        unsigned int bits = 0u;                       // zero-extend, then place
+        __builtin_memcpy(&bits, &val[e], sizeof(U));
+        w[byte >> 2] |= bits << ((byte & 3) * 8);
+    }
+    #pragma unroll
+    for(int k = 0; k < NW; k++) w[k] |= __shfl_xor(w[k], 16, 32);
+}
 }
 
 /*
@@ -65,15 +113,48 @@ __device__ inline static void load(RT &dst, const GL &src, const COORD &idx) {
     constexpr bool vectorizable = is_row && base::element_stride == 1
                                          && std::is_same_v<T, U> && sizeof(U) == 2;
 
+    /*
+     * The widening load: a narrow global (bf16, fp16, int8) into a wider tile.
+     *
+     * This is the read-side twin of the `packable` store below, and it exists
+     * for the same reason. In a row-layout tile every element a lane holds is
+     * in row `lane & 15` -- rt_base_coord's `.x` does not depend on `e` -- so
+     * a lane's E elements all live inside the base tile's 16-element run of
+     * that row. For the f32 accumulator those elements are every other column
+     * of the run, which the elementwise loop issues as E separate narrow
+     * loads: 32 `global_load_u16` per 16x64 tile per lane where two
+     * `global_load_dwordx4` would do.
+     *
+     * Unlike the store, the memory *traffic* is already fine -- lanes 0..15
+     * cover 16 rows and the coalescer merges the halves, so each cache line is
+     * fetched once -- so what this buys is issue slots, not bytes. It is still
+     * worth it: every Phase 2 op reads a 16-bit tensor into an fp32 tile, and
+     * at 75% of HBM the instruction stream is what is left to give back.
+     *
+     * The run is read once and indexed by `c.y`, which is why this needs no
+     * shuffle and no knowledge of which layout it is serving: lane l and lane
+     * l+16 read the *same* bytes and each keeps its own half of them. Reading
+     * the same address from both halves is what the mirrored operand path
+     * already does, and the coalescer merges it.
+     *
+     * Not enabled for `sizeof(U) == sizeof(T)`: the run would be 64 B per lane
+     * and the staging registers cost more than the issue slots are worth.
+     */
+    constexpr int  RUN  = base::tile_size_col;            // elements in the run
+    constexpr bool widening = is_row && !vectorizable && sizeof(U) < sizeof(T)
+                                     && (RUN * sizeof(U)) % 16 == 0;
+
     const U *src_ptr = (const U*)&src[(idx.template unit_coord<axis, 3>())];
     const int row_stride = src.template stride<axis>();
     const int lane = laneid();
     const int l16  = lane & 15;
 
     // 16-byte alignment of every row this warp will touch. Uniform across the
-    // warp, so the branch below is a scalar branch, not divergence.
-    const bool wide = vectorizable &&
+    // warp, so the branches below are scalar branches, not divergence.
+    const bool aligned =
         ((reinterpret_cast<uintptr_t>(src_ptr) | (row_stride * sizeof(U))) & 15) == 0;
+    const bool wide = vectorizable && aligned;
+    const int  half = lane >> 4;
 
     auto elementwise = [&](int i, int j, int row_base, int col_base) {
         #pragma unroll
@@ -81,6 +162,46 @@ __device__ inline static void load(RT &dst, const GL &src, const COORD &idx) {
             const int2 c = rt_base_coord<T, L>(e, lane);
             const T val = base_types::convertor<T, U>::convert(
                 src_ptr[(row_base + c.x)*row_stride + col_base + c.y]);
+            if (e & 1) dst.tiles[i][j].data[e>>1].y = val;
+            else       dst.tiles[i][j].data[e>>1].x = val;
+        }
+    };
+
+    // Read this lane's whole 16-element run, then pick the E entries of it the
+    // lane actually owns. See the `widening` comment above.
+    auto widened = [&](int i, int j, int row_base, int col_base) {
+        constexpr int NV = RUN * sizeof(U) / 16;
+        constexpr int PER = 16 / sizeof(U);   // U's per 16-byte access
+        const auto *p = reinterpret_cast<const detail::nt_vec4*>(
+            &src_ptr[(row_base + l16)*row_stride + col_base]);
+        U run[RUN];
+        #pragma unroll
+        for(int k = 0; k < NV; k++) {
+            // memcpy rather than a reinterpret_cast of the vector array: U is
+            // a class (__hip_bfloat16) and reading uint storage through it is
+            // an aliasing violation. The copy does not survive SROA.
+            const detail::nt_vec4 v = p[k];
+            __builtin_memcpy(&run[k*PER], &v, sizeof(v));
+        }
+        #pragma unroll
+        for(int e = 0; e < E; e++) {
+            // c.x is l16 for every e in a row-layout tile -- that is the
+            // precondition this path rests on -- so only c.y is needed.
+            //
+            // Both positions are read and one is selected, rather than
+            // indexing by `rt_base_coord(e, lane).y` directly, because that
+            // index depends on the wave half and a *dynamic* index into a
+            // local array is not a register file: the first version of this
+            // compiled `raw` to 48 B of scratch per lane with zero spills
+            // reported, which is the same silent-reordering hazard a spill is.
+            // Asking for lane 0 and lane 16 makes both indices constant, and
+            // the select is one v_cndmask. Where the halves do not interleave
+            // the two are the same index and it folds away entirely.
+            const int c0 = rt_base_coord<T, L>(e, 0).y;
+            const int c1 = rt_base_coord<T, L>(e, 16).y;
+            const T v0 = base_types::convertor<T, U>::convert(run[c0]);
+            const T v1 = base_types::convertor<T, U>::convert(run[c1]);
+            const T val = half ? v1 : v0;
             if (e & 1) dst.tiles[i][j].data[e>>1].y = val;
             else       dst.tiles[i][j].data[e>>1].x = val;
         }
@@ -101,6 +222,10 @@ __device__ inline static void load(RT &dst, const GL &src, const COORD &idx) {
                         __builtin_memcpy((void*)&dst.tiles[i][j].data[4*h], &v, sizeof(v));
                     }
                 }
+                else elementwise(i, j, row_base, col_base);
+            }
+            else if constexpr (widening) {
+                if (aligned) widened(i, j, row_base, col_base);
                 else elementwise(i, j, row_base, col_base);
             }
             else elementwise(i, j, row_base, col_base);
@@ -146,11 +271,39 @@ __device__ inline static void store_at(U *dst_ptr, int row_stride, const RT &src
     constexpr bool vectorizable = is_row && base::element_stride == 1
                                          && std::is_same_v<T, U> && sizeof(U) == 2;
 
+    /*
+     * The interleaved (f32 accumulator) layout, narrowing on the way out.
+     *
+     * `sizeof(U) < sizeof(T)` is the whole point and also the limit: the win
+     * comes from the destination run being *narrower* than the source, so the
+     * dwords a lane assembles are few. Same-width would need 16 exchanges per
+     * base tile to replace 8 plain dword stores, which is a loss.
+     *
+     * NT is excluded because a peer-directed store has to carry the bypass bits
+     * on every access, and the duplicate write this path relies on is not
+     * something to reason about over the fabric. Local stores are what it is
+     * for.
+     *
+     * Note this makes store() a warp-collective op for these types: the
+     * exchange requires the whole wave converged. Every caller in the tree
+     * diverges at warp granularity or coarser, which is the granularity the
+     * rest of the library already assumes.
+     */
+    constexpr bool packable = is_row && !vectorizable && !NT
+                                     && base::element_stride == 2
+                                     && base::halves_interleave
+                                     && sizeof(U) < sizeof(T)
+                                     && (2*E*sizeof(U)) % 16 == 0;
+
     const int lane = laneid();
     const int l16  = lane & 15;
+    const int half = lane >> 4;
 
-    const bool wide = vectorizable &&
+    // 16-byte alignment of every row this warp touches, uniform across the
+    // warp, so this is a scalar branch rather than divergence.
+    const bool aligned =
         ((reinterpret_cast<uintptr_t>(dst_ptr) | (row_stride * sizeof(U))) & 15) == 0;
+    const bool wide = vectorizable && aligned;
 
     // Lanes l and l+16 of an operand tile write the same bytes with the same
     // values. That redundancy is exactly the WMMA mirroring invariant, so the
@@ -172,6 +325,31 @@ __device__ inline static void store_at(U *dst_ptr, int row_stride, const RT &src
                 __builtin_nontemporal_store(w, reinterpret_cast<raw*>(p));
             }
             else *p = cv;
+        }
+    };
+
+    // Convert this lane's E elements and write the run they share with the
+    // partner lane. See detail::pack_interleaved_run.
+    auto packed = [&](int i, int j, int row_base, int col_base) {
+        U val[E];
+        #pragma unroll
+        for(int e = 0; e < E; e++) {
+            const T v = (e & 1) ? src.tiles[i][j].data[e>>1].y
+                                : src.tiles[i][j].data[e>>1].x;
+            val[e] = base_types::convertor<U, T>::convert(v);
+        }
+        constexpr int NW = 2*E*sizeof(U)/4;
+        unsigned int w[NW];
+        detail::pack_interleaved_run<U, E>(val, half, w);
+        // The run starts at this lane's row (rt_base_coord's `.x` is l16 for
+        // every e in a row-layout tile) and at the base tile's first column.
+        auto *q = reinterpret_cast<detail::nt_vec4 *>(
+            &dst_ptr[(row_base + l16)*row_stride + col_base]);
+        #pragma unroll
+        for(int k = 0; k < NW/4; k++) {
+            detail::nt_vec4 v;
+            __builtin_memcpy(&v, &w[4*k], sizeof(v));
+            q[k] = v;
         }
     };
 
@@ -198,6 +376,10 @@ __device__ inline static void store_at(U *dst_ptr, int row_stride, const RT &src
                         else *q = v;
                     }
                 }
+                else elementwise(i, j, row_base, col_base);
+            }
+            else if constexpr (packable) {
+                if (aligned) packed(i, j, row_base, col_base);
                 else elementwise(i, j, row_base, col_base);
             }
             else elementwise(i, j, row_base, col_base);

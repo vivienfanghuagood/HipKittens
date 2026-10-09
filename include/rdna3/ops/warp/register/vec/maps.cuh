@@ -254,6 +254,40 @@ template<ducks::rv::all T>
 __device__ static inline void relu(T &dst, const T &src) {
     unary_op<base_ops::relu, T>(dst, src);
 }
+/**
+ * @brief Takes the square root of each element of a register vector.
+ *
+ * @tparam T Register vector type.
+ * @param dst[out] Destination vector.
+ * @param src[in] Source vector.
+ */
+template<ducks::rv::all T>
+__device__ static inline void sqrt(T &dst, const T &src) {
+    unary_op<base_ops::sqrt, T>(dst, src);
+}
+/**
+ * @brief Takes the reciprocal square root of each element of a register
+ * vector. This is the tail of every normalization: one v_rsq_f32 per row.
+ *
+ * @tparam T Register vector type.
+ * @param dst[out] Destination vector.
+ * @param src[in] Source vector.
+ */
+template<ducks::rv::all T>
+__device__ static inline void rsqrt(T &dst, const T &src) {
+    unary_op<base_ops::rsqrt, T>(dst, src);
+}
+/**
+ * @brief Applies x*sigmoid(x) element-wise to a register vector.
+ *
+ * @tparam T Register vector type.
+ * @param dst[out] Destination vector.
+ * @param src[in] Source vector.
+ */
+template<ducks::rv::all T>
+__device__ static inline void silu(T &dst, const T &src) {
+    unary_op<base_ops::silu, T>(dst, src);
+}
 
 // ---- binary ops ----
 

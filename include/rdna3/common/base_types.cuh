@@ -47,6 +47,14 @@ using fp8e4m3_2 = __hip_fp8x2_e4m3_fnuz;
  * @brief Packed word of four float8 floating-point values.
  */
 using fp8e4m3_4 = __hip_fp8x4_e4m3_fnuz;
+/**
+ * @brief 8-bit signed integer, and a packed word of four of them.
+ *
+ * A *storage* type only -- see the packing/convertor specializations further
+ * down for why there is deliberately no rt<int8>.
+ */
+using int8   = int8_t;
+using int8_4 = char4;
 
 namespace ducks {
 /**
@@ -233,6 +241,29 @@ template<> struct packing<fp8e4m3_4> {
     using unpacked_type = fp8e4m3;
     using packed_type = fp8e4m3_4;
 };
+/*
+ * int8 is a *storage* type here and nothing more. gfx1100 has no int8 WMMA and
+ * no packed int8 ALU worth the name, so there is deliberately no rt<int8> and
+ * no maps: what int8 is for is a gl you quantize into and dequantize out of,
+ * which needs exactly this much -- a packing so gl<int8_t> instantiates, and a
+ * pair of convertors so load/store can narrow and widen. Everything between
+ * stays float. (The two `using` aliases live up with bf16 and fp8e4m3, in
+ * namespace kittens, because that is where a kernel's `gl<int8, ...>` looks.)
+ */
+template<> struct packing<int8> {
+    static __device__ inline constexpr int num() { return 1; }
+    using unpacked_type = int8;
+    using packed_type = int8_4;
+};
+template<> struct packing<int8_4> {
+    static __device__ inline constexpr int num() { return 4; }
+    using unpacked_type = int8;
+    using packed_type = int8_4;
+};
+template<> struct constants<int8> {
+    static __device__ inline constexpr int8 zero() { return 0; }
+    static __device__ inline constexpr int8 one()  { return 1; }
+};
 
 /**
  * @brief Pack four float8 into 32-bits.
@@ -379,6 +410,28 @@ template<> struct convertor<fp8e4m3, float> {
 template<> struct convertor<float, fp8e4m3> {
     static __host__ __device__ inline float convert(const fp8e4m3 & u) {
         return float(u);
+    }
+};
+/*
+ * float -> int8 rounds to nearest-even and saturates, rather than doing what a
+ * C cast does. Both halves of that matter for a quantizer and neither is the
+ * default: a cast truncates toward zero, which biases every value toward the
+ * origin by up to half a step, and a cast of an out-of-range float to a narrow
+ * integer is undefined -- in practice it wraps, so the outliers, which are the
+ * only elements the scale was chosen to accommodate, are exactly the ones that
+ * come back with the wrong sign. v_rndne_f32 plus two v_med3 is three
+ * instructions; a silently wrong outlier is not worth saving them.
+ */
+template<> struct convertor<int8, float> {
+    static __host__ __device__ inline int8 convert(const float & u) {
+        float r = __builtin_rintf(u);
+        r = r < -128.f ? -128.f : (r > 127.f ? 127.f : r);
+        return static_cast<int8>(r);
+    }
+};
+template<> struct convertor<float, int8> {
+    static __host__ __device__ inline float convert(const int8 & u) {
+        return static_cast<float>(u);
     }
 };
 }

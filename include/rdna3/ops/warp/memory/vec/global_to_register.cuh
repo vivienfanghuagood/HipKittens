@@ -113,4 +113,40 @@ __device__ inline static void store(const GL &dst, const RV &src, const COORD &i
         }
     }
 }
+
+/**
+ * @brief Store *one* element of a register vector to one element of a global.
+ *
+ * The folded-reduction counterpart to store() above, and only correct when
+ * every entry of `src` holds the same value -- which is what
+ * lang.collective.fold_rows produces and what hk's RegVecType.uniform tracks.
+ * Writing a single entry of a vector whose entries differ picks whichever one
+ * happens to live in lane 0 and is wrong on the other fifteen.
+ *
+ * Why it exists: a kernel that has folded a row onto a tile's sixteen rows has
+ * one workgroup per row of the real tensor, so its per-row output -- a
+ * quantization scale, say -- is a single number with a single slot, not a
+ * sixteen-wide run. store() would write sixteen consecutive rows' worth.
+ *
+ * The address is computed exactly as store() computes it, so this writes the
+ * first of the elements store() would have written. Lane 0 of every warp
+ * writes; a multi-warp workgroup therefore issues several identical stores to
+ * the same address, which is the same benign duplicate a backed-up block
+ * already relies on and cheaper than branching the workgroup on warp 0.
+ */
+template<ducks::rv::all RV, ducks::gl::all GL, ducks::coord::vec COORD=coord<RV>>
+__device__ inline static void store_scalar(const GL &dst, const RV &src, const COORD &idx) {
+    using T2 = typename RV::dtype;
+    using U  = typename GL::dtype;
+    using T  = typename base_types::packing<T2>::unpacked_type;
+
+    if(::kittens::laneid() != 0) return;
+    U *dst_ptr = (U*)&dst[(idx.template unit_coord<-1, 3>())];
+    // data[0][0] under any of the three layouts is an entry this lane really
+    // holds; which one it is differs per layout and does not matter here,
+    // because the precondition is that they are all equal. For align_l the
+    // storage is packed, so the cast takes the low half of the pair.
+    *dst_ptr = base_types::convertor<U, T>::convert(
+        reinterpret_cast<const T*>(&src.data[0][0])[0]);
+}
 } // namespace kittens
