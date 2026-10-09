@@ -11,6 +11,12 @@ not. Check it against your copy of sglang/srt/layers/linear.py.
 SGLang's RowParallelLinear is a close relative of vLLM's -- same weight layout,
 same tp_rank-0 bias rule, same reduce_results flag -- so the patch is nearly the
 same and the differences are called out where they matter.
+Attention is a separate patch and lives in the Python package:
+``python3 -c "import sglang, hk.integration.sglang as h; print(h.apply())"``
+routes ``F.scaled_dot_product_attention`` onto the generated HipKittens
+attention kernel. The two are independent -- this file is the fused
+GEMM->AllReduce for RowParallelLinear, that one is attention -- and applying
+both is fine.
 """
 
 import os

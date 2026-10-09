@@ -17,6 +17,12 @@ Design: wrap `forward` rather than reimplement it. The eligible path is short
 and self-contained, and everything else calls straight through to the original
 bound method, so a vLLM that has moved on breaks by falling back -- not by
 computing something subtly wrong.
+Attention is a separate patch and lives in the Python package:
+``python3 -c "import vllm, hk.integration.vllm as h; print(h.apply())"``
+routes ``F.scaled_dot_product_attention`` onto the generated HipKittens
+attention kernel. The two are independent -- this file is the fused
+GEMM->AllReduce for RowParallelLinear, that one is attention -- and applying
+both is fine.
 """
 
 import os
