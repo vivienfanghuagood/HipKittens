@@ -94,6 +94,25 @@ constexpr int WARPGROUP_WARPS{4};
  */
 __device__ __forceinline__ int warpid() { return threadIdx.x >> 5; }
 /**
+ * @brief The warp ID, in a scalar register.
+ *
+ * `warpid()` is `threadIdx.x >> 5`, which the compiler keeps in a VGPR: it has
+ * no way to know that every lane of a wave computes the same value. It does --
+ * a wave is 32 consecutive threads and `>> 5` is constant across them -- and
+ * the difference is not cosmetic. Anything derived from `warpid()` inherits the
+ * VGPR, so a comparison on it becomes a *divergent* branch (`v_cmpx` plus exec
+ * mask save/restore) rather than one `s_cbranch`, and every value the branch
+ * needs is pinned in a vector register across it. The attention kernel's causal
+ * mask is reached through `warpid()` and measured 90 spilled VGPRs that way,
+ * and none with this.
+ *
+ * Use this wherever the value feeds addressing or control flow; use `warpid()`
+ * where it feeds per-lane arithmetic and the readfirstlane would be a waste.
+ */
+__device__ __forceinline__ int warpid_uniform() {
+    return __builtin_amdgcn_readfirstlane(threadIdx.x >> 5);
+}
+/**
  * @brief Get the warpgroup ID of the current thread.
  * @return The warpgroup ID.
  */

@@ -401,33 +401,128 @@ __device__ static inline void copy(rt<T2, _height, _width, layout> &dst, const r
 namespace detail {
 
 /**
- * @brief Rewrite every element of a tile as a function of its (row, col).
+ * @brief Fill on one side of a shifted diagonal, without materialising the diagonal.
  *
- * The CDNA versions of the masks below carry hand-derived lane formulas, and the
- * on-diagonal cases carry 64-bit magic masks indexed by laneid. None of that
- * survives a change of wave width or replication, so this asks rt_base_coord()
- * for the coordinate instead and writes the predicate out in full. These are not
- * hot -- they run once per tile of a masked matmul, not once per k-step -- and a
- * predicate the next person can read is worth more here than the mask trick.
+ * The readable lowering asks rt_base_coord() for each element's (row, col) and
+ * writes the predicate out in full. That is the right shape for an axis
+ * predicate, where only one of the two is needed and it is a single register.
+ * A *diagonal* predicate needs both, and `col - row` varies with the element
+ * index, so the same lowering holds one register per element of the tile --
+ * eight, for every layout on this architecture -- live for as long as the mask
+ * is in a loop. That is what it costs: the attention kernel's causal mask
+ * spilled 152 B/lane written that way, the whole Q register file along with
+ * it, and spilling is a wrong answer in a kernel that hand-places `s_waitcnt`.
+ *
+ * The element index is not actually on the lane axis, though. Writing out
+ * rt_base_coord(),
+ *
+ *     row layout:  col - row = (element_stride*e + h) - l16
+ *     col layout:  col - row = l16 - (element_stride*e + h)
+ *
+ * with `l16 = lane & 15` and `h` the wave half, so
+ *
+ *     col - row = dbase +/- element_stride*e,   dbase = +/-(h - l16)
+ *
+ * -- one lane-dependent register for the whole tile, and a per-element *shift*
+ * that is a compile-time constant once the loops unroll. Which side of the
+ * compare it lands on matters. `dbase >= -row_idx - off - se` is one VGPR and a
+ * scalar threshold on paper, but the right-hand side is loop-invariant per
+ * element and LLVM reassociates it straight back into eight hoisted registers;
+ * that was measured too, and it spills harder than the naive form. Folding
+ * `row_idx` into the lane value instead leaves
+ *
+ *     keep  <=>  dbase + row_idx >= -(off + se)
+ *
+ * whose right-hand side is an *integer literal*. There is nothing left to
+ * hoist: one VGPR for the whole tile, and `elements_per_thread` compares
+ * against immediates.
+ *
+ * @tparam KEEP_GE true keeps `col - row >= -row_idx` (triu's complement),
+ *                 false keeps `col - row <= -row_idx` (tril's).
  */
-template<ducks::rt::all RT, typename F>
-__device__ static inline void map_by_coord(RT &dst, const RT &src, F &&f) {
+template<bool KEEP_GE, ducks::rt::all RT>
+__device__ static inline void diag_fill(
+        RT &dst, const RT &src, const int row_idx,
+        const typename base_types::packing<typename RT::dtype>::unpacked_type &val) {
     using T    = typename RT::T;
     using L    = typename RT::layout;
     using base = rt_base<T, L>;
-    const int lane = laneid();
+    constexpr bool is_row = std::is_same_v<L, ducks::rt_layout::row>;
+    const int lane  = laneid();
+    const int h     = base::halves_interleave ? (lane >> 4) : 0;
+    const int dbase = is_row ? (h - (lane & 15)) : ((lane & 15) - h);
+    // The one register the predicate costs. Everything else is an immediate.
+    const int d = dbase + row_idx;
     #pragma unroll
     for(int i = 0; i < RT::height; i++) {
         #pragma unroll
         for(int j = 0; j < RT::width; j++) {
+            // The tile's own offset into the wider tile, on the same axis.
+            const int off = j * base::tile_size_col - i * base::tile_size_row;
             #pragma unroll
             for(int e = 0; e < base::elements_per_thread; e++) {
-                const int2 c   = rt_base_coord<T, L>(e, lane);
-                const int  row = i * base::tile_size_row + c.x;
-                const int  col = j * base::tile_size_col + c.y;
-                const T    val = (e & 1) ? src.tiles[i][j].data[e>>1].y
-                                         : src.tiles[i][j].data[e>>1].x;
-                const T    out = f(row, col, val);
+                const int se  = is_row ? base::element_stride * e
+                                       : -base::element_stride * e;
+                const int c = -(off + se);
+                const bool keep = KEEP_GE ? (d >= c) : (d <= c);
+                const T v = (e & 1) ? src.tiles[i][j].data[e>>1].y
+                                    : src.tiles[i][j].data[e>>1].x;
+                const T out = keep ? v : T(val);
+                if(e & 1) dst.tiles[i][j].data[e>>1].y = out;
+                else      dst.tiles[i][j].data[e>>1].x = out;
+            }
+        }
+    }
+}
+
+/**
+ * @brief Fill on one side of an axis index, without materialising the index.
+ *
+ * The same economy as `diag_fill`, for the rectangular masks. Half of these
+ * are already cheap: a tile's row index is `lane & 15` in row layout and its
+ * column index is `lane & 15` in col layout, one register either way. The other
+ * half are not -- the *element* axis reads `element_stride*e + h`, which is a
+ * value per element of the tile, and a mask inside a loop holds all of them
+ * live. Attention's tail mask is on that axis (a row of S^T is a kv index) and
+ * cost six hoisted, spilled registers until it was hidden behind a branch.
+ *
+ * Writing the coordinate as `K + ce + base` -- `K` the tile's offset, `ce` the
+ * per-element shift, `base` the one lane-dependent term -- and moving the
+ * constants across the compare leaves `base - idx` against an immediate. One
+ * register, and no reason left to guard the mask with a branch.
+ *
+ * @tparam AXIS_IS_ROW true for the row masks (upper/lower), false for the
+ *                     column masks (left/right).
+ * @tparam FILL_LT     true fills where the coordinate is `< idx`, false where
+ *                     it is `>= idx`.
+ */
+template<bool AXIS_IS_ROW, bool FILL_LT, ducks::rt::all RT>
+__device__ static inline void axis_fill(
+        RT &dst, const RT &src, const int idx,
+        const typename base_types::packing<typename RT::dtype>::unpacked_type &val) {
+    using T    = typename RT::T;
+    using L    = typename RT::layout;
+    using base = rt_base<T, L>;
+    constexpr bool is_row = std::is_same_v<L, ducks::rt_layout::row>;
+    // row layout puts the elements on the column axis and col layout on the
+    // row axis, so exactly one of the two masks pays the per-element shift.
+    constexpr bool on_elements = (AXIS_IS_ROW != is_row);
+    const int lane = laneid();
+    const int h    = base::halves_interleave ? (lane >> 4) : 0;
+    const int t    = (on_elements ? h : (lane & 15)) - idx;
+    #pragma unroll
+    for(int i = 0; i < RT::height; i++) {
+        #pragma unroll
+        for(int j = 0; j < RT::width; j++) {
+            const int K = AXIS_IS_ROW ? i * base::tile_size_row
+                                      : j * base::tile_size_col;
+            #pragma unroll
+            for(int e = 0; e < base::elements_per_thread; e++) {
+                const int c = -(K + (on_elements ? base::element_stride * e : 0));
+                const bool fill = FILL_LT ? (t < c) : (t >= c);
+                const T v = (e & 1) ? src.tiles[i][j].data[e>>1].y
+                                    : src.tiles[i][j].data[e>>1].x;
+                const T out = fill ? T(val) : v;
                 if(e & 1) dst.tiles[i][j].data[e>>1].y = out;
                 else      dst.tiles[i][j].data[e>>1].x = out;
             }
@@ -449,8 +544,7 @@ __device__ static inline void map_by_coord(RT &dst, const RT &src, F &&f) {
  */
 template<ducks::rt::all RT>
 __device__ static inline void make_causal(RT &dst, const RT &src, const typename base_types::packing<typename RT::dtype>::unpacked_type &val=0) {
-    using T = typename RT::T;
-    detail::map_by_coord(dst, src, [&](int row, int col, T v) { return col <= row ? v : val; });
+    detail::diag_fill<false>(dst, src, 0, val);
 }
 
 /**
@@ -463,8 +557,7 @@ __device__ static inline void make_causal(RT &dst, const RT &src, const typename
  */
 template<ducks::rt::all RT>
 __device__ static inline void make_causal_t(RT &dst, const RT &src, const typename base_types::packing<typename RT::dtype>::unpacked_type &val=0) {
-    using T = typename RT::T;
-    detail::map_by_coord(dst, src, [&](int row, int col, T v) { return col >= row ? v : val; });
+    detail::diag_fill<true>(dst, src, 0, val);
 }
 
 /* ----------  TRIANGULAR FILLS  ---------- */
@@ -480,8 +573,7 @@ __device__ static inline void make_causal_t(RT &dst, const RT &src, const typena
  */
 template<ducks::rt::all RT>
 __device__ static inline void tril(RT &dst, const RT &src, const int row_idx, const typename base_types::packing<typename RT::dtype>::unpacked_type &val=0) {
-    using T = typename RT::T;
-    detail::map_by_coord(dst, src, [&](int row, int col, T v) { return col <= row - row_idx ? v : val; });
+    detail::diag_fill<false>(dst, src, row_idx, val);
 }
 
 /**
@@ -495,8 +587,7 @@ __device__ static inline void tril(RT &dst, const RT &src, const int row_idx, co
  */
 template<ducks::rt::all RT>
 __device__ static inline void triu(RT &dst, const RT &src, const int row_idx, const typename base_types::packing<typename RT::dtype>::unpacked_type &val=0) {
-    using T = typename RT::T;
-    detail::map_by_coord(dst, src, [&](int row, int col, T v) { return col < row - row_idx ? val : v; });
+    detail::diag_fill<true>(dst, src, row_idx, val);
 }
 
 /* ----------  RECTANGULAR FILLS  ---------- */
@@ -513,8 +604,7 @@ __device__ static inline void triu(RT &dst, const RT &src, const int row_idx, co
 template<ducks::rt::all RT>
 __device__ static inline void right_fill(RT &dst, const RT &src, const int col_idx, const typename base_types::packing<typename RT::dtype>::unpacked_type &val=0) {
     if(col_idx >= RT::cols) return;
-    using T = typename RT::T;
-    detail::map_by_coord(dst, src, [&](int row, int col, T v) { return col >= col_idx ? val : v; });
+    detail::axis_fill<false, false>(dst, src, col_idx, val);
 }
 
 /**
@@ -529,8 +619,7 @@ __device__ static inline void right_fill(RT &dst, const RT &src, const int col_i
 template<ducks::rt::all RT>
 __device__ static inline void left_fill(RT &dst, const RT &src, const int col_idx, const typename base_types::packing<typename RT::dtype>::unpacked_type &val=0) {
     if(col_idx <= 0) return;
-    using T = typename RT::T;
-    detail::map_by_coord(dst, src, [&](int row, int col, T v) { return col < col_idx ? val : v; });
+    detail::axis_fill<false, true>(dst, src, col_idx, val);
 }
 
 /**
@@ -545,8 +634,7 @@ __device__ static inline void left_fill(RT &dst, const RT &src, const int col_id
 template<ducks::rt::all RT>
 __device__ static inline void upper_fill(RT &dst, const RT &src, const int row_idx, const typename base_types::packing<typename RT::dtype>::unpacked_type &val=0) {
     if(row_idx <= 0) return;
-    using T = typename RT::T;
-    detail::map_by_coord(dst, src, [&](int row, int col, T v) { return row < row_idx ? val : v; });
+    detail::axis_fill<true, true>(dst, src, row_idx, val);
 }
 
 /**
@@ -561,8 +649,7 @@ __device__ static inline void upper_fill(RT &dst, const RT &src, const int row_i
 template<ducks::rt::all RT>
 __device__ static inline void lower_fill(RT &dst, const RT &src, const int row_idx, const typename base_types::packing<typename RT::dtype>::unpacked_type &val=0) {
     if(row_idx >= RT::rows) return;
-    using T = typename RT::T;
-    detail::map_by_coord(dst, src, [&](int row, int col, T v) { return row >= row_idx ? val : v; });
+    detail::axis_fill<true, false>(dst, src, row_idx, val);
 }
 
 /* ----------  SUBTILE  ---------- */
