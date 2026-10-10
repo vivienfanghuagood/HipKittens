@@ -301,19 +301,93 @@ template<> struct convertor<float, bf16> {
         return 	__bfloat162float(u);
     }
 };
-// template<> struct convertor<bf16, float> {
-//     static __host__ __device__ inline bf16 convert(const float & u) {
-//         return 	__float2bfloat16(u);
-//     }
-// };
+/**
+ * @brief float -> bf16, round to nearest even.
+ *
+ * This used to be `bit_cast<uint32_t>(u) >> 16` -- a truncation, labelled
+ * "fast unsafe conversion". It is not merely less accurate: truncation toward
+ * zero is *biased*, by half an ulp, always in the same direction. Attention
+ * rounds a tile of probabilities (all positive) through this on every KV
+ * block, and GEMM rounds its fp32 accumulators through it on every store, so
+ * the bias does not average out -- it accumulates.
+ *
+ * What that cost, measured: with V set to all ones the softmax weights sum to
+ * one and attention must return exactly 1.0 for every element, whatever Q and
+ * K were. torch returned exactly 1.0; this kernel returned 1.0 +- 2^-8,
+ * one whole bf16 ulp, on every element -- because the numerator summed the
+ * truncated probabilities while the denominator summed the fp32 ones. On real
+ * inputs it showed up as a uniform ~2.5x of aotriton's error at every
+ * quantile, which was enough to change which token a VLM decoded greedily
+ * while two other attention backends agreed with each other.
+ *
+ * The rounding is the standard branch-free bias add: add half an ulp, plus
+ * one more if the result's low bit is set, which is round-half-to-even. The
+ * NaN guard matters because a NaN whose mantissa is all ones would carry into
+ * the exponent and come back as an infinity.
+ */
+//: How fp32 -> bf16 rounds.
+//:
+//: This used to be `bit_cast<uint32_t>(u) >> 16` with the comment "fast
+//: unsafe conversion (truncation only)", and the unsafe part was not the
+//: speed. Truncation toward zero is *biased*: half an ulp, always the same
+//: direction. Attention rounds a tile of probabilities -- all positive --
+//: through this on every KV block while summing the fp32 ones for the
+//: denominator, so the bias does not cancel, it accumulates into the ratio.
+//:
+//: What it cost, measured (tools/hk-bench/attn_precision.py --exact): set V
+//: to all ones and the softmax weights sum to one, so attention must return
+//: exactly 1.0 for every element whatever Q and K were. torch returned
+//: exactly 1.0. This kernel returned 1.0 off by 2^-8 -- one whole bf16 ulp --
+//: on every element. On real inputs it showed up as a uniform ~2.5x of
+//: aotriton's error at every quantile, which was enough to make a VLM decode
+//: a different sentence while two other attention backends agreed with each
+//: other.
+//:
+//: Four settings, so the trade can be measured in one process
+//: (tools/hk-bench/bf16_round_cost.py) rather than argued about. Cost is
+//: attention at head_dim 128 / head_dim 64; GEMM is 0.2% for all of them,
+//: because its conversion is once per output element and not once per
+//: probability:
+//:
+//:   0  truncate            1 instr   --        biased; not a supported mode
+//:   1  nearest, ties away  2 instr   +2% / +3%  unbiased            <- default
+//:   2  nearest even        3 instr   +4% / +6%  unbiased
+//:   3  nearest even + NaN  5 instr   +6% / +13% unbiased and total
+//:
+//: The default is 1. Ties-even differs from ties-away only on an exact tie,
+//: which a computed float essentially never is, and the NaN guard doubles the
+//: cost to protect against a value attention cannot produce (P is exp2 of
+//: something finite). The caveat that buys: under 1 and 2 a NaN whose low
+//: mantissa bits are near all-ones can carry into the exponent and come back
+//: as an infinity rather than a NaN. Set -DHK_BF16_ROUND=3 if NaN
+//: propagation has to be exact.
+#ifndef HK_BF16_ROUND
+#define HK_BF16_ROUND 1
+#endif
+#ifdef HK_BF16_TRUNCATE
+#undef HK_BF16_ROUND
+#define HK_BF16_ROUND 0
+#endif
+
 template<> struct convertor<bf16, float> {
     static __host__ __device__ inline bf16 convert(const float &u) {
-        // Fast unsafe conversion (truncation only)
-        return std::bit_cast<bf16>(
-            static_cast<uint16_t>(
-                std::bit_cast<uint32_t>(u) >> 16
-            )
-        );
+        uint32_t x = std::bit_cast<uint32_t>(u);
+#if HK_BF16_ROUND == 0
+        // Truncation. Kept only so the others have something to be measured
+        // against; see the note above.
+#elif HK_BF16_ROUND == 1
+        // Ties away from zero. Exact ties are a measure-zero event on real
+        // data, and this is the cheapest unbiased rounding there is: one add.
+        x += 0x8000u;
+#elif HK_BF16_ROUND == 2
+        x += 0x7fffu + ((x >> 16) & 1u);            // ties to even
+#else
+        if ((x & 0x7fffffffu) > 0x7f800000u) {      // NaN in, NaN out
+            return std::bit_cast<bf16>(static_cast<uint16_t>(0x7fc0u));
+        }
+        x += 0x7fffu + ((x >> 16) & 1u);
+#endif
+        return std::bit_cast<bf16>(static_cast<uint16_t>(x >> 16));
     }
 };
 template<> struct convertor<float2, bf16_2> {
@@ -321,11 +395,13 @@ template<> struct convertor<float2, bf16_2> {
         return 	__bfloat1622float2(u);
     }
 };
+//: The packed form. Same rounding as the scalar one above -- it has to be,
+//: or a tile's two halves would disagree about what rounding means.
 template<> struct convertor<bf16_2, float2> {
     static __host__ __device__ inline bf16_2 convert(const float2 &u) {
         return bf16_2{
-            std::bit_cast<bf16>(static_cast<uint16_t>(std::bit_cast<uint32_t>(u.x) >> 16)),
-            std::bit_cast<bf16>(static_cast<uint16_t>(std::bit_cast<uint32_t>(u.y) >> 16))
+            convertor<bf16, float>::convert(u.x),
+            convertor<bf16, float>::convert(u.y)
         };
     }
 };
