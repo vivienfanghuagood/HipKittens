@@ -149,4 +149,37 @@ __device__ inline static void store_scalar(const GL &dst, const RV &src, const C
     *dst_ptr = base_types::convertor<U, T>::convert(
         reinterpret_cast<const T*>(&src.data[0][0])[0]);
 }
+
+/**
+ * @brief One element of a global, as a wave-uniform integer.
+ *
+ * The read counterpart of store_scalar, and the primitive a paged kernel is
+ * built on: `block_table[req][i]`, `seq_lens[req]`, `slot_mapping[t]` are all
+ * "fetch an integer from memory and index with it". Without this the IR can
+ * only index by block_idx and arithmetic on it, which cannot express a page
+ * table.
+ *
+ * Every lane loads the same address, and the result goes through
+ * `readfirstlane`. The load is not the point; declaring the *value* uniform
+ * is, so that the address arithmetic built on it lands in SGPRs instead of
+ * being carried per lane. A page index that is accidentally divergent costs a
+ * VGPR for every value derived from it, which on this architecture is how a
+ * kernel that fits becomes a kernel that spills.
+ *
+ * When the address is itself uniform -- a page table indexed by blockIdx --
+ * the compiler goes one better and drops the vector load entirely: the ISA
+ * for a kernel doing exactly that contains no `v_readfirstlane_b32` and one
+ * `s_load_b32` into an SGPR. The builtin is a floor, not a cost.
+ *
+ * No bounds check: a page table is produced by the framework and read in the
+ * kernel's innermost loop. The caller clamps the *index* (see how the
+ * attention kernel backs up its last block) rather than paying for a branch
+ * per element here.
+ */
+template<ducks::gl::all GL, typename COORD=coord<>>
+__device__ inline static int load_scalar(const GL &src, const COORD &idx) {
+    using U = typename GL::dtype;
+    const U *src_ptr = (const U*)&src[(idx.template unit_coord<-1, 3>())];
+    return __builtin_amdgcn_readfirstlane((int)(*src_ptr));
+}
 } // namespace kittens
