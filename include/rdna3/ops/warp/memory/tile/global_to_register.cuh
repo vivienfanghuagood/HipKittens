@@ -9,9 +9,47 @@
 #include "../../../../types/types.cuh"
 #include "../util/util.cuh"
 
+/*
+ * A 16-bit row tile holds each row twice, in lanes l and l + 16, and the
+ * packed fp32 -> 16-bit store completes the same run in both lanes. Bit 1 of
+ * HK_RT_HALF_SPLIT makes the bounded loads read each 32-byte run once -- each
+ * half its own 16 bytes, the other 16 taken from the partner with
+ * v_permlanex16 -- and bit 2 makes the bounded stores write it once, each half
+ * its own 16 bytes. 0 is the mirrored access: both halves read and write the
+ * whole run.
+ */
+#ifndef HK_RT_HALF_SPLIT
+#define HK_RT_HALF_SPLIT 0
+#endif
+
 namespace kittens {
 
 namespace detail {
+/// The 16 bytes this lane loaded, and its partner's, as the run's low and
+/// high halves: half 0 loaded the low 16 bytes, half 1 the high.
+__device__ inline void join_run_halves(const __uint128_t &mine, int half,
+                                       uint32_t (&lo)[4], uint32_t (&hi)[4]) {
+    uint32_t m[4];
+    __builtin_memcpy(m, &mine, sizeof(m));
+    #pragma unroll
+    for(int t = 0; t < 4; t++) {
+        const uint32_t o = uint32_t(__builtin_amdgcn_permlanex16(
+            int(m[t]), int(m[t]), 0x76543210u, 0xfedcba98u, false, false));
+        lo[t] = half ? o : m[t];
+        hi[t] = half ? m[t] : o;
+    }
+}
+
+/// This half's 16 bytes of a 32-byte run held whole in both halves.
+__device__ inline __uint128_t own_run_half(const uint32_t (&w)[8], int half) {
+    uint32_t s[4];
+    #pragma unroll
+    for(int t = 0; t < 4; t++) s[t] = half ? w[4 + t] : w[t];
+    __uint128_t raw;
+    __builtin_memcpy(&raw, s, sizeof(raw));
+    return raw;
+}
+
 // __builtin_nontemporal_store takes only native scalar/vector types, and the
 // tile element types here are classes (__hip_bfloat16, HIP_vector_type). These
 // are the same-width native types to memcpy through; nothing is converted, the
@@ -558,10 +596,19 @@ __device__ inline static void load_bounded(RT &dst, const GL &src, const COORD &
         constexpr int PER = 16 / sizeof(U);
         const uint32_t off = ((row_base + l16)*row_stride + col_base) * sizeof(U);
         U run[RUN];
-        #pragma unroll
-        for(int k = 0; k < NV; k++) {
-            const __uint128_t raw = llvm_amdgcn_raw_buffer_load_b128(srsrc, off + 16*k, col0, 0);
-            __builtin_memcpy(&run[k*PER], &raw, sizeof(raw));
+        if constexpr ((HK_RT_HALF_SPLIT & 1) && NV == 2) {
+            uint32_t lo[4], hi[4];
+            detail::join_run_halves(
+                llvm_amdgcn_raw_buffer_load_b128(srsrc, off + 16*half, col0, 0), half, lo, hi);
+            __builtin_memcpy(&run[0], lo, sizeof(lo));
+            __builtin_memcpy(&run[PER], hi, sizeof(hi));
+        }
+        else {
+            #pragma unroll
+            for(int k = 0; k < NV; k++) {
+                const __uint128_t raw = llvm_amdgcn_raw_buffer_load_b128(srsrc, off + 16*k, col0, 0);
+                __builtin_memcpy(&run[k*PER], &raw, sizeof(raw));
+            }
         }
         #pragma unroll
         for(int e = 0; e < E; e++) {
@@ -589,11 +636,21 @@ __device__ inline static void load_bounded(RT &dst, const GL &src, const COORD &
                 // LLVM cannot merge, whose registers the allocator reserves
                 // whether the branch runs or not (+10 VGPRs on the decode GEMM).
                 const uint32_t off = ((row_base + l16)*row_stride + col_base) * sizeof(U);
-                #pragma unroll
-                for(int h = 0; h < 2; h++) {
-                    const __uint128_t raw =
-                        llvm_amdgcn_raw_buffer_load_b128(srsrc, off + 16*h, col0, 0);
-                    __builtin_memcpy((void*)&dst.tiles[i][j].data[4*h], &raw, sizeof(raw));
+                if constexpr (HK_RT_HALF_SPLIT & 1) {
+                    uint32_t lo[4], hi[4];
+                    detail::join_run_halves(
+                        llvm_amdgcn_raw_buffer_load_b128(srsrc, off + 16*half, col0, 0),
+                        half, lo, hi);
+                    __builtin_memcpy((void*)&dst.tiles[i][j].data[0], lo, sizeof(lo));
+                    __builtin_memcpy((void*)&dst.tiles[i][j].data[4], hi, sizeof(hi));
+                }
+                else {
+                    #pragma unroll
+                    for(int h = 0; h < 2; h++) {
+                        const __uint128_t raw =
+                            llvm_amdgcn_raw_buffer_load_b128(srsrc, off + 16*h, col0, 0);
+                        __builtin_memcpy((void*)&dst.tiles[i][j].data[4*h], &raw, sizeof(raw));
+                    }
                 }
             }
             else if constexpr (widening) widened(i, j, row_base, col_base);
@@ -663,11 +720,19 @@ __device__ inline static void store_bounded(const GL &dst, const RT &src, const 
             const uint32_t run = ((row_base + l16)*row_stride + col_base) * sizeof(U);
             if constexpr (vectorizable) {
                 if (aligned) {
-                    #pragma unroll
-                    for(int h = 0; h < 2; h++) {
-                        __uint128_t raw;
-                        __builtin_memcpy(&raw, (const void*)&src.tiles[i][j].data[4*h], sizeof(raw));
-                        llvm_amdgcn_raw_buffer_store_b128(raw, srsrc, run + 16*h, 0, 0);
+                    if constexpr (HK_RT_HALF_SPLIT & 2) {
+                        uint32_t w[8];
+                        __builtin_memcpy(w, (const void*)&src.tiles[i][j].data[0], sizeof(w));
+                        llvm_amdgcn_raw_buffer_store_b128(detail::own_run_half(w, half),
+                                                          srsrc, run + 16*half, 0, 0);
+                    }
+                    else {
+                        #pragma unroll
+                        for(int h = 0; h < 2; h++) {
+                            __uint128_t raw;
+                            __builtin_memcpy(&raw, (const void*)&src.tiles[i][j].data[4*h], sizeof(raw));
+                            llvm_amdgcn_raw_buffer_store_b128(raw, srsrc, run + 16*h, 0, 0);
+                        }
                     }
                 }
                 else elementwise(i, j, row_base, col_base);
@@ -684,11 +749,18 @@ __device__ inline static void store_bounded(const GL &dst, const RT &src, const 
                     constexpr int NW = 2*E*sizeof(U)/4;
                     unsigned int w[NW];
                     detail::pack_interleaved_run<U, E>(val, half, w);
-                    #pragma unroll
-                    for(int k = 0; k < NW/4; k++) {
-                        __uint128_t raw;
-                        __builtin_memcpy(&raw, &w[4*k], sizeof(raw));
-                        llvm_amdgcn_raw_buffer_store_b128(raw, srsrc, run + 16*k, 0, 0);
+                    if constexpr ((HK_RT_HALF_SPLIT & 2) && NW == 8) {
+                        llvm_amdgcn_raw_buffer_store_b128(
+                            detail::own_run_half(reinterpret_cast<const uint32_t (&)[8]>(w), half),
+                            srsrc, run + 16*half, 0, 0);
+                    }
+                    else {
+                        #pragma unroll
+                        for(int k = 0; k < NW/4; k++) {
+                            __uint128_t raw;
+                            __builtin_memcpy(&raw, &w[4*k], sizeof(raw));
+                            llvm_amdgcn_raw_buffer_store_b128(raw, srsrc, run + 16*k, 0, 0);
+                        }
                     }
                 }
                 else elementwise(i, j, row_base, col_base);
