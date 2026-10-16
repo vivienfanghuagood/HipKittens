@@ -110,6 +110,36 @@ constexpr int WARPGROUP_WARPS{4};
  */
 __device__ __forceinline__ int warpid() { return threadIdx.x >> 5; }
 /**
+ * @brief Read every 64-byte line of a kernel's BYTES of arguments, now.
+ *
+ * A kernel's arguments are fresh memory at every launch -- the runtime writes
+ * each dispatch's into a new slot -- so every scalar-cache line of them is a
+ * cold miss, to host memory by default. LLVM sinks each argument's s_load to
+ * its first use, so a field in a second line that is used only late (an
+ * output's pointer and row stride, used by the final store) is a second miss
+ * that nothing overlaps. A one-row RMSNorm whose output sat at offset 0x60 of
+ * its arguments took 3.10 us where the same kernel with the output at 0x30
+ * took 2.16; read at entry, both took 2.1. With the arguments in device
+ * memory (HIP_FORCE_DEV_KERNARG=1) the late miss still cost 0.8 us.
+ *
+ * Call it first. The loads issue together and are waited on once, beside the
+ * miss on the first line that every kernel pays anyway; their values are
+ * dead after the asm, so nothing stays live.
+ */
+template<int BYTES>
+__device__ __forceinline__ void touch_kernargs() {
+    const __attribute__((address_space(4))) unsigned *ka =
+        (const __attribute__((address_space(4))) unsigned *)__builtin_amdgcn_kernarg_segment_ptr();
+    // One consumer for all of them: an asm per load would wait per load.
+    // The segment is only 16-byte aligned, so BYTES can span one line more
+    // than BYTES/64: the last dword is read as well, which covers it.
+    unsigned any = ka[(BYTES - 4) / 4];
+    #pragma unroll
+    for (int i = 0; i < (BYTES + 63) / 64; i++) any ^= ka[16 * i];
+    asm volatile("" :: "s"(any));
+}
+
+/**
  * @brief Get the warpgroup ID of the current thread.
  * @return The warpgroup ID.
  */
