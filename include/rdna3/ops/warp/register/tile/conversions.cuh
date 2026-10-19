@@ -117,6 +117,69 @@ __device__ static inline void transpose_base_data(T2 (&dst)[P], const T2 (&src)[
     for(int k = 0; k < P; k++) { dst[k].x = v[2*k]; dst[k].y = v[2*k+1]; }
 }
 
+/**
+ * @brief An operand base tile's transpose on its eight 32-bit words.
+ *
+ * The same four stages as transpose_base_data, but element k's pair (2k, 2k+1)
+ * is word k, so stages 1-3 -- element bits 1-3 -- swap whole words (word bits
+ * 0-2), and only stage 0 works inside a word, as one DPP move and one
+ * v_perm_b32 a word. Lifting the sixteen 16-bit values out and selecting on
+ * each, as the generic stages do, is about 180 instructions a tile on gfx1100;
+ * this is about 64.
+ */
+template<typename T2, int P>
+__device__ static inline void transpose_operand_words(T2 (&dst)[P], const T2 (&src)[P], const int lane) {
+    static_assert(P == 8 && sizeof(T2) == 4, "an operand base tile is eight packed 16-bit pairs");
+    uint32_t w[P];
+    #pragma unroll
+    for(int k = 0; k < P; k++) __builtin_memcpy(&w[k], (const void*)&src[k], 4);
+
+    // Stage 0, lane bit 0 with the half of a word. With S0 the partner's word
+    // and S1 this lane's: lane bit clear keeps its low half and takes the
+    // partner's low half as its high one (bytes 0,1 of S1, 0,1 of S0); set,
+    // keeps its high half and takes the partner's high half as its low one.
+    const uint32_t sel = (lane & 1) ? 0x03020706u : 0x05040100u;
+    #pragma unroll
+    for(int k = 0; k < P; k++) {
+        const uint32_t t = (uint32_t)lane_xor_b32<1>((int)w[k]);
+        w[k] = __builtin_amdgcn_perm(t, w[k], sel);
+    }
+
+    // Stages 1-3, lane bit s with word bit s-1.
+    auto stage = [&](auto lanemask_c) {
+        constexpr int LM = decltype(lanemask_c)::value;
+        constexpr int WM = LM / 2;
+        const bool a = (lane & LM) != 0;
+        #pragma unroll
+        for(int k = 0; k < P; k++) {
+            if((k & WM) != 0) continue;
+            const uint32_t lo = w[k], hi = w[k | WM];
+            const uint32_t recv = (uint32_t)lane_xor_b32<LM>((int)(a ? lo : hi));
+            w[k]      = a ? recv : lo;
+            w[k | WM] = a ? hi   : recv;
+        }
+    };
+    stage(std::integral_constant<int, 2>{});
+    stage(std::integral_constant<int, 4>{});
+    stage(std::integral_constant<int, 8>{});
+
+    #pragma unroll
+    for(int k = 0; k < P; k++) __builtin_memcpy((void*)&dst[k], &w[k], 4);
+}
+
+#ifndef HK_RDNA_XPOSE_WORDS
+#define HK_RDNA_XPOSE_WORDS 1   // 0: the generic stages, for an A/B in one process
+#endif
+template<bool halves_interleave, typename T2, int P>
+__device__ static inline void transpose_base(T2 (&dst)[P], const T2 (&src)[P], const int lane) {
+    if constexpr (HK_RDNA_XPOSE_WORDS && !halves_interleave && P == 8 && sizeof(T2) == 4) {
+        transpose_operand_words(dst, src, lane);
+    }
+    else {
+        transpose_base_data<halves_interleave>(dst, src, lane);
+    }
+}
+
 } // namespace detail
 
 /**
@@ -133,7 +196,7 @@ __device__ static inline void transpose_base_data(T2 (&dst)[P], const T2 (&src)[
 template<typename T, ducks::rt_layout::all layout>
 __device__ inline void swap_layout(rt_base<T, typename ducks::rt_layout::transpose<layout>::type> &dst, const rt_base<T, layout> &src) {
     using base = rt_base<T, layout>;
-    detail::transpose_base_data<base::halves_interleave>(dst.data, src.data, laneid());
+    detail::transpose_base<base::halves_interleave>(dst.data, src.data, laneid());
 }
 
 /**
@@ -211,7 +274,7 @@ __device__ static inline rt<T2, _rows, _cols, typename ducks::rt_layout::transpo
 template<typename T, ducks::rt_layout::all layout>
 __device__ inline void transpose(rt_base<T, layout> &dst, const rt_base<T, layout> &src) {
     using base = rt_base<T, layout>;
-    detail::transpose_base_data<base::halves_interleave>(dst.data, src.data, laneid());
+    detail::transpose_base<base::halves_interleave>(dst.data, src.data, laneid());
 }
 
 /**
