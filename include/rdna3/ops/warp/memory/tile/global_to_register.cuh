@@ -357,7 +357,7 @@ __device__ inline static void store_at(U *dst_ptr, int row_stride, const RT &src
             const T val = (e & 1) ? src.tiles[i][j].data[e>>1].y
                                   : src.tiles[i][j].data[e>>1].x;
             U *p = &dst_ptr[(row_base + c.x)*row_stride + col_base + c.y];
-            const U cv = base_types::convertor<U, T>::convert(val);
+            const U cv = base_types::store_convertor<U, T>::convert(val);
             // __builtin_nontemporal_store only accepts native scalar/vector
             // types, and U is a class (__hip_bfloat16), so go through an
             // integer of the same width. Pure bit shuffling, no conversion.
@@ -378,7 +378,7 @@ __device__ inline static void store_at(U *dst_ptr, int row_stride, const RT &src
         for(int e = 0; e < E; e++) {
             const T v = (e & 1) ? src.tiles[i][j].data[e>>1].y
                                 : src.tiles[i][j].data[e>>1].x;
-            val[e] = base_types::convertor<U, T>::convert(v);
+            val[e] = base_types::store_convertor<U, T>::convert(v);
         }
         constexpr int NW = 2*E*sizeof(U)/4;
         unsigned int w[NW];
@@ -707,7 +707,7 @@ __device__ inline static void store_bounded(const GL &dst, const RT &src, const 
                                 : src.tiles[i][j].data[e>>1].x;
             detail::buffer_store_elem<U>(
                 srsrc, ((row_base + c.x)*row_stride + col_base + c.y) * sizeof(U),
-                base_types::convertor<U, T>::convert(v));
+                base_types::store_convertor<U, T>::convert(v));
         }
     };
 
@@ -744,7 +744,7 @@ __device__ inline static void store_bounded(const GL &dst, const RT &src, const 
                     for(int e = 0; e < E; e++) {
                         const T v = (e & 1) ? src.tiles[i][j].data[e>>1].y
                                             : src.tiles[i][j].data[e>>1].x;
-                        val[e] = base_types::convertor<U, T>::convert(v);
+                        val[e] = base_types::store_convertor<U, T>::convert(v);
                     }
                     constexpr int NW = 2*E*sizeof(U)/4;
                     unsigned int w[NW];

@@ -390,6 +390,44 @@ template<> struct convertor<bf16, float> {
         return std::bit_cast<bf16>(static_cast<uint16_t>(x >> 16));
     }
 };
+//: How a store rounds when it narrows fp32 to bf16 in memory: a register
+//: tile, vector or strip written to a bf16 global. Same settings as
+//: HK_BF16_ROUND; the default is 2, nearest even, which is torch's rounding
+//: for every value but a NaN whose low mantissa bits are near all ones (3
+//: keeps those too, for about 1% more on a norm). In-register conversions
+//: (`copy`, attention's P every KV block) keep HK_BF16_ROUND's: ties-away is
+//: one add cheaper there, and a tie is rare in a computed value. A store is
+//: once an element, and its input is often a sum of two bf16 values -- a
+//: residual add -- an exact tie a fifth of the time, where ties-away
+//: disagreed with torch on 10.7% of the elements (hk-dsl
+//: docs/history/36-the-agent-loop.md).
+#ifndef HK_BF16_STORE_ROUND
+#define HK_BF16_STORE_ROUND 2
+#endif
+
+template<typename U, typename T> struct store_convertor {
+    static __host__ __device__ inline U convert(const T &u) {
+        return convertor<U, T>::convert(u);
+    }
+};
+template<> struct store_convertor<bf16, float> {
+    static __host__ __device__ inline bf16 convert(const float &u) {
+        uint32_t x = std::bit_cast<uint32_t>(u);
+#if HK_BF16_STORE_ROUND == 0
+#elif HK_BF16_STORE_ROUND == 1
+        x += 0x8000u;
+#elif HK_BF16_STORE_ROUND == 2
+        x += 0x7fffu + ((x >> 16) & 1u);
+#else
+        if ((x & 0x7fffffffu) > 0x7f800000u) {
+            return std::bit_cast<bf16>(static_cast<uint16_t>(0x7fc0u));
+        }
+        x += 0x7fffu + ((x >> 16) & 1u);
+#endif
+        return std::bit_cast<bf16>(static_cast<uint16_t>(x >> 16));
+    }
+};
+
 template<> struct convertor<float2, bf16_2> {
     static __host__ __device__ inline float2 convert(const bf16_2 & u) {
         return 	__bfloat1622float2(u);

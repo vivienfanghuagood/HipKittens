@@ -211,7 +211,7 @@ __device__ inline static void store(const GL &dst, const RS &src, const coord<> 
             U run[RS::run];
             #pragma unroll
             for (int e = 0; e < RS::run; e++)
-                run[e] = base_types::convertor<U, T>::convert(src.data[r][j][e]);
+                run[e] = base_types::store_convertor<U, T>::convert(src.data[r][j][e]);
             detail::strip_write(base + r * stride + j * RS::span, run);
         }
     }
@@ -269,7 +269,7 @@ __device__ inline static void store_bounded(const GL &dst, const RS &src, const 
             U run[RS::run];
             #pragma unroll
             for (int e = 0; e < RS::run; e++)
-                run[e] = base_types::convertor<U, T>::convert(src.data[r][j][e]);
+                run[e] = base_types::store_convertor<U, T>::convert(src.data[r][j][e]);
             detail::strip_buffer_write(srsrc, voff, soff, run);
         }
     }
@@ -297,7 +297,7 @@ template<ducks::gl::all GL, ducks::rs::cv CV>
 __device__ inline static void store_scalar(const GL &dst, const CV &src, const coord<> &idx) {
     using U = typename GL::dtype;
     if (laneid() != 0) return;
-    *(U*)&dst[idx] = base_types::convertor<U, typename CV::T>::convert(src.data[0][0]);
+    *(U*)&dst[idx] = base_types::store_convertor<U, typename CV::T>::convert(src.data[0][0]);
 }
 
 /**

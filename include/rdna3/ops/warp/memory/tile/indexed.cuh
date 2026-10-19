@@ -173,7 +173,7 @@ __device__ inline static void store_scatter(const GL &dst, const RT &src, const 
                 for (int e = 0; e < E; e++) {
                     const T v = (e & 1) ? src.tiles[i][j].data[e >> 1].y
                                         : src.tiles[i][j].data[e >> 1].x;
-                    val[e] = base_types::convertor<U, T>::convert(v);
+                    val[e] = base_types::store_convertor<U, T>::convert(v);
                 }
                 constexpr int NW = 2 * E * sizeof(U) / 4;
                 unsigned int w[NW];
@@ -191,7 +191,7 @@ __device__ inline static void store_scatter(const GL &dst, const RT &src, const 
                     const T v = (e & 1) ? src.tiles[i][j].data[e >> 1].y
                                         : src.tiles[i][j].data[e >> 1].x;
                     detail::buffer_store_elem<U>(srsrc, off == oob ? oob : off + cy * sizeof(U),
-                                                 base_types::convertor<U, T>::convert(v));
+                                                 base_types::store_convertor<U, T>::convert(v));
                 }
             }
         }

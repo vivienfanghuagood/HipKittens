@@ -90,7 +90,7 @@ __device__ inline static void store(const GL &dst, const RV &src, const COORD &i
             for(int e = 0; e < rv_align_held<T>(); e++) {
                 const int p = rv_align_entry<T>(e, lane);
                 const T val = (e & 1) ? src.data[w][e>>1].y : src.data[w][e>>1].x;
-                dst_ptr[w*kittens::TILE_ROW_DIM<T> + p] = base_types::convertor<U, T>::convert(val);
+                dst_ptr[w*kittens::TILE_ROW_DIM<T> + p] = base_types::store_convertor<U, T>::convert(val);
             }
         }
     }
@@ -98,7 +98,7 @@ __device__ inline static void store(const GL &dst, const RV &src, const COORD &i
         #pragma unroll
         for(int w = 0; w < src.outer_dim; w++) {
             dst_ptr[w*kittens::TILE_ROW_DIM<T> + (lane & 15)] =
-                base_types::convertor<U, T>::convert(src[w][0]);
+                base_types::store_convertor<U, T>::convert(src[w][0]);
         }
     }
     else if constexpr (std::is_same_v<typename RV::layout, naive_l>) {
@@ -106,7 +106,7 @@ __device__ inline static void store(const GL &dst, const RV &src, const COORD &i
         for(int w = 0; w < src.outer_dim; w++) {
             const int i = w*WARP_THREADS + lane;
             if(i < src.length) {
-                dst_ptr[i] = base_types::convertor<U, T>::convert(src[w][0]);
+                dst_ptr[i] = base_types::store_convertor<U, T>::convert(src[w][0]);
             }
         }
     }
@@ -144,7 +144,7 @@ __device__ inline static void store_scalar(const GL &dst, const RV &src, const C
     // holds; which one it is differs per layout and does not matter here,
     // because the precondition is that they are all equal. For align_l the
     // storage is packed, so the cast takes the low half of the pair.
-    *dst_ptr = base_types::convertor<U, T>::convert(
+    *dst_ptr = base_types::store_convertor<U, T>::convert(
         reinterpret_cast<const T*>(&src.data[0][0])[0]);
 }
 
