@@ -457,6 +457,13 @@ template<> struct convertor<bf16_2, float2> {
 // };
 
 
+/// The i32 WMMA accumulator into fp32 (an int8 GEMM's dequant epilogue).
+template<> struct convertor<float2, int2> {
+    static __host__ __device__ inline float2 convert(const int2 &u) { return float2{(float)u.x, (float)u.y}; }
+};
+template<> struct convertor<float, int> {
+    static __host__ __device__ inline float convert(const int &u) { return (float)u; }
+};
 template<> struct convertor<float, half> {
     static __host__ __device__ inline float convert(const half & u) {
         return __half2float(u);
