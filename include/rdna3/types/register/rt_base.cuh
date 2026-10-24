@@ -66,7 +66,8 @@ template<typename _T, ducks::rt_layout::all _layout> struct rt_base {
     using dtype = T2; ///< Data type of the matrix elements
 
     static_assert(
-        std::is_same_v<dtype, bf16_2> || std::is_same_v<dtype, float2> || std::is_same_v<dtype, half_2>,
+        std::is_same_v<dtype, bf16_2> || std::is_same_v<dtype, float2> || std::is_same_v<dtype, half_2>
+        || std::is_same_v<dtype, int8_4> || std::is_same_v<dtype, int2>,
         "rt_base was provided an unsupported type. (RDNA3 has no fp8 WMMA.)"
     );
 
@@ -86,7 +87,9 @@ template<typename _T, ducks::rt_layout::all _layout> struct rt_base {
     static constexpr int registers_per_thread = packed_per_thread * sizeof(dtype) / 4; // registers are 32-bit words
 
     // Both shapes come out to 8 VGPRs per lane per 16x16 tile.
-    static_assert(registers_per_thread == 8, "unexpected gfx11 WMMA fragment size");
+    // ... except an int8 operand (iu8 WMMA): 16 bytes a lane, 4 VGPRs.
+    static_assert(registers_per_thread == (std::is_same_v<dtype, int8_4> ? 4 : 8),
+                  "unexpected gfx11 WMMA fragment size");
 
     /// Distance along the element axis between element `e` and element `e+1` of
     /// a single lane. 1 for a WMMA operand (a lane holds a contiguous K vector);

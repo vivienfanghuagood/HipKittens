@@ -67,7 +67,8 @@ namespace base_types {
 template<typename T>
 concept T2 = std::is_same_v<T, float2> || std::is_same_v<T, bf16_2> || std::is_same_v<T, half_2> || std::is_same_v<T, fp8e4m3_4>;
 template<typename T>
-concept T1 = std::is_same_v<T, float>  || std::is_same_v<T, bf16  > || std::is_same_v<T, half> || std::is_same_v<T, fp8e4m3>;
+concept T1 = std::is_same_v<T, float>  || std::is_same_v<T, bf16  > || std::is_same_v<T, half> || std::is_same_v<T, fp8e4m3>
+          || std::is_same_v<T, int8> || std::is_same_v<T, int>;
 
 } // namespace base_types
 } // namespace ducks
@@ -242,12 +243,14 @@ template<> struct packing<fp8e4m3_4> {
     using packed_type = fp8e4m3_4;
 };
 /*
- * int8 is a *storage* type here and nothing more. gfx1100 has no int8 WMMA and
- * no packed int8 ALU worth the name, so there is deliberately no rt<int8> and
- * no maps: what int8 is for is a gl you quantize into and dequantize out of,
- * which needs exactly this much -- a packing so gl<int8_t> instantiates, and a
- * pair of convertors so load/store can narrow and widen. Everything between
- * stays float. (The two `using` aliases live up with bf16 and fp8e4m3, in
+ * int8 was a storage type here only, on the belief that gfx1100 has no int8
+ * WMMA. It has one: v_wmma_i32_16x16x16_iu8_w32, at the f16 rate (measured
+ * 96 vs 101 TOP/s register-only on a W7900D) and with the f16 layout (a lane
+ * holds row l%16's 16 K bytes, the two wave halves mirrored; i32 accumulator
+ * laid out as the f32 one -- tools/rdna-probes, 0/256 mismatches). So rt<int8>
+ * now exists as a WMMA *operand* (row layout, loaded from st<int8> with one
+ * ds_read_b128 a base tile) and rt<int> as its accumulator; there are still no
+ * elementwise maps on int8 tiles, and a gl<int8_t> keeps its convertors. (The two `using` aliases live up with bf16 and fp8e4m3, in
  * namespace kittens, because that is where a kernel's `gl<int8, ...>` looks.)
  */
 template<> struct packing<int8> {

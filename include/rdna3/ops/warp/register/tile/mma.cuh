@@ -52,6 +52,26 @@ __device__ static inline void wmma161616(float2 (&D)[4],
     );
 }
 
+typedef __attribute__((__vector_size__(4 * sizeof(int)))) int wmma_int4_t;
+typedef __attribute__((__vector_size__(8 * sizeof(int)))) int wmma_int8_t;
+
+/// v_wmma_i32_16x16x16_iu8 (signed x signed): A and B are 16 bytes a lane
+/// (int8_4[4], the f16 layout at one byte an element), the accumulator v8i32
+/// laid out as the f32 one.
+__device__ static inline void wmma161616(int2 (&D)[4],
+                                         const int8_4 (&A)[4],
+                                         const int8_4 (&B)[4],
+                                         const int2 (&C)[4]) {
+    *(wmma_int8_t*)D = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(
+        true, *(const wmma_int4_t*)A, true, *(const wmma_int4_t*)B, *(const wmma_int8_t*)C, false);
+}
+__device__ static inline void mma_ABt_base(rt_base<int, ducks::rt_layout::col> &d,
+                                     const rt_base<int8, ducks::rt_layout::row> &a,
+                                     const rt_base<int8, ducks::rt_layout::row> &b,
+                                     const rt_base<int, ducks::rt_layout::col> &c) {
+    wmma161616(d.data, a.data, b.data, c.data);
+}
+
 /**
  * @brief Base matrix multiply-accumulate operation for row layout.
  *
@@ -128,9 +148,12 @@ __device__ static inline void mma_AtBt_base(rt_base<float, ducks::rt_layout::col
 /// fp8 variant, and the f16-accumulate form is not wired up here.
 template<typename D, typename A, typename B, typename C>
 constexpr bool mma_types_ok =
-    std::is_same_v<typename D::T, float> && std::is_same_v<typename C::T, float> &&
-    std::is_same_v<typename A::T, typename B::T> &&
-    (std::is_same_v<typename A::T, bf16> || std::is_same_v<typename A::T, half>);
+    (std::is_same_v<typename D::T, float> && std::is_same_v<typename C::T, float> &&
+     std::is_same_v<typename A::T, typename B::T> &&
+     (std::is_same_v<typename A::T, bf16> || std::is_same_v<typename A::T, half>)) ||
+    // iu8: int8 operands, i32 accumulator (mma_ABt only)
+    (std::is_same_v<typename D::T, int> && std::is_same_v<typename C::T, int> &&
+     std::is_same_v<typename A::T, int8> && std::is_same_v<typename B::T, int8>);
 
 /**
  * @brief Matrix multiply-accumulate operation.

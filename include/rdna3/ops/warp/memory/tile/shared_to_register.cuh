@@ -51,7 +51,7 @@ static constexpr bool lds_vectorizable =
                typename RT::layout>::element_stride == 1
     && std::is_same_v<typename base_types::packing<typename RT::dtype>::unpacked_type,
                       typename ST::dtype>
-    && sizeof(typename ST::dtype) == 2;
+    && (sizeof(typename ST::dtype) == 2 || sizeof(typename ST::dtype) == 1);
 
 /**
  * @brief How many LDS instructions load()/load_async() issues for this pair.
@@ -61,7 +61,8 @@ static constexpr bool lds_vectorizable =
  * vectorized path, in which case load_async() is not available.
  */
 template<ducks::rt::all RT, ducks::st::all ST>
-static constexpr int lds_loads = lds_vectorizable<RT, ST> ? RT::height * RT::width * 2 : 0;
+static constexpr int lds_loads = lds_vectorizable<RT, ST>
+    ? RT::height * RT::width * (sizeof(typename ST::dtype) == 1 ? 1 : 2) : 0;
 
 /**
  * @brief Load data from a shared tile into a register tile.
@@ -96,9 +97,10 @@ __device__ inline static void load(RT &dst, const ST &src) {
     constexpr bool is_row = std::is_same_v<L, ducks::rt_layout::row>;
     constexpr int  E      = base::elements_per_thread;
 
-    // A whole 16-element row, same width in LDS as in registers: 2x ds_read_b128.
+    // A whole 16-element row, same width in LDS as in registers: 2x ds_read_b128
+    // (one for an int8 row: 16 bytes).
     constexpr bool vectorizable = is_row && base::element_stride == 1
-                                         && std::is_same_v<T, U> && sizeof(U) == 2;
+                                         && std::is_same_v<T, U> && (sizeof(U) == 2 || sizeof(U) == 1);
 
     const int lane = laneid();
     const int l16  = lane & 15;
@@ -116,11 +118,17 @@ __device__ inline static void load(RT &dst, const ST &src) {
                 // column boundary is a multiple of 16, and the swizzle only
                 // moves bits 4-6.  The register side goes through memcpy
                 // because `data` is only 4-byte aligned as an array.
+                if constexpr (sizeof(U) == 1) {
+                    const uint32_t p = src.idx(src_ptr, {row_base + l16, col_base});
+                    const float4 v = load_shared_vec4_async(p);
+                    __builtin_memcpy((void*)&dst.tiles[i][j].data[0], &v, sizeof(v));
+                } else {
                 #pragma unroll
                 for(int b = 0; b < 2; b++) {
                     const uint32_t p = src.idx(src_ptr, {row_base + l16, col_base + 8*b});
                     const float4 v = load_shared_vec4_async(p);
                     __builtin_memcpy((void*)&dst.tiles[i][j].data[4*b], &v, sizeof(v));
+                }
                 }
             }
             else {

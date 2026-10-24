@@ -74,6 +74,7 @@ template<typename T> constexpr int TILE_ELEMENTS{TILE_COL_DIM<T>*TILE_ROW_DIM<T>
  */
 template<typename T> constexpr int WMMA_REPLICATION = 2;  // f16 / bf16 operands
 template<> constexpr int WMMA_REPLICATION<float> = 1;     // f32 accumulator
+template<> constexpr int WMMA_REPLICATION<int> = 1;       // i32 accumulator (iu8 WMMA)
 /**
  * @brief Constant representing number of threads in a warp.
  */
