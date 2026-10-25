@@ -69,8 +69,7 @@ __device__ inline void philox_uniform(RT &dst, uint32_t seed_lo, uint32_t seed_h
                 const uint32_t ctr = uint32_t(offset + (i * dst.tile_size_row + c.x) * row_stride +
                                               j * dst.tile_size_col + c.y);
                 const float v = detail::uniform_from(detail::philox_first(ctr, seed_lo, seed_hi));
-                if (e & 1) dst.tiles[i][j].data[e >> 1].y = v;
-                else       dst.tiles[i][j].data[e >> 1].x = v;
+                reinterpret_cast<T *>(&dst.tiles[i][j].data[0])[e] = v;   // any packing (int8_4: four a word)
             }
         }
     }

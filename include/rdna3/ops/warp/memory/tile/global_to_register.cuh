@@ -204,8 +204,7 @@ __device__ inline static void load(RT &dst, const GL &src, const COORD &idx) {
             const int2 c = rt_base_coord<T, L>(e, lane);
             const T val = base_types::convertor<T, U>::convert(
                 src_ptr[(row_base + c.x)*row_stride + col_base + c.y]);
-            if (e & 1) dst.tiles[i][j].data[e>>1].y = val;
-            else       dst.tiles[i][j].data[e>>1].x = val;
+            reinterpret_cast<T *>(&dst.tiles[i][j].data[0])[e] = val;   // any packing (int8_4: four a word)
         }
     };
 
@@ -244,8 +243,7 @@ __device__ inline static void load(RT &dst, const GL &src, const COORD &idx) {
             const T v0 = base_types::convertor<T, U>::convert(run[c0]);
             const T v1 = base_types::convertor<T, U>::convert(run[c1]);
             const T val = half ? v1 : v0;
-            if (e & 1) dst.tiles[i][j].data[e>>1].y = val;
-            else       dst.tiles[i][j].data[e>>1].x = val;
+            reinterpret_cast<T *>(&dst.tiles[i][j].data[0])[e] = val;   // any packing (int8_4: four a word)
         }
     };
 
@@ -354,8 +352,7 @@ __device__ inline static void store_at(U *dst_ptr, int row_stride, const RT &src
         #pragma unroll
         for(int e = 0; e < E; e++) {
             const int2 c = rt_base_coord<T, L>(e, lane);
-            const T val = (e & 1) ? src.tiles[i][j].data[e>>1].y
-                                  : src.tiles[i][j].data[e>>1].x;
+            const T val = reinterpret_cast<const T *>(&src.tiles[i][j].data[0])[e];
             U *p = &dst_ptr[(row_base + c.x)*row_stride + col_base + c.y];
             const U cv = base_types::store_convertor<U, T>::convert(val);
             // __builtin_nontemporal_store only accepts native scalar/vector
@@ -376,8 +373,7 @@ __device__ inline static void store_at(U *dst_ptr, int row_stride, const RT &src
         U val[E];
         #pragma unroll
         for(int e = 0; e < E; e++) {
-            const T v = (e & 1) ? src.tiles[i][j].data[e>>1].y
-                                : src.tiles[i][j].data[e>>1].x;
+            const T v = reinterpret_cast<const T *>(&src.tiles[i][j].data[0])[e];
             val[e] = base_types::store_convertor<U, T>::convert(v);
         }
         constexpr int NW = 2*E*sizeof(U)/4;
@@ -584,8 +580,7 @@ __device__ inline static void load_bounded(RT &dst, const GL &src, const COORD &
             const uint32_t off = ((row_base + c.x)*row_stride + col_base + c.y) * sizeof(U);
             const T val = base_types::convertor<T, U>::convert(
                 detail::buffer_load_elem<U>(srsrc, off, col0));
-            if (e & 1) dst.tiles[i][j].data[e>>1].y = val;
-            else       dst.tiles[i][j].data[e>>1].x = val;
+            reinterpret_cast<T *>(&dst.tiles[i][j].data[0])[e] = val;   // any packing (int8_4: four a word)
         }
     };
 
@@ -617,8 +612,7 @@ __device__ inline static void load_bounded(RT &dst, const GL &src, const COORD &
             const T v0 = base_types::convertor<T, U>::convert(run[c0]);
             const T v1 = base_types::convertor<T, U>::convert(run[c1]);
             const T val = half ? v1 : v0;
-            if (e & 1) dst.tiles[i][j].data[e>>1].y = val;
-            else       dst.tiles[i][j].data[e>>1].x = val;
+            reinterpret_cast<T *>(&dst.tiles[i][j].data[0])[e] = val;   // any packing (int8_4: four a word)
         }
     };
 
@@ -703,8 +697,7 @@ __device__ inline static void store_bounded(const GL &dst, const RT &src, const 
         #pragma unroll
         for(int e = 0; e < E; e++) {
             const int2 c = rt_base_coord<T, L>(e, lane);
-            const T v = (e & 1) ? src.tiles[i][j].data[e>>1].y
-                                : src.tiles[i][j].data[e>>1].x;
+            const T v = reinterpret_cast<const T *>(&src.tiles[i][j].data[0])[e];
             detail::buffer_store_elem<U>(
                 srsrc, ((row_base + c.x)*row_stride + col_base + c.y) * sizeof(U),
                 base_types::store_convertor<U, T>::convert(v));
@@ -742,8 +735,7 @@ __device__ inline static void store_bounded(const GL &dst, const RT &src, const 
                     U val[E];
                     #pragma unroll
                     for(int e = 0; e < E; e++) {
-                        const T v = (e & 1) ? src.tiles[i][j].data[e>>1].y
-                                            : src.tiles[i][j].data[e>>1].x;
+                        const T v = reinterpret_cast<const T *>(&src.tiles[i][j].data[0])[e];
                         val[e] = base_types::store_convertor<U, T>::convert(v);
                     }
                     constexpr int NW = 2*E*sizeof(U)/4;

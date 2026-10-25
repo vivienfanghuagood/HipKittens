@@ -528,11 +528,9 @@ __device__ static inline void diag_fill(
                                        : -base::element_stride * e;
                 const int c = -(off + se);
                 const bool keep = KEEP_GE ? (d >= c) : (d <= c);
-                const T v = (e & 1) ? src.tiles[i][j].data[e>>1].y
-                                    : src.tiles[i][j].data[e>>1].x;
+                const T v = reinterpret_cast<const T *>(&src.tiles[i][j].data[0])[e];
                 const T out = keep ? v : T(val);
-                if(e & 1) dst.tiles[i][j].data[e>>1].y = out;
-                else      dst.tiles[i][j].data[e>>1].x = out;
+                reinterpret_cast<T *>(&dst.tiles[i][j].data[0])[e] = out;   // any packing (int8_4: four a word)
             }
         }
     }
@@ -583,11 +581,9 @@ __device__ static inline void axis_fill(
             for(int e = 0; e < base::elements_per_thread; e++) {
                 const int c = -(K + (on_elements ? base::element_stride * e : 0));
                 const bool fill = FILL_LT ? (t < c) : (t >= c);
-                const T v = (e & 1) ? src.tiles[i][j].data[e>>1].y
-                                    : src.tiles[i][j].data[e>>1].x;
+                const T v = reinterpret_cast<const T *>(&src.tiles[i][j].data[0])[e];
                 const T out = fill ? T(val) : v;
-                if(e & 1) dst.tiles[i][j].data[e>>1].y = out;
-                else      dst.tiles[i][j].data[e>>1].x = out;
+                reinterpret_cast<T *>(&dst.tiles[i][j].data[0])[e] = out;   // any packing (int8_4: four a word)
             }
         }
     }

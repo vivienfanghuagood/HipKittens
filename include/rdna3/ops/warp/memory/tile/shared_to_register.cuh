@@ -137,8 +137,7 @@ __device__ inline static void load(RT &dst, const ST &src) {
                     const int2 c = rt_base_coord<T, L>(e, lane);
                     const T val = base_types::convertor<T, U>::convert(
                         src[{row_base + c.x, col_base + c.y}]);
-                    if (e & 1) dst.tiles[i][j].data[e>>1].y = val;
-                    else       dst.tiles[i][j].data[e>>1].x = val;
+                    reinterpret_cast<T *>(&dst.tiles[i][j].data[0])[e] = val;   // any packing (int8_4: four a word)
                 }
             }
         }
@@ -215,8 +214,7 @@ __device__ inline static void store(ST &dst, const RT &src) {
                 #pragma unroll
                 for(int e = 0; e < E; e++) {
                     const int2 c = rt_base_coord<T, L>(e, lane);
-                    const T val = (e & 1) ? src.tiles[i][j].data[e>>1].y
-                                          : src.tiles[i][j].data[e>>1].x;
+                    const T val = reinterpret_cast<const T *>(&src.tiles[i][j].data[0])[e];
                     dst[{row_base + c.x, col_base + c.y}] =
                         base_types::convertor<U, T>::convert(val);
                 }

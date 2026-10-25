@@ -41,8 +41,7 @@ __device__ inline static void load(RV &dst, const GL &src, const COORD &idx) {
             for(int e = 0; e < rv_align_held<T>(); e++) {
                 const int p = rv_align_entry<T>(e, lane);
                 const T val = base_types::convertor<T, U>::convert(src_ptr[w*kittens::TILE_ROW_DIM<T> + p]);
-                if(e & 1) dst.data[w][e>>1].y = val;
-                else      dst.data[w][e>>1].x = val;
+                reinterpret_cast<T *>(&dst.data[w][0])[e] = val;   // any packing (int8_4: four a word)
             }
         }
     }
@@ -89,7 +88,7 @@ __device__ inline static void store(const GL &dst, const RV &src, const COORD &i
             #pragma unroll
             for(int e = 0; e < rv_align_held<T>(); e++) {
                 const int p = rv_align_entry<T>(e, lane);
-                const T val = (e & 1) ? src.data[w][e>>1].y : src.data[w][e>>1].x;
+                const T val = reinterpret_cast<const T *>(&src.data[w][0])[e];
                 dst_ptr[w*kittens::TILE_ROW_DIM<T> + p] = base_types::store_convertor<U, T>::convert(val);
             }
         }

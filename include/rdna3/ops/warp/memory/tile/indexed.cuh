@@ -108,8 +108,7 @@ __device__ inline static void load_gather(RT &dst, const GL &src, const IL &idx,
                     const T v0 = base_types::convertor<T, U>::convert(run[rt_base_coord<T, L>(e, 0).y]);
                     const T v1 = base_types::convertor<T, U>::convert(run[rt_base_coord<T, L>(e, 16).y]);
                     const T val = half ? v1 : v0;
-                    if (e & 1) dst.tiles[i][j].data[e >> 1].y = val;
-                    else       dst.tiles[i][j].data[e >> 1].x = val;
+                    reinterpret_cast<T *>(&dst.tiles[i][j].data[0])[e] = val;   // any packing (int8_4: four a word)
                 }
             } else {
                 #pragma unroll
@@ -117,8 +116,7 @@ __device__ inline static void load_gather(RT &dst, const GL &src, const IL &idx,
                     const int cy = rt_base_coord<T, L>(e, lane).y;
                     const T val = base_types::convertor<T, U>::convert(
                         detail::buffer_load_elem<U>(srsrc, off == oob ? oob : off + cy * sizeof(U), 0));
-                    if (e & 1) dst.tiles[i][j].data[e >> 1].y = val;
-                    else       dst.tiles[i][j].data[e >> 1].x = val;
+                    reinterpret_cast<T *>(&dst.tiles[i][j].data[0])[e] = val;   // any packing (int8_4: four a word)
                 }
             }
         }
@@ -171,8 +169,7 @@ __device__ inline static void store_scatter(const GL &dst, const RT &src, const 
                 U val[E];
                 #pragma unroll
                 for (int e = 0; e < E; e++) {
-                    const T v = (e & 1) ? src.tiles[i][j].data[e >> 1].y
-                                        : src.tiles[i][j].data[e >> 1].x;
+                    const T v = reinterpret_cast<const T *>(&src.tiles[i][j].data[0])[e];
                     val[e] = base_types::store_convertor<U, T>::convert(v);
                 }
                 constexpr int NW = 2 * E * sizeof(U) / 4;
@@ -188,8 +185,7 @@ __device__ inline static void store_scatter(const GL &dst, const RT &src, const 
                 #pragma unroll
                 for (int e = 0; e < E; e++) {
                     const int cy = rt_base_coord<T, L>(e, lane).y;
-                    const T v = (e & 1) ? src.tiles[i][j].data[e >> 1].y
-                                        : src.tiles[i][j].data[e >> 1].x;
+                    const T v = reinterpret_cast<const T *>(&src.tiles[i][j].data[0])[e];
                     detail::buffer_store_elem<U>(srsrc, off == oob ? oob : off + cy * sizeof(U),
                                                  base_types::store_convertor<U, T>::convert(v));
                 }
@@ -223,8 +219,7 @@ __device__ inline static void atomic_add(const GL &dst, const RT &src, const COO
             #pragma unroll
             for (int e = 0; e < E; e++) {
                 const int2 c = rt_base_coord<T, L>(e, lane);
-                const float v = (e & 1) ? src.tiles[i][j].data[e >> 1].y
-                                        : src.tiles[i][j].data[e >> 1].x;
+                const float v = reinterpret_cast<const T *>(&src.tiles[i][j].data[0])[e];
                 atomicAdd(&p[(i * src.tile_size_row + c.x) * row_stride +
                              j * src.tile_size_col + c.y], v);
             }
