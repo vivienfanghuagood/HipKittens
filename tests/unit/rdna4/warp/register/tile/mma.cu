@@ -391,11 +391,107 @@ static void fp8_test_generator(test_data &results) {
 }
 #endif // KITTENS_RDNA4
 
+/*
+ * int8 -- v_wmma_i32_16x16x16_iu8, on gfx11 and gfx12 alike: rt<int8> row
+ * operands into an rt<int> accumulator, mma_ABt only. Small integers, so the
+ * i32 sums -- and their fp32 copy, which is what is stored -- are exact and the
+ * comparison is too. Hand-rolled like the fp8 section, for the same reason: A,
+ * B and C are three types. The LDS variant goes through st<int8>, the one-byte
+ * vectorized shared->register path.
+ */
+template<int H, int W, int KK, bool VIA_LDS>
+__global__ __launch_bounds__(kittens::WARP_THREADS, 1)
+void i8_mma_kernel(const kittens::gl<kittens::int8, 1, 1, 16*H, 16*KK> a_gl,
+                   const kittens::gl<kittens::int8, 1, 1, 16*W, 16*KK> b_gl,
+                   const kittens::gl<float, 1, 1, 16*H, 16*W> c_gl) {
+    kittens::rt<kittens::int8, 16*H, 16*KK, kittens::ducks::rt_layout::row> a;
+    kittens::rt<kittens::int8, 16*W, 16*KK, kittens::ducks::rt_layout::row> b;
+    kittens::rt<int, 16*H, 16*W, kittens::ducks::rt_layout::col> c;
+    kittens::rt_fl<16*H, 16*W, kittens::ducks::rt_layout::col> cf;
+    if constexpr (VIA_LDS) {
+        extern __shared__ kittens::alignment_dummy __shm[];
+        kittens::shared_allocator<16> al((int*)&__shm[0]);
+        using ST_A = kittens::st<kittens::int8, 16*H, 16*KK>;
+        ST_A &a_sh = al.allocate<ST_A>();
+        kittens::load(a_sh, a_gl, {0,0,0,0});
+        __builtin_amdgcn_s_barrier();
+        kittens::load(a, a_sh);
+    }
+    else {
+        kittens::load(a, a_gl, {});
+    }
+    kittens::load(b, b_gl, {});
+    __builtin_amdgcn_s_barrier();
+    #pragma unroll
+    for(int i = 0; i < c.height; i++)
+        #pragma unroll
+        for(int j = 0; j < c.width; j++)
+            #pragma unroll
+            for(int k = 0; k < c.packed_per_tile; k++) c.tiles[i][j].data[k] = int2{0, 0};
+    kittens::mma_ABt(c, a, b, c);
+    kittens::copy(cf, c);
+    kittens::store(c_gl, cf, {});
+}
+
+template<int H, int W, int KK, bool VIA_LDS>
+static void i8_mma_run(test_data &results) {
+    test_info this_result;
+    this_result.label = std::string("reg_mma_ABt_i8") + (VIA_LDS ? "_lds" : "") + "_["
+                      + std::to_string(16*H) + "x" + std::to_string(16*W) + "x" + std::to_string(16*KK) + "]";
+    constexpr int M = 16*H, N = 16*W, KD = 16*KK;
+    std::vector<int8_t> a(M*KD), b(N*KD);
+    std::mt19937 gen(7);
+    std::uniform_int_distribution<int> dis(-8, 8);
+    for(auto &x : a) x = int8_t(dis(gen));
+    for(auto &x : b) x = int8_t(dis(gen));
+    std::vector<float> c_ref(M*N), c_out(M*N);
+    for(int i = 0; i < M; i++)
+        for(int j = 0; j < N; j++) {
+            int sum = 0;
+            for(int k = 0; k < KD; k++) sum += int(a[i*KD + k]) * int(b[j*KD + k]);
+            c_ref[i*N + j] = float(sum);
+        }
+    kittens::int8 *d_a, *d_b; float *d_c;
+    hipMalloc(&d_a, a.size()); hipMalloc(&d_b, b.size()); hipMalloc(&d_c, M*N*sizeof(float));
+    hipMemcpy(d_a, a.data(), a.size(), hipMemcpyHostToDevice);
+    hipMemcpy(d_b, b.data(), b.size(), hipMemcpyHostToDevice);
+    HipCheckError();
+    kittens::gl<kittens::int8, 1, 1, M, KD> a_gl(d_a, nullptr, nullptr, nullptr, nullptr);
+    kittens::gl<kittens::int8, 1, 1, N, KD> b_gl(d_b, nullptr, nullptr, nullptr, nullptr);
+    kittens::gl<float, 1, 1, M, N> c_gl(d_c, nullptr, nullptr, nullptr, nullptr);
+    hipFuncSetAttribute(reinterpret_cast<const void*>(i8_mma_kernel<H, W, KK, VIA_LDS>),
+                        hipFuncAttributeMaxDynamicSharedMemorySize, kittens::MAX_SHARED_MEMORY / 2);
+    i8_mma_kernel<H, W, KK, VIA_LDS><<<1, kittens::WARP_THREADS, kittens::MAX_SHARED_MEMORY / 2>>>(a_gl, b_gl, c_gl);
+    hipDeviceSynchronize();
+    HipCheckError();
+    hipMemcpy(c_out.data(), d_c, M*N*sizeof(float), hipMemcpyDeviceToHost);
+    HipCheckError();
+    int bad = 0, first = -1;
+    for(int i = 0; i < M*N; i++) if(c_out[i] != c_ref[i]) { if(first < 0) first = i; bad++; }
+    std::cout << "test `" << this_result.label << "` ";
+    if(!bad) std::cout << " -- PASSED" << std::endl;
+    else std::cout << " ----- ALERT! FAILED test `" << this_result.label << "` -----" << std::endl
+                   << bad << " of " << M*N << " wrong; first at " << first << ": ref=" << c_ref[first]
+                   << ", out=" << c_out[first] << std::endl;
+    hipFree(d_a); hipFree(d_b); hipFree(d_c);
+    this_result.result = bad ? test_result::FAILED : test_result::PASSED;
+    results.push_back(this_result);
+}
+
+static void i8_test_generator(test_data &results) {
+    i8_mma_run<1, 1, 1, false>(results);
+    i8_mma_run<2, 2, 2, false>(results);
+    i8_mma_run<2, 3, 4, false>(results);
+    i8_mma_run<1, 1, 1, true>(results);
+    i8_mma_run<2, 2, 4, true>(results);
+}
+
 } // anonymous namespace
 void warp::reg::tile::mma::tests(test_data &results) {
     std::cout << "\n ----- Starting ops/warp/register/tile/mma tests! -----\n" << std::endl;
 
     test_generator<kittens::ducks::rt_shape::rt_16x16>(results);
+    i8_test_generator(results);
 #ifdef KITTENS_RDNA4
     fp8_test_generator(results);
 #endif

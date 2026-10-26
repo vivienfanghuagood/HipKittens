@@ -47,24 +47,21 @@ struct identifier {};
  * element index within a lane (data[] is these packed two at a time for the
  * 2- and 4-byte types, four at a time for fp8):
  *
- *   rt_base<bf16|half, row>  A operand   e -> (row l%16, col 8*(l/16) + e), e in 0..7
- *   rt_base<bf16|half, col>  B operand   e -> (row 8*(l/16) + e, col l%16), e in 0..7
- *   rt_base<fp8e4m3|fp8e5m2, row|col>    same as the 2-byte operands
- *   rt_base<float, col>      accumulator e -> (row 2e + l/16, col l%16),    e in 0..7
- *   rt_base<float, row>      transposed  e -> (row l%16, col 2e + l/16),    e in 0..7
+ *   rt_base<T, row>   e -> (row l%16, col 8*(l/16) + e), e in 0..7
+ *   rt_base<T, col>   e -> (row 8*(l/16) + e, col l%16), e in 0..7
  *
- * fp8 shares the operand mapping exactly -- gfx12's fp8 WMMA is the same
- * 16x16x16 shape as its bf16 one, not CDNA's K=32 variant, so the only thing
- * that changes is that the lane's 8 elements are 8 bytes instead of 16.
+ * for every T: a bf16/half/fp8/int8 A operand is row, B col; the f32 (or i32)
+ * accumulator is col, and a row-layout float tile is its transpose.  gfx12's
+ * fp8 and iu8 WMMA are the same 16x16x16 shape as its bf16 one, not CDNA's K=32
+ * variant, so the only thing that changes is that the lane's 8 elements are 8
+ * bytes instead of 16.  Measured on a gfx1201: see the note in common/util.cuh.
  *
  * The convention matches CDNA's: `row` means the lane picks the row and the
  * elements run along the columns, `col` is the transpose.  Every shape here is
- * exactly 8 elements per lane -- gfx12 replicates nothing -- and the only thing
- * that varies is how the two wave halves divide the element axis: operands
- * split k into 0..7 and 8..15, the accumulator interleaves even and odd rows.
- *
- * !! The operand half-split is inferred, not measured.  See the note on
- * WMMA_HALF_SHIFT in common/util.cuh. !!
+ * exactly 8 elements per lane -- gfx12 replicates nothing -- and the two wave
+ * halves divide the element axis into 0..7 and 8..15.  So an accumulator and
+ * the operand of the same layout hold the same elements in the same lanes, and
+ * converting one to the other moves nothing across lanes.
  */
 template<typename _T, ducks::rt_layout::all _layout> struct rt_base {
     using identifier = ducks::rt_base::identifier; ///< Type identifier for the rt_base structure.
@@ -76,7 +73,8 @@ template<typename _T, ducks::rt_layout::all _layout> struct rt_base {
 
     static_assert(
         std::is_same_v<dtype, bf16_2> || std::is_same_v<dtype, float2> || std::is_same_v<dtype, half_2>
-        || std::is_same_v<dtype, fp8e4m3_4> || std::is_same_v<dtype, fp8e5m2_4>,
+        || std::is_same_v<dtype, fp8e4m3_4> || std::is_same_v<dtype, fp8e5m2_4>
+        || std::is_same_v<dtype, int8_4> || std::is_same_v<dtype, int2>,
         "rt_base was provided an unsupported type."
     );
 
@@ -94,22 +92,21 @@ template<typename _T, ducks::rt_layout::all _layout> struct rt_base {
     static constexpr int registers_per_thread = packed_per_thread * sizeof(dtype) / 4; // registers are 32-bit words
 
     // 8 elements per lane whatever the type, so the VGPR cost follows the width:
-    // 2 for an fp8 operand, 4 for a 2-byte one, 8 for the f32 accumulator. This
-    // is the RDNA3 tree's static_assert(== 8) relaxed -- there, operand
-    // mirroring made every type cost 8, and here it is the halved operand that
-    // is the whole point. The three widths are exactly the three builtin
-    // operand types: v2i, v8f16/v8bf16, v8f32.
+    // 2 for an fp8 or int8 operand, 4 for a 2-byte one, 8 for the f32 or i32
+    // accumulator. This is the RDNA3 tree's static_assert(== 8) relaxed --
+    // there, operand mirroring made every type cost 8, and here it is the halved
+    // operand that is the whole point. The widths are exactly the builtin
+    // operand types: v2i32, v8f16/v8bf16, v8f32/v8i32.
     static_assert(elements_per_thread == 8, "unexpected gfx12 WMMA fragment size");
-    static_assert(registers_per_thread == (std::is_same_v<T, float> ? 8
-                                          : ducks::base_types::fp8<T> ? 2 : 4),
+    static_assert(registers_per_thread == (sizeof(T) == 4 ? 8 : sizeof(T) == 1 ? 2 : 4),
                   "unexpected gfx12 WMMA fragment width");
 
     /// Distance along the element axis between element `e` and element `e+1` of
-    /// a single lane. 1 for a WMMA operand (a lane holds a contiguous run of k);
-    /// 2 for the f32 accumulator (the two wave halves interleave along the axis).
+    /// a single lane: 1, a lane holds a contiguous run (on gfx11 the f32
+    /// accumulator's was 2, the two wave halves interleaving).
     static constexpr int element_stride = kittens::WMMA_ELEMENT_STRIDE<T>;
-    /// How far the upper wave half is shifted along that axis: 8 for an operand
-    /// (the halves split k), 1 for the accumulator (they interleave rows).
+    /// How far the upper wave half is shifted along that axis: 8, the halves
+    /// split it into 0..7 and 8..15.
     static constexpr int half_shift = kittens::WMMA_HALF_SHIFT<T>;
     /// Kept for symmetry with the RDNA3 tree, where it distinguished the mirrored
     /// operands from the interleaved accumulator. On gfx12 every shape is split.
@@ -152,9 +149,9 @@ __device__ static inline int2 rt_base_coord(int e, int lane) {
  *
  * An `align` vector is indexed along a tile's element axis, so it inherits that
  * axis' lane mapping: the vector is replicated across the 16 lanes of a wave
- * half, and each half holds only part of it -- every other entry for the f32
- * accumulator, a contiguous run of 8 for a WMMA operand.  (On RDNA3 the operand
- * case was the easy one, since both halves held everything; here it is not.)
+ * half, and each half holds only part of it -- a contiguous run of 8.  (On
+ * RDNA3 the operand case was the easy one, since both halves held everything;
+ * here it is not.)
  *
  * Returns the element index `e` in 0..elements_per_thread-1 that this lane uses
  * for entry `p` in 0..15, or -1 if this lane's half does not hold `p` at all.
@@ -164,13 +161,32 @@ template<typename T>
 __device__ static inline int rv_align_elem(int p, int lane) {
     using base = rt_base<T, ducks::rt_layout::row>; // stride/shift depend only on T
     // Invert pos = element_stride*e + half_shift*h for this lane's half, and
-    // report -1 when no e in range produces p. For the accumulator that reads
-    // "this half holds the even (or odd) entries"; for an operand, "this half
-    // holds k in 0..7 (or 8..15)".
+    // report -1 when no e in range produces p: "this half holds entries 0..7
+    // (or 8..15)".
     const int q = p - base::half_shift * (lane >> 4);
     if (q < 0 || q >= base::element_stride * base::elements_per_thread) return -1;
     if constexpr (base::element_stride > 1) if (q % base::element_stride) return -1;
     return q / base::element_stride;
+}
+
+/**
+ * @brief The other direction: how many entries of a 16-entry align_l block a
+ * lane holds, and which entry its `e`-th slot is.
+ *
+ * Accesses are written as a loop over these slots, not over all sixteen
+ * entries with rv_align_elem's -1 skipped: the skip depends on the lane, so
+ * that form compiles to one divergent branch -- and one serialized memory
+ * round trip -- per entry, where this one is a straight run of loads whose
+ * address merely differs by half.
+ */
+template<typename T>
+__device__ static inline constexpr int rv_align_held() {
+    return rt_base<T, ducks::rt_layout::row>::elements_per_thread;
+}
+template<typename T>
+__device__ static inline int rv_align_entry(int e, int lane) {
+    using base = rt_base<T, ducks::rt_layout::row>;
+    return base::element_stride * e + base::half_shift * (lane >> 4);
 }
 
 /* ----------  CONCEPTS  ---------- */

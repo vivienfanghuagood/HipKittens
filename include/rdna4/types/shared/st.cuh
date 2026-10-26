@@ -79,8 +79,13 @@ namespace kittens {
                     underlying_width%4 == 0 ? 64 :
                     underlying_width%2 == 0 ? 32 : 16
                 ) :
-                underlying_width%4 == 0 ? 128 :
-                underlying_width%2 == 0 ?  64 : 32
+                // A row of an int8 tile is 16 bytes a 16-column subtile: 128-byte
+                // subtiles need eight of them. (This said %4 -> 128, copied from
+                // the 2-byte case; unused until rt<int8> existed, then it laid a
+                // 16x64 tile out as 16x128 and ran into the next allocation.)
+                underlying_width%8 == 0 ? 128 :
+                underlying_width%4 == 0 ?  64 :
+                underlying_width%2 == 0 ?  32 : 16
             ) :
             sizeof(dtype) == 2 ? (
                 underlying_width%4 == 0 ? 128 :

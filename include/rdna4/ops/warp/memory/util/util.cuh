@@ -106,6 +106,36 @@ __device__ inline float4 load_global_vec4(const float4* gptr) {
     return v;
 }
 
+#ifndef KITTENS_ROW_BOUNDS
+#define KITTENS_ROW_BOUNDS 1
+#endif
+
+/**
+ * @brief How many of a tile's TILE_ROWS rows, starting at element coordinate
+ *        `uc`, lie inside `g` along `axis` -- clamped to [0, TILE_ROWS].
+ *
+ * The row predicate every global load and store below applies: past it a load
+ * reads zero and a store writes nothing, so a tile hanging off the end of a
+ * tensor is legal instead of a read past the allocation. It is one scalar
+ * compare, and for a whole tile every caller takes its unpredicated path.
+ * Where the loads are buffer ops the predicate is the buffer's range and the
+ * instruction count does not change, which is what keeps a hand-placed vmcnt
+ * a compile-time immediate.
+ *
+ * KITTENS_ROW_BOUNDS=0 treats every tile as whole -- the behaviour before the
+ * predicate existed, kept so the two can be timed against each other.
+ */
+template<int axis, int TILE_ROWS, typename GL, typename COORD>
+__device__ inline int rows_in_bounds(const GL &g, const COORD &uc) {
+#if KITTENS_ROW_BOUNDS
+    const int start = axis == 0 ? uc.b : axis == 1 ? uc.d : uc.r;
+    const int left = int(g.template shape<axis>()) - start;
+    return left <= 0 ? 0 : (left < TILE_ROWS ? left : TILE_ROWS);
+#else
+    return TILE_ROWS;
+#endif
+}
+
 using i32x4 = int32_t __attribute__((ext_vector_type(4)));
 struct buffer_resource {
     uint64_t ptr;
@@ -168,8 +198,24 @@ __device__ inline i32x4 make_srsrc(const void* ptr, uint32_t range_bytes) {
     std::uintptr_t as_int = reinterpret_cast<std::uintptr_t>(ptr);   // width = sizeof(void*)
     std::uint64_t  as_u64 = static_cast<std::uint64_t>(as_int);    // widen if host is 32-bit
     buffer_resource rsrc = make_buffer_resource(as_u64, range_bytes, GFX12_BUFFER_CONFIG);
-    return *reinterpret_cast<const i32x4*>(&rsrc);
+    i32x4 r = *reinterpret_cast<const i32x4*>(&rsrc);
+    // A buffer instruction takes its descriptor in SGPRs. Every caller builds
+    // it from a tile coordinate, which is uniform across the wave, but LLVM
+    // cannot always see that -- a coordinate derived from the warp index looks
+    // per-lane -- and then wraps each buffer op in a waterfall loop. On the
+    // GEMM's bounded epilogue that was 64 loops and 8% of the kernel.
+    r.x = __builtin_amdgcn_readfirstlane(r.x);
+    r.y = __builtin_amdgcn_readfirstlane(r.y);
+    r.z = __builtin_amdgcn_readfirstlane(r.z);
+    r.w = __builtin_amdgcn_readfirstlane(r.w);
+    return r;
 }
+
+__device__ uint16_t llvm_amdgcn_raw_buffer_load_b16(i32x4 srsrc, uint32_t voffset, uint32_t soffset, uint32_t coherency)
+    __asm("llvm.amdgcn.raw.buffer.load.i16");
+
+__device__ uint32_t llvm_amdgcn_raw_buffer_load_b32(i32x4 srsrc, uint32_t voffset, uint32_t soffset, uint32_t coherency)
+    __asm("llvm.amdgcn.raw.buffer.load.i32");
 
 __device__ uint64_t llvm_amdgcn_raw_buffer_load_b64(i32x4 srsrc, uint32_t voffset, uint32_t soffset, uint32_t coherency)
     __asm("llvm.amdgcn.raw.buffer.load.i64");
@@ -250,6 +296,76 @@ __device__ inline float2 load_shared_vec_async(uint32_t lds_off) {
 template<int N=0> __device__ inline void lds_wait() {
     static_assert(N >= 0 && N <= 63, "dscnt is 6 bits");
     asm volatile("s_wait_dscnt %0" :: "i"(N) : "memory");
+}
+
+namespace detail {
+typedef float bind_v4f __attribute__((ext_vector_type(4)));
+
+// The offset is a template parameter, not a loop index, so every access is a
+// constant offset in the IR that SROA sees -- an object reached through a
+// runtime offset would be forced to scratch, which on a hand-waited kernel is
+// worse than the bug this is fixing.
+template<int I, int N, typename T> __device__ inline void bind_regs(T &x) {
+    if constexpr (I < N) {
+        bind_v4f v;
+        __builtin_memcpy(&v, (const char *)&x + I * sizeof(bind_v4f), sizeof(v));
+        asm volatile("" : "+v"(v));
+        __builtin_memcpy((char *)&x + I * sizeof(bind_v4f), &v, sizeof(v));
+        bind_regs<I + 1, N>(x);
+    }
+}
+}  // namespace detail
+
+/**
+ * @brief Re-establish the register dependence that s_waitcnt does not carry.
+ *
+ * `load_shared_vec4_async` writes its destination through an inline-asm *output*
+ * operand, so LLVM believes the value is ready the instant the asm statement
+ * ends. `lds_wait` is a separate volatile asm sharing no operands with it, and
+ * `v_wmma` is a pure builtin with no memory effect -- so nothing in the IR stops
+ * the scheduler from hoisting the consuming WMMA above the wait, and it does,
+ * nondeterministically, as soon as register pressure shifts. It is not a spill:
+ * ScratchSize stays 0 while the answer changes run to run.
+ *
+ * Binding the destination after the wait puts the missing edge back. The bind
+ * cannot move above the wait (volatile asm is ordered against volatile asm) and
+ * the consumer cannot move above the bind (it reads the bind's outputs). It
+ * costs nothing at runtime: "+v" ties each output to its own input register, so
+ * no instruction is emitted.
+ *
+ * Any tile loaded with `load<false>` and waited on by hand has to go through
+ * this (or through `lds_wait_for`, which does both) before it is used.
+ */
+template<typename T> __device__ inline void lds_bind(T &x) {
+    static_assert(sizeof(T) % sizeof(detail::bind_v4f) == 0,
+                  "lds_bind takes whole 128-bit register groups");
+    detail::bind_regs<0, sizeof(T) / sizeof(detail::bind_v4f)>(x);
+}
+
+/**
+ * @brief `lds_wait<N>()` followed by `lds_bind` on each tile it retires.
+ *
+ * The form to reach for: the wait alone is not enough to order a WMMA against
+ * the reads it is waiting on. See lds_bind.
+ */
+template<int N=0, typename... Ts> __device__ inline void lds_wait_for(Ts&... xs) {
+    lds_wait<N>();
+    (lds_bind(xs), ...);
+}
+
+/**
+ * @brief Wait until at most `N` vector-memory loads are still outstanding.
+ *
+ * The loadcnt analogue of lds_wait (gfx11's vmcnt; gfx12 counts stores
+ * separately, in storecnt). Buffer loads return in issue order, so a
+ * caller that keeps D batches of `B` loads in flight retires the oldest batch
+ * with vm_wait<(D-1)*B>() and leaves the newer D-1 batches moving. That is how
+ * the GEMM gets a global prefetch distance of more than one K-tile without
+ * more than one barrier.
+ */
+template<int N=0> __device__ inline void vm_wait() {
+    static_assert(N >= 0 && N <= 63, "loadcnt is 6 bits");
+    asm volatile("s_wait_loadcnt %0" :: "i"(N) : "memory");
 }
 
 /*

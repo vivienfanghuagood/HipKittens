@@ -60,8 +60,9 @@ struct rv {
     static_assert(length % kittens::TILE_ROW_DIM<T> == 0, "Length must be divisible by the tile dimension");
     static constexpr int tiles  = _length / kittens::TILE_ROW_DIM<T>; ///< Length in subtiles, aliased for consistency with sv type
     /// Internal layout within a subtile. 1 for naive/ortho (one entry per lane);
-    /// for align it is however many packed pairs a lane holds of the tile this
-    /// vector came off, i.e. 4 for f32 accumulators and 8 for bf16/half operands.
+    /// for align it is however many packed words a lane holds of the tile this
+    /// vector came off: 8 entries, so 4 pairs for f32 / bf16 / half and 2 quads
+    /// for fp8.
     static constexpr int inner_dim =
         is_naive || is_ortho
         ? 1

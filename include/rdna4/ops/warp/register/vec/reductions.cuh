@@ -51,10 +51,9 @@ __device__ static inline void reduce(
     else if constexpr (std::is_same_v<typename RV::layout, align_l>) {
         // align replicates across the 16 lanes of a half, so a lane already
         // holds every entry its half has -- the fold is entirely register-local.
-        // The only thing it cannot see is the other half, and the halves differ
-        // only for accumulators, whose element axis is strided by 2 with the
-        // wave-half bit supplying the low bit of the position. Operands mirror,
-        // so for them the exchange would be a no-op and is compiled out.
+        // The only thing it cannot see is the other half, which on gfx12 holds
+        // the other 8 entries of every 16 (gfx11's operands mirrored, and there
+        // the exchange compiled out).
         using T2 = typename RV::dtype;                                // packed
         T2 accum2 = src[0][0];
         #pragma unroll

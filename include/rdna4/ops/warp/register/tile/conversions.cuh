@@ -18,31 +18,16 @@ namespace kittens {
  *   row layout: (row, col) = (lane_low, pos)
  *   col layout: (row, col) = (pos, lane_low)
  *
- * How pos is physically stored is the whole difference between the two kinds of
- * tile gfx12 has.  Both spread the 16 positions over the two wave halves, 8 per
- * lane, and differ only in which bit of pos the wave-half bit carries:
+ * On gfx12 every fragment stores pos the same way, operand or accumulator,
+ * whatever its type: pos = e + 8*(laneid >> 4).  Bit 3 of pos lives in the
+ * wave-half bit; bits 2:0 are the element index.  (Measured on a gfx1201; see
+ * the note in common/util.cuh.  The gfx11 accumulator kept bit 0 of pos in the
+ * wave-half bit instead, which is why the RDNA3 tree's copy() between a float
+ * and a bf16 tile crosses the halves, and this one's does not.)
  *
- *   operands (bf16/half): pos = e + 8*(laneid >> 4). Bit 3 of pos lives in the
- *     wave-half bit; bits 2:0 are the element index.
- *
- *   accumulators (float): pos = 2*e + (laneid >> 4). Bit 0 of pos lives in the
- *     wave-half bit; bits 3:1 are the element index.
- *
- * So each shape is `pos = element_stride*e + half_shift*h`, and everything below
- * is parameterised on log2(half_shift) -- 3 for an operand, 0 for an
- * accumulator -- rather than on the RDNA3 tree's `halves_interleave` flag, which
- * there distinguished the mirrored operand (half bit carries nothing) from the
- * interleaved accumulator.  On gfx12 there is no mirroring and no such split.
- *
- * That is why the conversions here are not the CDNA ones with a different lane
- * formula -- on CDNA every tile spreads its element axis the same way, so copy()
- * between two dtypes is pointwise. Here a float tile and a bf16 tile of the same
- * shape hold their values in genuinely different places, and copy() has to move
- * data across the wave halves.
- *
- * !! NOT HARDWARE-VERIFIED.  The operand half-split these derivations rest on is
- * inferred from the builtin's fragment width; see the note on WMMA_HALF_SHIFT in
- * common/util.cuh. !!
+ * So copy() between two element types of one layout is pointwise, as on CDNA,
+ * and the only conversions that move data are the layout swaps and transposes:
+ * a 16x16 transpose of the (lane_low, pos) grid.
  */
 
 /* ----------  LAYOUT SWAPS  ---------- */
@@ -83,40 +68,30 @@ __device__ static inline void xpose_stage(T (&v)[E], const int lane) {
  * the axes, the other relabels the matrix -- so they share this routine and
  * differ only in the type they hand back.
  *
- * Four stages, stage i swapping bit i of lane_low with bit i of pos.  Exactly
- * one bit of pos -- bit HALF_BIT = log2(half_shift) -- is carried by the wave
- * half rather than by the element index, and that stage is the odd one out:
- *
- *   the HALF_BIT stage has to swap lane bit HALF_BIT with lane bit 4.  That is
- *     not a power-of-two butterfly; it is lane ^ ((1<<HALF_BIT) | 16), applied
- *     only to the lanes where the two bits disagree (those lanes swap their
- *     entire register file, since all of a lane's values share that pos bit).
- *
- *   the other three stages are the ordinary butterfly, pairing lane bit
- *     j+ES_SHIFT with element-index bit j, where ES_SHIFT = log2(element_stride).
- *
- * For the accumulator (ES_SHIFT 1, HALF_BIT 0) that is lane^17 plus stages
- * <2,1> <4,2> <8,4>; for an operand (ES_SHIFT 0, HALF_BIT 3) it is lane^24 plus
- * <1,1> <2,2> <4,4>.  Either way: 8 permlanex16 and 12 DPP movs per base tile.
- * Compare a round trip through LDS, which is what the CDNA code's
+ * Four stages, stage i swapping bit i of lane_low with bit i of pos.  Bit 3 of
+ * pos is carried by the wave half rather than by the element index, and that
+ * stage is the odd one out: it swaps lane bit 3 with lane bit 4, which is not a
+ * power-of-two butterfly but lane ^ 24, applied only to the lanes where the two
+ * bits disagree (those lanes swap their entire register file, since all of a
+ * lane's values share that pos bit).  The other three stages are the ordinary
+ * butterfly, lane bit j with element bit j.  8 permlanex16 and 12 DPP movs per
+ * base tile, against a round trip through LDS, which is what the CDNA code's
  * dynamically-indexed __shfl lowers to.
  *
- * The RDNA3 version of this had a second, cheaper path for operands, because
- * there the halves were mirrors and the wave-half bit could simply be ignored --
- * 20 pure-DPP exchanges and no permlanex16.  gfx12 buys its halved operand
- * register cost partly here.
+ * The values are lifted out of the packed words into one T each, so the routine
+ * serves every packing (two a word for the 2- and 4-byte types, four for fp8
+ * and int8).  A word-level form that keeps element pairs together, as the gfx11
+ * tree's transpose_operand_words does, would save instructions on the 2-byte
+ * tiles; not written yet.
  */
-template<int HALF_BIT, int ES_SHIFT, typename T2, int P>
+template<typename T, int HALF_BIT, int ES_SHIFT, typename T2, int P>
 __device__ static inline void transpose_base_data(T2 (&dst)[P], const T2 (&src)[P], const int lane) {
-    using T = typename base_types::packing<T2>::unpacked_type;
-    constexpr int E = 2 * P;
+    constexpr int E = P * base_types::packing<T2>::num();
     static_assert(E == 8, "a gfx12 base tile holds 8 elements per lane");
-    static_assert(HALF_BIT == 0 || HALF_BIT == 3, "only the two gfx12 fragment shapes are derived here");
-    static_assert(ES_SHIFT == (HALF_BIT == 0 ? 1 : 0), "element_stride and half_shift must tile pos exactly");
+    static_assert(HALF_BIT == 3 && ES_SHIFT == 0, "gfx12 has one fragment shape: pos = e + 8*half");
 
     T v[E];
-    #pragma unroll
-    for(int k = 0; k < P; k++) { v[2*k] = src[k].x; v[2*k+1] = src[k].y; }
+    __builtin_memcpy(v, (const void*)&src[0], sizeof(v));
 
     // The stage that crosses the wave halves.
     const bool swap_halves = (((lane >> HALF_BIT) ^ (lane >> 4)) & 1) != 0;
@@ -130,8 +105,13 @@ __device__ static inline void transpose_base_data(T2 (&dst)[P], const T2 (&src)[
     xpose_stage<1 << (1 + ES_SHIFT), 1 << 1, T, E>(v, lane);
     xpose_stage<1 << (2 + ES_SHIFT), 1 << 2, T, E>(v, lane);
 
-    #pragma unroll
-    for(int k = 0; k < P; k++) { dst[k].x = v[2*k]; dst[k].y = v[2*k+1]; }
+    __builtin_memcpy((void*)&dst[0], v, sizeof(v));
+}
+
+template<typename T, ducks::rt_layout::all layout, typename T2, int P>
+__device__ static inline void transpose_base(T2 (&dst)[P], const T2 (&src)[P], const int lane) {
+    using base = rt_base<T, layout>;
+    transpose_base_data<T, log2_exact(base::half_shift), log2_exact(base::element_stride)>(dst, src, lane);
 }
 
 } // namespace detail
@@ -149,10 +129,7 @@ __device__ static inline void transpose_base_data(T2 (&dst)[P], const T2 (&src)[
  */
 template<typename T, ducks::rt_layout::all layout>
 __device__ inline void swap_layout(rt_base<T, typename ducks::rt_layout::transpose<layout>::type> &dst, const rt_base<T, layout> &src) {
-    using base = rt_base<T, layout>;
-    detail::transpose_base_data<detail::log2_exact(base::half_shift),
-                                detail::log2_exact(base::element_stride)>(
-        dst.data, src.data, laneid());
+    detail::transpose_base<T, layout>(dst.data, src.data, laneid());
 }
 
 /**
@@ -229,10 +206,7 @@ __device__ static inline rt<T2, _rows, _cols, typename ducks::rt_layout::transpo
  */
 template<typename T, ducks::rt_layout::all layout>
 __device__ inline void transpose(rt_base<T, layout> &dst, const rt_base<T, layout> &src) {
-    using base = rt_base<T, layout>;
-    detail::transpose_base_data<detail::log2_exact(base::half_shift),
-                                detail::log2_exact(base::element_stride)>(
-        dst.data, src.data, laneid());
+    detail::transpose_base<T, layout>(dst.data, src.data, laneid());
 }
 
 /**
@@ -329,31 +303,11 @@ __device__ static inline rt<T2, _rows, _cols, layout>& transpose_inplace(rt<T2, 
 /**
  * @brief Copies a register base tile, converting the underlying type if necessary.
  *
- * Between two tiles of the same element_stride this is pointwise, as on CDNA.
- * Across strides it is not, because the two kinds of tile spread `pos`
- * differently: an accumulator lane owns the 8 positions whose parity matches its
- * wave half, an operand lane owns the contiguous run 8h..8h+7.  Neither is a
- * subset of the other, so -- unlike RDNA3, where the operand held everything and
- * the operand->accumulator direction was a free discard -- *both* directions
- * have to cross the halves here.
- *
- * Both are the same 8 exchanges.  Step e hands a lane its own element e and its
- * mirror's element e, which between them are two known positions; the lane keeps
- * whichever of the two it needs and drops the other.  Half the exchanges are
- * therefore wasted in each half, and that is not avoidable with a symmetric
- * permlanex16: the element index a lane wants at a given step depends on its own
- * wave half, so the two partners can never both be asking for the register the
- * other one needs.
- *
- *   accumulator -> operand (float -> bf16/half).  This is the conversion
- *     attention needs between the score matrix and the second matmul's operand.
- *     Source element u is position 2u+h and source element u+4 is 2u+8+h; a lane
- *     in half 0 wants positions 2u and 2u+1 (from the first exchange), a lane in
- *     half 1 wants 2u+8 and 2u+9 (from the second).
- *
- *   operand -> accumulator.  Source element m is position m+8h.  Destination
- *     element t is position 2t+h and t+4 is 2t+8+h, which sit in element 2t+h of
- *     one half or the other depending on t.
+ * Pointwise: every gfx12 fragment of one layout holds the same element in the
+ * same lane and slot whatever its type (see the top of this file), so an f32
+ * accumulator becomes a bf16 operand of the same layout -- attention's P, a
+ * GEMM epilogue -- with no lane exchange at all.  On gfx11 it crossed the wave
+ * halves in both directions.
  *
  * @tparam T The data type of the destination register elements.
  * @tparam U The data type of the source register elements.
@@ -367,60 +321,22 @@ __device__ static inline void copy(rt_base<T, layout> &dst, const rt_base<U, lay
     using S  = rt_base<U, layout>;
     using T2 = typename base_types::packing<T>::packed_type;
     using U2 = typename base_types::packing<U>::packed_type;
+    static_assert(D::element_stride == S::element_stride && D::half_shift == S::half_shift,
+                  "gfx12 fragments of one layout share a shape");
 
-    // Read element e of a packed array, and write element e of another.
-    auto get = [](const auto &a, int e) { return (e & 1) ? a[e>>1].y : a[e>>1].x; };
-
-    if constexpr (D::element_stride == S::element_stride) {
+    if constexpr (base_types::packing<T2>::num() == base_types::packing<U2>::num()) {
         #pragma unroll
         for(int k = 0; k < D::packed_per_thread; k++) {
             dst.data[k] = base_types::convertor<T2, U2>::convert(src.data[k]);
         }
     }
-    else if constexpr (S::element_stride == 2) {
-        // accumulator (pos 2e+h) -> operand (pos m+8h).
-        const int h = laneid() >> 4;
-        #pragma unroll
-        for(int u = 0; u < D::packed_per_thread; u++) {   // 4
-            // Step u: source element u carries position 2u+h, so after the
-            // exchange this lane has both 2u and 2u+1 -- which half 0 wants.
-            const U own_lo   = get(src.data, u);
-            const U other_lo = lane_xor<HALF_WAVE_SWAP>(own_lo);
-            // Step u+4: source element u+4 carries 2u+8+h, giving both 2u+8 and
-            // 2u+9 -- which half 1 wants, as its operand elements 2u and 2u+1.
-            const U own_hi   = get(src.data, u + S::elements_per_thread/2);
-            const U other_hi = lane_xor<HALF_WAVE_SWAP>(own_hi);
-            // Select on U = float here, then convert; see the note below on why
-            // the other direction cannot be written that way round.
-            dst.data[u].x = base_types::convertor<T, U>::convert(h ? other_hi : own_lo);
-            dst.data[u].y = base_types::convertor<T, U>::convert(h ? own_hi   : other_lo);
-        }
-    }
     else {
-        // operand (pos m+8h) -> accumulator (pos 2t+h).
-        //
-        // Convert before selecting, not after. U is bf16 or half here, which
-        // are classes wrapping a short; a runtime select between two of them
-        // materialises a temporary, and that is enough to make LLVM give up
-        // on SROA and park the whole source tile in scratch. T is float in
-        // this branch -- selecting on it stays in registers.
-        const int h = laneid() >> 4;
-        constexpr int Q = D::packed_per_thread;                // 4
+        // Different packings (fp32 <-> fp8 or int8): element by element. The
+        // indices are constants, so this stays in registers.
         #pragma unroll
-        for(int t = 0; t < Q; t++) {
-            // Source element 2t carries position 2t+8h, so the exchange yields
-            // positions 2t (from half 0) and 2t+8 (from half 1); element 2t+1
-            // likewise yields 2t+1 and 2t+9.  Half 0 wants the even pair, half 1
-            // the odd pair, as destination elements t and t+4.
-            const T own_ev   = base_types::convertor<T, U>::convert(get(src.data, 2*t));
-            const T other_ev = lane_xor<HALF_WAVE_SWAP>(own_ev);
-            const T own_od   = base_types::convertor<T, U>::convert(get(src.data, 2*t + 1));
-            const T other_od = lane_xor<HALF_WAVE_SWAP>(own_od);
-            const T lo = h ? other_od : own_ev;    // position 2t + h
-            const T hi = h ? own_od   : other_ev;  // position 2t + 8 + h
-            if(t & 1) dst.data[t>>1].y = lo; else dst.data[t>>1].x = lo;
-            const int th = t + Q;
-            if(th & 1) dst.data[th>>1].y = hi; else dst.data[th>>1].x = hi;
+        for(int e = 0; e < D::elements_per_thread; e++) {
+            reinterpret_cast<T *>(&dst.data[0])[e] = base_types::convertor<T, U>::convert(
+                reinterpret_cast<const U *>(&src.data[0])[e]);
         }
     }
 }
@@ -452,35 +368,126 @@ __device__ static inline void copy(rt<T2, _height, _width, layout> &dst, const r
 namespace detail {
 
 /**
- * @brief Rewrite every element of a tile as a function of its (row, col).
+ * @brief Fill on one side of a shifted diagonal, without materialising the diagonal.
  *
- * The CDNA versions of the masks below carry hand-derived lane formulas, and the
- * on-diagonal cases carry 64-bit magic masks indexed by laneid. None of that
- * survives a change of wave width or replication, so this asks rt_base_coord()
- * for the coordinate instead and writes the predicate out in full. These are not
- * hot -- they run once per tile of a masked matmul, not once per k-step -- and a
- * predicate the next person can read is worth more here than the mask trick.
+ * The readable lowering asks rt_base_coord() for each element's (row, col) and
+ * writes the predicate out in full. That is the right shape for an axis
+ * predicate, where only one of the two is needed and it is a single register.
+ * A *diagonal* predicate needs both, and `col - row` varies with the element
+ * index, so the same lowering holds one register per element of the tile --
+ * eight, for every layout on this architecture -- live for as long as the mask
+ * is in a loop. That is what it costs: the attention kernel's causal mask
+ * spilled 152 B/lane written that way, the whole Q register file along with
+ * it, and spilling is a wrong answer in a kernel that hand-places `s_waitcnt`.
+ *
+ * The element index is not actually on the lane axis, though. Writing out
+ * rt_base_coord(),
+ *
+ *     row layout:  col - row = (element_stride*e + h) - l16
+ *     col layout:  col - row = l16 - (element_stride*e + h)
+ *
+ * with `l16 = lane & 15` and `h = half_shift * (lane >> 4)`, so
+ *
+ *     col - row = dbase +/- element_stride*e,   dbase = +/-(h - l16)
+ *
+ * -- one lane-dependent register for the whole tile, and a per-element *shift*
+ * that is a compile-time constant once the loops unroll. Which side of the
+ * compare it lands on matters. `dbase >= -row_idx - off - se` is one VGPR and a
+ * scalar threshold on paper, but the right-hand side is loop-invariant per
+ * element and LLVM reassociates it straight back into eight hoisted registers;
+ * that was measured too, and it spills harder than the naive form. Folding
+ * `row_idx` into the lane value instead leaves
+ *
+ *     keep  <=>  dbase + row_idx >= -(off + se)
+ *
+ * whose right-hand side is an *integer literal*. There is nothing left to
+ * hoist: one VGPR for the whole tile, and `elements_per_thread` compares
+ * against immediates.
+ *
+ * @tparam KEEP_GE true keeps `col - row >= -row_idx` (triu's complement),
+ *                 false keeps `col - row <= -row_idx` (tril's).
  */
-template<ducks::rt::all RT, typename F>
-__device__ static inline void map_by_coord(RT &dst, const RT &src, F &&f) {
+template<bool KEEP_GE, ducks::rt::all RT>
+__device__ static inline void diag_fill(
+        RT &dst, const RT &src, const int row_idx,
+        const typename base_types::packing<typename RT::dtype>::unpacked_type &val) {
     using T    = typename RT::T;
     using L    = typename RT::layout;
     using base = rt_base<T, L>;
-    const int lane = laneid();
+    constexpr bool is_row = std::is_same_v<L, ducks::rt_layout::row>;
+    const int lane  = laneid();
+    const int h     = base::half_shift * (lane >> 4);
+    const int dbase = is_row ? (h - (lane & 15)) : ((lane & 15) - h);
+    // The one register the predicate costs. Everything else is an immediate.
+    const int d = dbase + row_idx;
     #pragma unroll
     for(int i = 0; i < RT::height; i++) {
         #pragma unroll
         for(int j = 0; j < RT::width; j++) {
-            // dtype packs 4 elements for fp8 and 2 for everything else, so
-            // index the unpacked type rather than through .x/.y.
-            const T* in  = reinterpret_cast<const T*>(&src.tiles[i][j].data[0]);
-            T*       out = reinterpret_cast<T*>(&dst.tiles[i][j].data[0]);
+            // The tile's own offset into the wider tile, on the same axis.
+            const int off = j * base::tile_size_col - i * base::tile_size_row;
             #pragma unroll
             for(int e = 0; e < base::elements_per_thread; e++) {
-                const int2 c   = rt_base_coord<T, L>(e, lane);
-                const int  row = i * base::tile_size_row + c.x;
-                const int  col = j * base::tile_size_col + c.y;
-                out[e] = f(row, col, in[e]);
+                const int se  = is_row ? base::element_stride * e
+                                       : -base::element_stride * e;
+                const int c = -(off + se);
+                const bool keep = KEEP_GE ? (d >= c) : (d <= c);
+                const T v = reinterpret_cast<const T *>(&src.tiles[i][j].data[0])[e];
+                const T out = keep ? v : T(val);
+                reinterpret_cast<T *>(&dst.tiles[i][j].data[0])[e] = out;   // any packing (int8_4: four a word)
+            }
+        }
+    }
+}
+
+/**
+ * @brief Fill on one side of an axis index, without materialising the index.
+ *
+ * The same economy as `diag_fill`, for the rectangular masks. Half of these
+ * are already cheap: a tile's row index is `lane & 15` in row layout and its
+ * column index is `lane & 15` in col layout, one register either way. The other
+ * half are not -- the *element* axis reads `element_stride*e + h`, which is a
+ * value per element of the tile, and a mask inside a loop holds all of them
+ * live. Attention's tail mask is on that axis (a row of S^T is a kv index) and
+ * cost six hoisted, spilled registers until it was hidden behind a branch.
+ *
+ * Writing the coordinate as `K + ce + base` -- `K` the tile's offset, `ce` the
+ * per-element shift, `base` the one lane-dependent term -- and moving the
+ * constants across the compare leaves `base - idx` against an immediate. One
+ * register, and no reason left to guard the mask with a branch.
+ *
+ * @tparam AXIS_IS_ROW true for the row masks (upper/lower), false for the
+ *                     column masks (left/right).
+ * @tparam FILL_LT     true fills where the coordinate is `< idx`, false where
+ *                     it is `>= idx`.
+ */
+template<bool AXIS_IS_ROW, bool FILL_LT, ducks::rt::all RT>
+__device__ static inline void axis_fill(
+        RT &dst, const RT &src, const int idx,
+        const typename base_types::packing<typename RT::dtype>::unpacked_type &val) {
+    using T    = typename RT::T;
+    using L    = typename RT::layout;
+    using base = rt_base<T, L>;
+    constexpr bool is_row = std::is_same_v<L, ducks::rt_layout::row>;
+    // row layout puts the elements on the column axis and col layout on the
+    // row axis, so exactly one of the two masks pays the per-element shift.
+    constexpr bool on_elements = (AXIS_IS_ROW != is_row);
+    const int lane = laneid();
+    const int h    = base::half_shift * (lane >> 4);
+    const int t    = (on_elements ? h : (lane & 15)) - idx;
+    #pragma unroll
+    for(int i = 0; i < RT::height; i++) {
+        #pragma unroll
+        for(int j = 0; j < RT::width; j++) {
+            const int K = AXIS_IS_ROW ? i * base::tile_size_row
+                                      : j * base::tile_size_col;
+            #pragma unroll
+            for(int e = 0; e < base::elements_per_thread; e++) {
+                const int c = -(K + (on_elements ? base::element_stride * e : 0));
+                const bool fill = FILL_LT ? (t < c) : (t >= c);
+                const T v = reinterpret_cast<const T *>(&src.tiles[i][j].data[0])[e];
+                const T out = fill ? T(val) : v;
+                reinterpret_cast<T *>(&dst.tiles[i][j].data[0])[e] = out;   // any packing (int8_4: four a word)
             }
         }
     }
@@ -500,8 +507,7 @@ __device__ static inline void map_by_coord(RT &dst, const RT &src, F &&f) {
  */
 template<ducks::rt::all RT>
 __device__ static inline void make_causal(RT &dst, const RT &src, const typename base_types::packing<typename RT::dtype>::unpacked_type &val=0) {
-    using T = typename RT::T;
-    detail::map_by_coord(dst, src, [&](int row, int col, T v) { return col <= row ? v : val; });
+    detail::diag_fill<false>(dst, src, 0, val);
 }
 
 /**
@@ -514,8 +520,7 @@ __device__ static inline void make_causal(RT &dst, const RT &src, const typename
  */
 template<ducks::rt::all RT>
 __device__ static inline void make_causal_t(RT &dst, const RT &src, const typename base_types::packing<typename RT::dtype>::unpacked_type &val=0) {
-    using T = typename RT::T;
-    detail::map_by_coord(dst, src, [&](int row, int col, T v) { return col >= row ? v : val; });
+    detail::diag_fill<true>(dst, src, 0, val);
 }
 
 /* ----------  TRIANGULAR FILLS  ---------- */
@@ -531,8 +536,7 @@ __device__ static inline void make_causal_t(RT &dst, const RT &src, const typena
  */
 template<ducks::rt::all RT>
 __device__ static inline void tril(RT &dst, const RT &src, const int row_idx, const typename base_types::packing<typename RT::dtype>::unpacked_type &val=0) {
-    using T = typename RT::T;
-    detail::map_by_coord(dst, src, [&](int row, int col, T v) { return col <= row - row_idx ? v : val; });
+    detail::diag_fill<false>(dst, src, row_idx, val);
 }
 
 /**
@@ -546,8 +550,7 @@ __device__ static inline void tril(RT &dst, const RT &src, const int row_idx, co
  */
 template<ducks::rt::all RT>
 __device__ static inline void triu(RT &dst, const RT &src, const int row_idx, const typename base_types::packing<typename RT::dtype>::unpacked_type &val=0) {
-    using T = typename RT::T;
-    detail::map_by_coord(dst, src, [&](int row, int col, T v) { return col < row - row_idx ? val : v; });
+    detail::diag_fill<true>(dst, src, row_idx, val);
 }
 
 /* ----------  RECTANGULAR FILLS  ---------- */
@@ -564,8 +567,7 @@ __device__ static inline void triu(RT &dst, const RT &src, const int row_idx, co
 template<ducks::rt::all RT>
 __device__ static inline void right_fill(RT &dst, const RT &src, const int col_idx, const typename base_types::packing<typename RT::dtype>::unpacked_type &val=0) {
     if(col_idx >= RT::cols) return;
-    using T = typename RT::T;
-    detail::map_by_coord(dst, src, [&](int row, int col, T v) { return col >= col_idx ? val : v; });
+    detail::axis_fill<false, false>(dst, src, col_idx, val);
 }
 
 /**
@@ -580,8 +582,7 @@ __device__ static inline void right_fill(RT &dst, const RT &src, const int col_i
 template<ducks::rt::all RT>
 __device__ static inline void left_fill(RT &dst, const RT &src, const int col_idx, const typename base_types::packing<typename RT::dtype>::unpacked_type &val=0) {
     if(col_idx <= 0) return;
-    using T = typename RT::T;
-    detail::map_by_coord(dst, src, [&](int row, int col, T v) { return col < col_idx ? val : v; });
+    detail::axis_fill<false, true>(dst, src, col_idx, val);
 }
 
 /**
@@ -596,8 +597,7 @@ __device__ static inline void left_fill(RT &dst, const RT &src, const int col_id
 template<ducks::rt::all RT>
 __device__ static inline void upper_fill(RT &dst, const RT &src, const int row_idx, const typename base_types::packing<typename RT::dtype>::unpacked_type &val=0) {
     if(row_idx <= 0) return;
-    using T = typename RT::T;
-    detail::map_by_coord(dst, src, [&](int row, int col, T v) { return row < row_idx ? val : v; });
+    detail::axis_fill<true, true>(dst, src, row_idx, val);
 }
 
 /**
@@ -612,8 +612,7 @@ __device__ static inline void upper_fill(RT &dst, const RT &src, const int row_i
 template<ducks::rt::all RT>
 __device__ static inline void lower_fill(RT &dst, const RT &src, const int row_idx, const typename base_types::packing<typename RT::dtype>::unpacked_type &val=0) {
     if(row_idx >= RT::rows) return;
-    using T = typename RT::T;
-    detail::map_by_coord(dst, src, [&](int row, int col, T v) { return row >= row_idx ? val : v; });
+    detail::axis_fill<true, false>(dst, src, row_idx, val);
 }
 
 /* ----------  SUBTILE  ---------- */

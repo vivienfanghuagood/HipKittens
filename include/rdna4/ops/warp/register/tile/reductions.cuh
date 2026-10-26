@@ -15,11 +15,10 @@ namespace kittens {
  * depends only on whether the reduced axis is the tile's *element* axis or its
  * *lane* axis. See rt_base_coord() for those axes.
  *
- *   element axis  ->  the values are already in one lane, so the reduction is
- *                     register-local. Accumulators additionally need a single
- *                     cross-half exchange, because their two wave halves hold
- *                     alternating positions rather than mirrors. The result is
- *                     one value per lane: an rv_layout::ortho vector.
+ *   element axis  ->  each lane holds half of the values (its wave half's run
+ *                     of 8), so the reduction is register-local plus a single
+ *                     cross-half exchange. The result is one value per lane:
+ *                     an rv_layout::ortho vector.
  *   lane axis     ->  the values are spread over the 16 lanes of a wave half,
  *                     so it is a 4-step butterfly. Both halves compute their own
  *                     copy, which is exactly what rv_layout::align wants. The
@@ -68,14 +67,13 @@ __device__ static inline void elem_axis_reduce(V &dst, const T &src, const V &sr
             }
         }
         RT single = op::template op<RT>(accum.x, accum.y);
-        // Neither gfx12 fragment gives a lane the whole element axis: the
-        // accumulator's halves hold alternating positions, an operand's hold
-        // the runs 0..7 and 8..15.  Either way a lane is missing half the
-        // values and one cross-half exchange completes the reduction.  (On
-        // gfx11 the operand case was free -- the halves were mirrors -- which
-        // is what halves_interleave used to select.  It is true for every
-        // gfx12 type, so the branch is now always taken; it is left in place
-        // because it still says the right thing about *why*.)
+        // No gfx12 fragment gives a lane the whole element axis: the halves
+        // hold the runs 0..7 and 8..15, so a lane is missing half the values
+        // and one cross-half exchange completes the reduction.  (On gfx11 the
+        // operand case was free -- the halves were mirrors -- which is what
+        // halves_interleave used to select.  It is true for every gfx12 type,
+        // so the branch is now always taken; it is left in place because it
+        // still says the right thing about *why*.)
         if constexpr (base::halves_interleave) {
             single = op::template op<RT>(single, lane_xor<HALF_WAVE_SWAP>(single));
         }

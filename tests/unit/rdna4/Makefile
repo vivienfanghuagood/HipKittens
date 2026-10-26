@@ -1,9 +1,6 @@
 # rdna4 (gfx1200/gfx1201, RX 9070) unit tests.
 #
-# !! These have never been run.  No gfx12 part was available while
-# include/rdna4 was written, so the tree is compile-verified only -- see
-# README.md.  `make` is the gate; `./unit_tests` is the thing to try first when
-# hardware turns up.
+# Green on a gfx1201 (Radeon AI PRO R9700), section by section -- see README.md.
 #
 # Shared rules live in ../common/tests.mk; this file only sets local knobs.
 

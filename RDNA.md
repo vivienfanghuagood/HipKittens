@@ -9,18 +9,18 @@ the work here lives on the `rdna` branch, on top of `de0cddbd`.
 
 | | RDNA3 (gfx1100) | RDNA4 (gfx1201) |
 |---|---|---|
-| core library | `include/rdna3`, 68 files | `include/rdna4`, 68 files |
-| unit tests | **1659 passed, 0 failed** on a W7900D | compiles; **never executed** |
+| core library | `include/rdna3` | `include/rdna4`, brought up to `include/rdna3` (strips, int8, indexed, w4, granules) |
+| unit tests | **1659 passed, 0 failed** on a W7900D | **0 failed** on a Radeon AI PRO R9700, every section, fp8 and int8 mma included |
 | bf16 GEMM | **77.2 TFLOPs** peak, 77% of the measured WMMA ceiling. 107-119% of the best AMD library *in HipKittens' own layout*; 85-93% of that library when it is free to pick its own | compiles; never executed |
 | distributed | fused GEMM→all-reduce / reduce-scatter, as a torch operator: **1.22-1.31x** and **1.31-1.59x** over hipBLASLt + RCCL at prefill, on 2x W7900D. [Full writeup](kernels/rdna3/distributed/README.md) | not attempted |
 | attention | single-GPU SDPA forward, as a torch operator and an `F.scaled_dot_product_attention` drop-in: **64-65 TFLOPs**, **2.8-3.3x** the aotriton kernel every Radeon framework actually reaches, and 4-14% ahead of a hand-written Triton FA-2 (causal: 4.4x and 3-12%). [Full writeup](kernels/rdna3/attn/README.md) | not attempted |
-| fp8 | not available in hardware | implemented, all four opcodes, untested |
+| fp8 | not available in hardware | all four opcodes, unit-tested on a gfx1201 |
 
-**Read the second column as "written, not verified."** No gfx12 part was
-available. Every gfx12 claim about *where a value physically lives* is inferred
-from builtin signatures, not measured. See
-[`tests/unit/rdna4/README.md`](tests/unit/rdna4/README.md) for exactly which
-claims are which, and run `./unit_tests` there first if you have the hardware.
+The gfx12 fragment layouts were measured on a gfx1201 with
+`tools/rdna-probes/wmma_layout.hip`'s `PROBE_GFX12_W32` variant; the
+accumulator was not what this tree first assumed (fact 2 below). What the
+first hardware run found is in [`tests/unit/rdna4/README.md`](tests/unit/rdna4/README.md).
+The GEMM and anything about speed on gfx12 are still unmeasured.
 
 ## Why this is a separate tree and not a `#ifdef`
 
@@ -51,10 +51,13 @@ back undefined behaviour that looked like a coherent — and wrong — layout.)
 **2. gfx12 splits K between the halves instead.** Operands are `v8bf16`, 4
 VGPRs, no redundancy: lane `l` holds `k = 8·(l/16) … +7` of row `l%16`. Half the
 operand registers for the same tile. That is the point of RDNA4 for this
-library. It also makes accumulator↔operand conversion *more* expensive, not
-less — on gfx11 one direction was a free discard because the operand halves
-already held everything; on gfx12 neither half does, so both directions cross
-the halves at 8 `permlanex16` each.
+library. The accumulator splits the same way: lane `l` register `r` holds row
+`r + 8·(l/16)`, the upper half rows 8..15 (gfx11 interleaved even and odd rows,
+`2r + l/16`). So on gfx12 an accumulator and the operand of the same layout hold
+the same elements in the same lanes, and converting one to the other is a type
+conversion with no lane exchange -- on gfx11 it crossed the halves. (This tree
+first assumed gfx11's accumulator and every mma test failed on the hardware;
+measured with `tools/rdna-probes/wmma_layout.hip`, `PROBE_GFX12_W32`.)
 
 **3. There is no global→LDS DMA on either.** `vmem-to-lds-load-insts` is absent
 on gfx11 and gfx12 alike. HipKittens' third pillar — "asynchronous loads/stores

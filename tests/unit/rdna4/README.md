@@ -2,41 +2,41 @@
 
 Unit tests for `include/rdna4`, for an RX 9060 XT / RX 9070 (XT) class card.
 
-## Read this first: nothing here has ever run
+## Status: green on a gfx1201
 
-No gfx12 part was available while `include/rdna4` was written. This tree is
-**compile-verified only**. `make` succeeds for `--offload-arch=gfx1201`; the
-resulting `./unit_tests` binary has never been executed, on any machine.
+Run on a Radeon AI PRO R9700 (gfx1201, 64 CU, ROCm 7.2.3), one leaf section
+at a time (`TEST_DEFINES=-DTEST_WARP_REGISTER_TILE_MMA` and so on, so that a
+fault in one section cannot hide the others): every section passes, 0
+failures -- warp memory (tile and vector, global<->shared<->register), group
+memory, register tile maps / reductions / conversions / mma (bf16, half, all
+four fp8 pairings, int8), register vector maps / reductions / conversions, and
+the shared tile and vector conversions.
 
-What that does and does not buy you:
+What the first run found, before the fixes that make it green:
 
-- **Verified.** Every type, op and test in the tree type-checks and codegens for
-  gfx1201. The WMMA builtin signatures were confirmed against the compiler
-  (`wmma_f32_16x16x16_{f16,bf16}_w32_gfx12` take `v8h`/`v8s` operands and a
-  `v8f` accumulator). The instruction selection is what it should be — the LDS
-  fast path emits `ds_load_b128`, not `flat_load_b128`, and the MMA emits
-  `v_wmma_f32_16x16x16_bf16`. The 64 KB per-workgroup LDS ceiling was confirmed
-  by compiling a 65540-byte `__shared__` array and reading the error. The gfx12
-  split wait counters (`s_wait_dscnt` / `s_wait_loadcnt` / `s_wait_storecnt`)
-  are what the tree emits, checked against the disassembly. All four fp8 WMMA
-  opcodes are reachable from the tile API and all four appear in this tree's
-  object code (`v_wmma_f32_16x16x16_{fp8_fp8,fp8_bf8,bf8_fp8,bf8_bf8}`), and the
-  fp8 LDS path emits `ds_load_b64` / `ds_store_b64` rather than the `b128` the
-  2-byte types get.
-- **Not verified.** Every claim about *where a value physically lives*. The
-  operand fragment layout — that lane `l` holds `k = 8*(l/16) .. +7` of row
-  `l%16` — is inferred from the builtin's `v8` operand width plus the shape of
-  the gfx11 layout that was measured. It is the single assumption the whole tree
-  rests on, and it is not a measurement.
+- **The accumulator layout was wrong.** The tree had carried gfx11's over:
+  lane `l` register `r` holding row `2r + l/16`. On gfx12 it is row
+  `r + 8*(l/16)` -- the upper half holds rows 8..15 -- measured with the
+  `PROBE_GFX12_W32` variant of `tools/rdna-probes/wmma_layout.hip`. Every mma
+  test failed (224 of 224). The operand layout (lane `l` holds
+  `k = 8*(l/16) .. +7` of row `l%16`) was right. See the layout note in
+  `include/rdna4/common/util.cuh`: every gfx12 fragment now has one shape.
+- **A dynamically indexed register array went to LDS.** `rv<float, align>`'s
+  loads indexed a lane's registers by a lane-dependent position; LLVM's
+  promote-alloca moved the array into *static LDS* (64 KB of it at S=2), which
+  with the harness's 32 KB of dynamic LDS is over the limit, and the dispatch
+  failed with HSA_STATUS_ERROR_INVALID_ALLOCATION. The rdna3 tree's later
+  `rv_align_held` / `rv_align_entry` loops (constant indices) fixed it.
+- **One test copied what it meant to reference.** `warp/shared/vec/conversions`
+  took `auto ref = subvec_inplace(...)`, a copy of the subvector in private
+  memory; once the shared-vector accessors addressed LDS directly, they read
+  that copy's private address as an LDS offset. Now `auto &ref`, in both trees.
 
-So: when a gfx12 card turns up, `./unit_tests` is the first thing to try, and
-if the fragment inference is wrong it is the thing that will say so. Expect
-`warp/register/tile/{mma,conversions}` and `warp/memory/tile/shared_to_register`
-to fail together if it is — they all derive from `rt_base_coord()`.
-
-Before trusting a fix, re-run the layout probe rather than guessing: the
-`PROBE_GFX12_W32` variant of `tools/rdna-probes/wmma_layout.hip` measures the
-fragment directly, the same way the gfx1100 layout was established.
+The tree was also brought up to `include/rdna3` (register strips, int8 WMMA,
+indexed and bounded loads, w4 dequantize, granule addressing, Philox), each
+piece re-derived for the gfx12 layout rather than copied: a row-layout tile's
+lane holds a contiguous run of its row, so every global<->register transfer is
+one 8/16/32-byte run a lane, with no cross-half exchange.
 
 One thing you will notice in a disassembly and should not chase: the test bodies
 call `__builtin_amdgcn_s_waitcnt(0)`, which is the combined gfx11-style wait, so

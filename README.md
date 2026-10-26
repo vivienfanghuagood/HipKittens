@@ -28,7 +28,7 @@ We support CDNA3 and CDNA 4.
 > **single-GPU SDPA forward at 2.7-3.0x the aotriton kernel** every Radeon
 > framework actually reaches, and **fused GEMM→all-reduce / reduce-scatter at
 > 1.22-1.59x** over hipBLASLt + RCCL, both shipped as torch operators.
-> `include/rdna4` is written but has never run on hardware.
+> `include/rdna4` (gfx1201, RDNA4) passes its unit tests on a Radeon AI PRO R9700.
 > See **[RDNA.md](RDNA.md)** for the state of it, what is verified and what is
 > not, and the three hardware facts the whole port is derived from.
 >
