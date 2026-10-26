@@ -314,6 +314,15 @@ template<int I, int N, typename T> __device__ inline void bind_regs(T &x) {
         bind_regs<I + 1, N>(x);
     }
 }
+typedef float bind_v2f __attribute__((ext_vector_type(2)));
+/// The 8-byte tail of an object that is not whole 16-byte groups: a single
+/// fp8 or int8 base tile (8 bytes a lane on gfx12).
+template<int OFF, typename T> __device__ inline void bind_tail8(T &x) {
+    bind_v2f v;
+    __builtin_memcpy(&v, (const char *)&x + OFF, sizeof(v));
+    asm volatile("" : "+v"(v));
+    __builtin_memcpy((char *)&x + OFF, &v, sizeof(v));
+}
 }  // namespace detail
 
 /**
@@ -337,9 +346,9 @@ template<int I, int N, typename T> __device__ inline void bind_regs(T &x) {
  * this (or through `lds_wait_for`, which does both) before it is used.
  */
 template<typename T> __device__ inline void lds_bind(T &x) {
-    static_assert(sizeof(T) % sizeof(detail::bind_v4f) == 0,
-                  "lds_bind takes whole 128-bit register groups");
+    static_assert(sizeof(T) % 8 == 0, "lds_bind takes whole 64-bit register groups");
     detail::bind_regs<0, sizeof(T) / sizeof(detail::bind_v4f)>(x);
+    if constexpr (sizeof(T) % 16) detail::bind_tail8<sizeof(T) / 16 * 16>(x);
 }
 
 /**

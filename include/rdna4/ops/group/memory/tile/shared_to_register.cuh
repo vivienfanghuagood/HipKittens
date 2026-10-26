@@ -79,7 +79,7 @@ __device__ inline static void load(RT &dst, const ST &src) {
             }
         }
     }
-    if constexpr (vectorizable) lds_wait<0>();
+    if constexpr (vectorizable) lds_wait_for<0>(dst);   // the bind: see the warp-level load
 }
 
 
