@@ -217,6 +217,17 @@ template<> __device__ inline half   relu::op<half>  (const half &x  ) { return _
 template<> __device__ inline half_2 relu::op<half_2>(const half_2 &x) { return half_2{__hmax(x.x, base_types::constants<half>::zero()),
                                                                                      __hmax(x.y, base_types::constants<half>::zero())}; }
 
+/**
+ * @brief The unit step: 1 where x > 0, else 0. With a subtraction in front it
+ * is a comparison as a multiplier -- a dropout's keep mask, x * step(r - p).
+ */
+struct step {
+    template<typename T> static __device__ inline T op(const T &x);
+};
+template<> __device__ inline float  step::op<float> (const float &x ) { return x > 0.f ? 1.f : 0.f; }
+template<> __device__ inline float2 step::op<float2>(const float2 &x) { return float2{x.x > 0.f ? 1.f : 0.f,
+                                                                                     x.y > 0.f ? 1.f : 0.f}; }
+
 constexpr float SQRT_2_OVER_PI   = 0.7978845608028654f;
 constexpr float GELU_COEFF       = 0.044715f;
 constexpr float GELU_INNER_COEFF = GELU_COEFF * SQRT_2_OVER_PI;
@@ -268,6 +279,72 @@ template<> __device__ inline float dgelu::op<float>(const float &x) {
 }
 template<> __device__ inline float2 dgelu::op<float2>(const float2 &x) {
     return float2{dgelu::op<float>(x.x), dgelu::op<float>(x.y)};
+}
+
+/**
+ * @brief Square root.
+ *
+ * Float only, deliberately: the normalization kernels that need this
+ * accumulate in fp32 regardless of the tensor's storage type, and a packed
+ * 16-bit sqrt would invite computing a variance in bf16, which has eight
+ * mantissa bits and loses the small differences a variance is made of.
+ *
+ * @tparam T The data type of the input and output values.
+ * @param x[in] The input value.
+ * @return The square root of the input.
+ */
+struct sqrt {
+    template<typename T> static __device__ inline T op(const T &x);
+};
+template<> __device__ inline float  sqrt::op<float> (const float &x ) { return __builtin_amdgcn_sqrtf(x); }
+template<> __device__ inline float2 sqrt::op<float2>(const float2 &x) {
+    return float2{__builtin_amdgcn_sqrtf(x.x), __builtin_amdgcn_sqrtf(x.y)};
+}
+
+/**
+ * @brief Reciprocal square root, 1/sqrt(x).
+ *
+ * `v_rsq_f32` in one instruction, which is the whole reason this exists as an
+ * op rather than as a divide by a sqrt: the tail of every RMSNorm and
+ * LayerNorm is one of these per row, and the divide form is three instructions
+ * and a different rounding.
+ *
+ * ~1 ulp, like every other transcendental here (see exp, which uses
+ * `v_exp_f32` for the same reason). Do not use it where the exact IEEE result
+ * matters.
+ *
+ * @tparam T The data type of the input and output values.
+ * @param x[in] The input value.
+ * @return 1/sqrt of the input.
+ */
+struct rsqrt {
+    template<typename T> static __device__ inline T op(const T &x);
+};
+template<> __device__ inline float  rsqrt::op<float> (const float &x ) { return __builtin_amdgcn_rsqf(x); }
+template<> __device__ inline float2 rsqrt::op<float2>(const float2 &x) {
+    return float2{__builtin_amdgcn_rsqf(x.x), __builtin_amdgcn_rsqf(x.y)};
+}
+
+/**
+ * @brief Sigmoid linear unit, x * sigmoid(x), also called swish.
+ *
+ * Written as x / (1 + exp(-x)) using the hardware exp2, i.e. exp(-x) is
+ * exp2(-x * log2(e)). Fusing it saves the three temporaries the composed form
+ * needs, which on a kernel that is already register-bound is the difference
+ * between one occupancy step and the next.
+ *
+ * @tparam T The data type of the input and output values.
+ * @param x[in] The input value.
+ * @return x * sigmoid(x).
+ */
+struct silu {
+    template<typename T> static __device__ inline T op(const T &x);
+};
+template<> __device__ inline float silu::op<float>(const float &x) {
+    return x * __builtin_amdgcn_rcpf(1.f + __builtin_amdgcn_exp2f(-x * 1.44269504088896340736f));
+}
+template<> __device__ inline float2 silu::op<float2>(const float2 &x) {
+    return float2{silu::op<float>(x.x), silu::op<float>(x.y)};
 }
 
 /**

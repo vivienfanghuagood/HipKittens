@@ -21,7 +21,7 @@ the gfx12 claims were checked without a gfx12 card.
 
 | | |
 |---|---|
-| `wmma_layout.hip` | **The foundational measurement.** One-hot probes plus gauge analysis, recovering the physical register layout of every WMMA operand and accumulator. Everything in `rt_base_coord()` comes from here. Has a `PROBE_GFX12_W32` variant, written but never run. |
+| `wmma_layout.hip` | **The foundational measurement.** One-hot probes plus gauge analysis, recovering the physical register layout of every WMMA operand and accumulator. Everything in `rt_base_coord()` comes from here. Its `PROBE_GFX12_W32` variant, run on a gfx1201, measured the gfx12 accumulator: row `r + 8*(l/16)`, not gfx11's `2r + l/16`. |
 | `features.hip` + `run_features.sh` | The hardware feature matrix — `vmem-to-lds`, `s_setprio`, `sched_group_barrier`, `permlane*`, WMMA variants, SWMMAC, and the maximum static LDS allocation, found by bisecting the compiler error. |
 | `mma_gate.hip` | Phase 3 gate: does the `rt_base` layout derivation agree with real WMMA output, for a single 16×16×16 and for blocked GEMMs. |
 | `mem_gate.hip` | Phase 4 gate: every memory path round-tripped — global↔shared, global↔register, shared↔register, tiles and vectors, both layouts. |

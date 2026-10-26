@@ -167,12 +167,21 @@ __device__ inline static void load(RT &dst, const ST &src) {
     }
     // One wait for the whole tile: the reads above were issued back to back so
     // that their latencies overlap, and the compiler cannot insert this itself
-    // for an inline-asm ds_load.
-    if constexpr (vectorizable && wait) lds_wait<0>();
+    // for an inline-asm ds_load. And the bind after it (lds_wait_for): without
+    // it nothing orders the tile's consumers after the wait, and LLVM schedules
+    // a WMMA on the tile above it -- tools/rdna-probes/mma_gate.hip's mma_AtBt
+    // read the registers before the loads landed and came back as garbage on a
+    // gfx1201 (hk.runtime.cocheck flags such a read as a wait hazard).
+    if constexpr (vectorizable && wait) lds_wait_for<0>(dst);
 }
 
 /**
  * @brief Issue a tile's LDS reads without waiting for them. See load<false>.
+ *
+ * The caller owes this tile a `lds_wait_for<N>(dst)` -- not a bare `lds_wait`.
+ * The reads land through an inline-asm output operand, so nothing in the IR
+ * ties them to the wait, and a consuming WMMA will be scheduled above it. See
+ * `lds_bind` in memory/util/util.cuh.
  */
 template<ducks::rt::all RT, ducks::st::all ST>
 __device__ inline static void load_async(RT &dst, const ST &src) { load<false>(dst, src); }

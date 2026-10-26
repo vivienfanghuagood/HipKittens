@@ -57,39 +57,36 @@ template<typename T> constexpr int TILE_ELEMENTS{TILE_COL_DIM<T>*TILE_ROW_DIM<T>
 /* ----------  gfx12 WMMA FRAGMENT SHAPE  ---------- */
 
 /*
- * !! NOT HARDWARE-VERIFIED !!  No gfx1200/gfx1201 part was available when this
- * was written.  The shapes below are read off the builtin signatures, which are
- * unambiguous about *size*, plus the RDNA4 ISA guide's description of how the
- * two wave halves split K, which is what fixes the *arrangement*.  Before
- * trusting a number out of this tree, run the PROBE_GFX12_W32 variant of
- * tools/rdna-probes/wmma_layout.hip, which tests exactly this table.
+ * Measured on a gfx1201 (Radeon AI PRO R9700) with the PROBE_GFX12_W32 variant
+ * of tools/rdna-probes/wmma_layout.hip, and held by tests/unit/rdna4's mma
+ * section (random A and B through the tile API against a host GEMM):
  *
- * Where gfx12 differs from gfx11, and why every constant below is a separate
- * knob rather than the single `replication` RDNA3 needed:
+ *   A operand (v8f16 / v8bf16, 4 VGPRs; fp8 and iu8 v2i32, 2 VGPRs): lane l
+ *       feeds row l%16 and holds k = 8*(l/16) + e, e in 0..7.  The halves
+ *       split K instead of mirroring it (gfx11: v16, 8 VGPRs, lanes l and l+16
+ *       identical), so an operand costs half the registers it does on RDNA3.
+ *   B operand: the same with column l%16.
+ *   C/D accumulator (v8f32 / v8i32, 8 VGPRs): lane l register r holds
+ *       (row r + 8*(l/16), col l%16).  NOT gfx11's (row 2r + l/16): the upper
+ *       half holds rows 8..15 contiguously instead of the odd rows.  This tree
+ *       first carried the gfx11 arrangement over unmeasured, and every mma test
+ *       failed on the hardware.
  *
- *   A operand, gfx11 (v16f16, 8 VGPRs): lane l feeds row l%16 and holds all 16
- *       of k.  Lanes 0-15 and 16-31 must carry identical data.
- *   A operand, gfx12 (v8f16, 4 VGPRs):  lane l feeds row l%16 and holds
- *       k = 8*(l/16) + e, e in 0..7.  The halves split K instead of mirroring
- *       it, so an operand costs half the registers it does on RDNA3 -- the
- *       single biggest reason a gfx12 GEMM should outrun a gfx11 one at the
- *       same tile size.  fp8 is the same shape, 8 bytes and 2 VGPRs per lane.
- *   C/D accumulator (v8f32, 8 VGPRs): unchanged from gfx11.  Lane l register r
- *       holds (row 2r + l/16, col l%16).
- *
- * So on gfx12 nothing is replicated, but *both* operands and accumulators are
- * split across the wave halves -- just along different axes and by different
- * amounts.  That is the pair of constants below.
+ * So on gfx12 every fragment has one shape: the lane picks a row (or column)
+ * l%16, and its 8 elements run contiguously along the other axis, the upper
+ * wave half 8 further on.  An accumulator in the col layout is lane for lane
+ * a B operand, and in the row layout an A operand -- converting between them
+ * is an element type change, with no lane exchange.  The two constants below
+ * are kept as knobs (and the code reads them rather than assuming 1 and 8)
+ * because that is what made the gfx11 tree and this one the same source.
  */
 template<typename T> constexpr int WMMA_REPLICATION = 1;  // gfx12 duplicates nothing
 
 /// Distance along a lane's element axis between element `e` and element `e+1`.
-template<typename T> constexpr int WMMA_ELEMENT_STRIDE = 1;  // operands: contiguous in k
-template<> constexpr int WMMA_ELEMENT_STRIDE<float> = 2;     // accumulator: rows interleave
+template<typename T> constexpr int WMMA_ELEMENT_STRIDE = 1;  // every fragment: contiguous
 
 /// How far along that axis the upper wave half is shifted from the lower one.
-template<typename T> constexpr int WMMA_HALF_SHIFT = 8;  // operands: k 0..7 vs 8..15
-template<> constexpr int WMMA_HALF_SHIFT<float> = 1;     // accumulator: odd vs even rows
+template<typename T> constexpr int WMMA_HALF_SHIFT = 8;      // every fragment: 0..7 vs 8..15
 /**
  * @brief Constant representing number of threads in a warp.
  */
@@ -109,6 +106,25 @@ constexpr int WARPGROUP_WARPS{4};
  * @return The warp ID.
  */
 __device__ __forceinline__ int warpid() { return threadIdx.x >> 5; }
+/**
+ * @brief The warp ID, in a scalar register.
+ *
+ * `warpid()` is `threadIdx.x >> 5`, which the compiler keeps in a VGPR: it has
+ * no way to know that every lane of a wave computes the same value. It does --
+ * a wave is 32 consecutive threads and `>> 5` is constant across them -- and
+ * the difference is not cosmetic. Anything derived from `warpid()` inherits the
+ * VGPR, so a comparison on it becomes a *divergent* branch (`v_cmpx` plus exec
+ * mask save/restore) rather than one `s_cbranch`, and every value the branch
+ * needs is pinned in a vector register across it. The attention kernel's causal
+ * mask is reached through `warpid()` and measured 90 spilled VGPRs that way,
+ * and none with this.
+ *
+ * Use this wherever the value feeds addressing or control flow; use `warpid()`
+ * where it feeds per-lane arithmetic and the readfirstlane would be a waste.
+ */
+__device__ __forceinline__ int warpid_uniform() {
+    return __builtin_amdgcn_readfirstlane(threadIdx.x >> 5);
+}
 /**
  * @brief Read every 64-byte line of a kernel's BYTES of arguments, now.
  *
@@ -396,7 +412,7 @@ __device__ static inline int lane_half_xor_b32(int x) {
     return __builtin_amdgcn_permlanex16(x, x, permlanex16_sel<B>(0), permlanex16_sel<B>(8), true, false);
 }
 
-/// Apply a 32-bit lane exchange to a value of any 2, 4 or 8 byte type.
+/// Apply a 32-bit lane exchange to a value of any 1, 2, 4 or 8 byte type.
 ///
 /// The void* casts are deliberate: bf16_2 and friends have constructors, so the
 /// compiler warns about memcpy'ing them even though moving their bits between
@@ -415,9 +431,10 @@ __device__ static inline T lane_apply_b32(const T &f, F &&op_b32) {
         return r;
     }
     else {
-        static_assert(sizeof(T) == 4 || sizeof(T) == 2, "lane exchange supports 2, 4 and 8 byte values");
+        static_assert(sizeof(T) == 4 || sizeof(T) == 2 || sizeof(T) == 1,
+                      "lane exchange supports 1, 2, 4 and 8 byte values");
         int x = 0;
-        __builtin_memcpy(&x, (const void*)&f, sizeof(T)); // 16-bit types ride in the low half
+        __builtin_memcpy(&x, (const void*)&f, sizeof(T)); // narrow types ride in the low bits
         x = op_b32(x);
         T r;
         __builtin_memcpy((void*)&r, &x, sizeof(T));
@@ -440,13 +457,13 @@ __device__ static inline T lane_xor(const T &f) {
 /**
  * @brief Exchange a value with lane `laneid ^ ((1<<B) | 16)`.
  *
- * Not a power of two, so it is not a lane_xor. Every gfx12 fragment layout needs
- * one of these: exactly one bit of a value's position along the element axis is
- * carried by the wave-half bit rather than by the element index, so one stage of
- * a transpose has to swap a lane bit with lane bit 4. Which lane bit depends on
- * the shape -- bit 0 for the f32 accumulator (position = 2e+h), bit 3 for a WMMA
- * operand (position = e+8h) -- and B names it. Applied only to the lanes where
- * the two bits disagree. See transpose() in ops/warp/register/tile/conversions.cuh.
+ * Not a power of two, so it is not a lane_xor. Every gfx12 fragment needs one
+ * of these: bit 3 of a value's position along the element axis (position =
+ * e + 8*half) is carried by the wave-half bit rather than by the element index,
+ * so one stage of a transpose has to swap lane bit 3 with lane bit 4 -- B = 3.
+ * (On gfx11 the f32 accumulator's was bit 0, position = 2e + half.) Applied only
+ * to the lanes where the two bits disagree. See transpose() in
+ * ops/warp/register/tile/conversions.cuh.
  */
 template<int B, typename T>
 __device__ static inline T lane_half_xor(const T &f) {

@@ -11,27 +11,23 @@
 namespace kittens {
 
 /*
- * gfx12 WMMA.  One shape only here: 16x16x16, wave32, f32 accumulate.
+ * gfx12 WMMA.  One shape only here: 16x16x16, wave32, f32 (or i32) accumulate.
  *
- * The change from gfx11 is the operand fragment.  There a lane held the whole
- * K=16 vector and the two wave halves had to mirror each other, costing 8 VGPRs
- * for a bf16 operand; here the halves split k (lower half holds k 0..7, upper
- * half k 8..15), so an operand is v8f16 / v8bf16 and costs 4 (v2i and 2 for
- * fp8, see below).  That halving is
- * the main reason RDNA4 can carry a bigger register block than RDNA3 at the
- * same 256-VGPR budget.  rt_base<bf16|half, *> is sized for exactly that
- * (replication 1, 4 VGPRs), so the fragments stay a straight reinterpret of
- * `.data`.  The accumulator is unchanged: v8f32, held as float2[4].
+ * The change from gfx11 is the fragment.  There a lane held the whole K=16
+ * vector and the two wave halves had to mirror each other, costing 8 VGPRs for
+ * a bf16 operand; here the halves split k (lower half holds k 0..7, upper half
+ * k 8..15), so an operand is v8f16 / v8bf16 and costs 4 (v2i32 and 2 for fp8
+ * and iu8, see below).  That halving is the main reason RDNA4 can carry a
+ * bigger register block than RDNA3 at the same 256-VGPR budget.  rt_base is
+ * sized for exactly that (replication 1), so the fragments stay a straight
+ * reinterpret of `.data`.  The accumulator is v8f32 / v8i32, held as
+ * float2[4] / int2[4], with the upper half holding rows 8..15 (gfx11
+ * interleaved even and odd rows): see the layout note in common/util.cuh, which
+ * was measured on a gfx1201.
  *
  * The builtins carry a `_gfx12` suffix and are mutually exclusive with the
  * gfx11 ones -- neither set compiles for the other target -- which is why this
  * is a separate header tree rather than an #ifdef inside the RDNA3 one.
- *
- * !! NOT HARDWARE-VERIFIED.  The signatures below were confirmed by compiling
- * for gfx1201, and the resulting v_wmma_* instructions were read back out of
- * the ISA, but no gfx12 part has executed this code.  The element-to-lane
- * mapping in particular is inferred from the fragment width; see the note on
- * WMMA_HALF_SHIFT in common/util.cuh. !!
  */
 
 typedef __attribute__((__vector_size__(8 * sizeof(__fp16)))) __fp16 wmma_half8_t;
@@ -103,6 +99,25 @@ __device__ static inline void wmma161616(float2 (&D)[4],
         *(wmma_float8_t*)D = __builtin_amdgcn_wmma_f32_16x16x16_bf8_fp8_w32_gfx12(a, b, c);
     else
         *(wmma_float8_t*)D = __builtin_amdgcn_wmma_f32_16x16x16_bf8_bf8_w32_gfx12(a, b, c);
+}
+
+typedef __attribute__((__vector_size__(8 * sizeof(int)))) int wmma_int8_t;
+
+/// v_wmma_i32_16x16x16_iu8 (signed x signed), the gfx12 form: A and B are 8
+/// bytes a lane (int8_4[2], the fp8 fragment at one byte an element), the
+/// accumulator v8i32 laid out as the f32 one.
+__device__ static inline void wmma161616(int2 (&D)[4],
+                                         const int8_4 (&A)[2],
+                                         const int8_4 (&B)[2],
+                                         const int2 (&C)[4]) {
+    *(wmma_int8_t*)D = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32_gfx12(
+        true, *(const wmma_int2_t*)A, true, *(const wmma_int2_t*)B, *(const wmma_int8_t*)C, false);
+}
+__device__ static inline void mma_ABt_base(rt_base<int, ducks::rt_layout::col> &d,
+                                     const rt_base<int8, ducks::rt_layout::row> &a,
+                                     const rt_base<int8, ducks::rt_layout::row> &b,
+                                     const rt_base<int, ducks::rt_layout::col> &c) {
+    wmma161616(d.data, a.data, b.data, c.data);
 }
 
 /**
@@ -217,10 +232,13 @@ __device__ static inline void mma_AtBt_base(rt_base<float, ducks::rt_layout::col
 /// encodings may be mixed, because there is a distinct opcode for each pair.
 template<typename D, typename A, typename B, typename C>
 constexpr bool mma_types_ok =
-    std::is_same_v<typename D::T, float> && std::is_same_v<typename C::T, float> &&
-    ((std::is_same_v<typename A::T, typename B::T> &&
-      (std::is_same_v<typename A::T, bf16> || std::is_same_v<typename A::T, half>))
-     || (ducks::base_types::fp8<typename A::T> && ducks::base_types::fp8<typename B::T>));
+    (std::is_same_v<typename D::T, float> && std::is_same_v<typename C::T, float> &&
+     ((std::is_same_v<typename A::T, typename B::T> &&
+       (std::is_same_v<typename A::T, bf16> || std::is_same_v<typename A::T, half>))
+      || (ducks::base_types::fp8<typename A::T> && ducks::base_types::fp8<typename B::T>))) ||
+    // iu8: int8 operands, i32 accumulator (mma_ABt only)
+    (std::is_same_v<typename D::T, int> && std::is_same_v<typename C::T, int> &&
+     std::is_same_v<typename A::T, int8> && std::is_same_v<typename B::T, int8>);
 
 /**
  * @brief Matrix multiply-accumulate operation.

@@ -42,7 +42,9 @@ struct test_subvec {
         __builtin_amdgcn_sched_barrier(0);
         #pragma unroll
         for(int i = 0; i < S/SV_S; i++) {
-            auto ref = kittens::subvec_inplace<ST_SHAPE::cols*SV_S>(shared_vec, i);
+            // A reference: `auto` alone copies the subvector into private memory, and the
+            // LDS accessors (which take its address as an LDS offset) then read garbage.
+            auto &ref = kittens::subvec_inplace<ST_SHAPE::cols*SV_S>(shared_vec, i);
             kittens::rv<dtype, ST_SHAPE::cols*SV_S, kittens::ducks::rv_layout::naive> reg;
             kittens::load(reg, ref);
             __builtin_amdgcn_s_waitcnt(0);

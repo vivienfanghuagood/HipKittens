@@ -78,6 +78,14 @@ using fp8e5m2_2 = __hip_fp8x2_e5m2;
  * @brief Packed word of four E5M2 values.
  */
 using fp8e5m2_4 = __hip_fp8x4_e5m2;
+/**
+ * @brief 8-bit signed integer, and a packed word of four of them.
+ *
+ * The WMMA operand of v_wmma_i32_16x16x16_iu8 (rt<int8>, accumulating into
+ * rt<int>), and a storage type; see the packing/convertor specializations below.
+ */
+using int8   = int8_t;
+using int8_4 = char4;
 
 namespace ducks {
 /**
@@ -90,7 +98,8 @@ namespace base_types {
 template<typename T>
 concept T2 = std::is_same_v<T, float2> || std::is_same_v<T, bf16_2> || std::is_same_v<T, half_2> || std::is_same_v<T, fp8e4m3_4> || std::is_same_v<T, fp8e5m2_4>;
 template<typename T>
-concept T1 = std::is_same_v<T, float>  || std::is_same_v<T, bf16  > || std::is_same_v<T, half> || std::is_same_v<T, fp8e4m3> || std::is_same_v<T, fp8e5m2>;
+concept T1 = std::is_same_v<T, float>  || std::is_same_v<T, bf16  > || std::is_same_v<T, half> || std::is_same_v<T, fp8e4m3> || std::is_same_v<T, fp8e5m2>
+          || std::is_same_v<T, int8> || std::is_same_v<T, int>;
 
 /// The two 8-bit operand formats gfx12 WMMA accepts, in either A or B position.
 template<typename T>
@@ -303,6 +312,30 @@ template<> struct packing<fp8e5m2_4> {
     using unpacked_type = fp8e5m2;
     using packed_type = fp8e5m2_4;
 };
+/*
+ * int8 is a WMMA operand on gfx12 as on gfx11: v_wmma_i32_16x16x16_iu8_w32_gfx12
+ * takes a v2i32 per operand -- 8 bytes a lane, the two wave halves splitting K
+ * exactly as the 2-byte and fp8 operands do (nothing mirrored) -- and an i32
+ * accumulator laid out as the f32 one. So rt<int8> is an operand (row layout,
+ * one 8-byte LDS read a base tile, like fp8) and rt<int> its accumulator; there
+ * are no elementwise maps on int8 tiles, and a gl<int8_t> keeps its convertors.
+ * (The two `using` aliases live up with bf16 and fp8e4m3, in namespace kittens,
+ * because that is where a kernel's `gl<int8, ...>` looks.)
+ */
+template<> struct packing<int8> {
+    static __device__ inline constexpr int num() { return 1; }
+    using unpacked_type = int8;
+    using packed_type = int8_4;
+};
+template<> struct packing<int8_4> {
+    static __device__ inline constexpr int num() { return 4; }
+    using unpacked_type = int8;
+    using packed_type = int8_4;
+};
+template<> struct constants<int8> {
+    static __device__ inline constexpr int8 zero() { return 0; }
+    static __device__ inline constexpr int8 one()  { return 1; }
+};
 
 /**
  * @brief Pack four float8 into 32-bits.
@@ -340,31 +373,145 @@ template<> struct convertor<float, bf16> {
         return 	__bfloat162float(u);
     }
 };
-// template<> struct convertor<bf16, float> {
-//     static __host__ __device__ inline bf16 convert(const float & u) {
-//         return 	__float2bfloat16(u);
-//     }
-// };
+/**
+ * @brief float -> bf16, round to nearest even.
+ *
+ * This used to be `bit_cast<uint32_t>(u) >> 16` -- a truncation, labelled
+ * "fast unsafe conversion". It is not merely less accurate: truncation toward
+ * zero is *biased*, by half an ulp, always in the same direction. Attention
+ * rounds a tile of probabilities (all positive) through this on every KV
+ * block, and GEMM rounds its fp32 accumulators through it on every store, so
+ * the bias does not average out -- it accumulates.
+ *
+ * What that cost, measured: with V set to all ones the softmax weights sum to
+ * one and attention must return exactly 1.0 for every element, whatever Q and
+ * K were. torch returned exactly 1.0; this kernel returned 1.0 +- 2^-8,
+ * one whole bf16 ulp, on every element -- because the numerator summed the
+ * truncated probabilities while the denominator summed the fp32 ones. On real
+ * inputs it showed up as a uniform ~2.5x of aotriton's error at every
+ * quantile, which was enough to change which token a VLM decoded greedily
+ * while two other attention backends agreed with each other.
+ *
+ * The rounding is the standard branch-free bias add: add half an ulp, plus
+ * one more if the result's low bit is set, which is round-half-to-even. The
+ * NaN guard matters because a NaN whose mantissa is all ones would carry into
+ * the exponent and come back as an infinity.
+ */
+//: How fp32 -> bf16 rounds.
+//:
+//: This used to be `bit_cast<uint32_t>(u) >> 16` with the comment "fast
+//: unsafe conversion (truncation only)", and the unsafe part was not the
+//: speed. Truncation toward zero is *biased*: half an ulp, always the same
+//: direction. Attention rounds a tile of probabilities -- all positive --
+//: through this on every KV block while summing the fp32 ones for the
+//: denominator, so the bias does not cancel, it accumulates into the ratio.
+//:
+//: What it cost, measured (hk-dsl tools/hk-bench/attn_precision.py --exact): set V
+//: to all ones and the softmax weights sum to one, so attention must return
+//: exactly 1.0 for every element whatever Q and K were. torch returned
+//: exactly 1.0. This kernel returned 1.0 off by 2^-8 -- one whole bf16 ulp --
+//: on every element. On real inputs it showed up as a uniform ~2.5x of
+//: aotriton's error at every quantile, which was enough to make a VLM decode
+//: a different sentence while two other attention backends agreed with each
+//: other.
+//:
+//: Four settings, so the trade can be measured in one process
+//: (hk-dsl tools/hk-bench/bf16_round_cost.py) rather than argued about. Cost is
+//: attention at head_dim 128 / head_dim 64; GEMM is 0.2% for all of them,
+//: because its conversion is once per output element and not once per
+//: probability:
+//:
+//:   0  truncate            1 instr   --        biased; not a supported mode
+//:   1  nearest, ties away  2 instr   +2% / +3%  unbiased            <- default
+//:   2  nearest even        3 instr   +4% / +6%  unbiased
+//:   3  nearest even + NaN  5 instr   +6% / +13% unbiased and total
+//:
+//: The default is 1. Ties-even differs from ties-away only on an exact tie,
+//: which a computed float essentially never is, and the NaN guard doubles the
+//: cost to protect against a value attention cannot produce (P is exp2 of
+//: something finite). The caveat that buys: under 1 and 2 a NaN whose low
+//: mantissa bits are near all-ones can carry into the exponent and come back
+//: as an infinity rather than a NaN. Set -DHK_BF16_ROUND=3 if NaN
+//: propagation has to be exact.
+#ifndef HK_BF16_ROUND
+#define HK_BF16_ROUND 1
+#endif
+#ifdef HK_BF16_TRUNCATE
+#undef HK_BF16_ROUND
+#define HK_BF16_ROUND 0
+#endif
+
 template<> struct convertor<bf16, float> {
     static __host__ __device__ inline bf16 convert(const float &u) {
-        // Fast unsafe conversion (truncation only)
-        return std::bit_cast<bf16>(
-            static_cast<uint16_t>(
-                std::bit_cast<uint32_t>(u) >> 16
-            )
-        );
+        uint32_t x = std::bit_cast<uint32_t>(u);
+#if HK_BF16_ROUND == 0
+        // Truncation. Kept only so the others have something to be measured
+        // against; see the note above.
+#elif HK_BF16_ROUND == 1
+        // Ties away from zero. Exact ties are a measure-zero event on real
+        // data, and this is the cheapest unbiased rounding there is: one add.
+        x += 0x8000u;
+#elif HK_BF16_ROUND == 2
+        x += 0x7fffu + ((x >> 16) & 1u);            // ties to even
+#else
+        if ((x & 0x7fffffffu) > 0x7f800000u) {      // NaN in, NaN out
+            return std::bit_cast<bf16>(static_cast<uint16_t>(0x7fc0u));
+        }
+        x += 0x7fffu + ((x >> 16) & 1u);
+#endif
+        return std::bit_cast<bf16>(static_cast<uint16_t>(x >> 16));
     }
 };
+//: How a store rounds when it narrows fp32 to bf16 in memory: a register
+//: tile, vector or strip written to a bf16 global. Same settings as
+//: HK_BF16_ROUND; the default is 2, nearest even, which is torch's rounding
+//: for every value but a NaN whose low mantissa bits are near all ones (3
+//: keeps those too, for about 1% more on a norm). In-register conversions
+//: (`copy`, attention's P every KV block) keep HK_BF16_ROUND's: ties-away is
+//: one add cheaper there, and a tie is rare in a computed value. A store is
+//: once an element, and its input is often a sum of two bf16 values -- a
+//: residual add -- an exact tie a fifth of the time, where ties-away
+//: disagreed with torch on 10.7% of the elements (hk-dsl
+//: docs/history/36-the-agent-loop.md).
+#ifndef HK_BF16_STORE_ROUND
+#define HK_BF16_STORE_ROUND 2
+#endif
+
+template<typename U, typename T> struct store_convertor {
+    static __host__ __device__ inline U convert(const T &u) {
+        return convertor<U, T>::convert(u);
+    }
+};
+template<> struct store_convertor<bf16, float> {
+    static __host__ __device__ inline bf16 convert(const float &u) {
+        uint32_t x = std::bit_cast<uint32_t>(u);
+#if HK_BF16_STORE_ROUND == 0
+#elif HK_BF16_STORE_ROUND == 1
+        x += 0x8000u;
+#elif HK_BF16_STORE_ROUND == 2
+        x += 0x7fffu + ((x >> 16) & 1u);
+#else
+        if ((x & 0x7fffffffu) > 0x7f800000u) {
+            return std::bit_cast<bf16>(static_cast<uint16_t>(0x7fc0u));
+        }
+        x += 0x7fffu + ((x >> 16) & 1u);
+#endif
+        return std::bit_cast<bf16>(static_cast<uint16_t>(x >> 16));
+    }
+};
+
 template<> struct convertor<float2, bf16_2> {
     static __host__ __device__ inline float2 convert(const bf16_2 & u) {
         return 	__bfloat1622float2(u);
     }
 };
+//: The packed form. Same rounding as the scalar one above -- it has to be,
+//: or a tile's two halves would disagree about what rounding means.
 template<> struct convertor<bf16_2, float2> {
     static __host__ __device__ inline bf16_2 convert(const float2 &u) {
         return bf16_2{
-            std::bit_cast<bf16>(static_cast<uint16_t>(std::bit_cast<uint32_t>(u.x) >> 16)),
-            std::bit_cast<bf16>(static_cast<uint16_t>(std::bit_cast<uint32_t>(u.y) >> 16))
+            convertor<bf16, float>::convert(u.x),
+            convertor<bf16, float>::convert(u.y)
         };
     }
 };
@@ -379,6 +526,13 @@ template<> struct convertor<bf16_2, float2> {
 // };
 
 
+/// The i32 WMMA accumulator into fp32 (an int8 GEMM's dequant epilogue).
+template<> struct convertor<float2, int2> {
+    static __host__ __device__ inline float2 convert(const int2 &u) { return float2{(float)u.x, (float)u.y}; }
+};
+template<> struct convertor<float, int> {
+    static __host__ __device__ inline float convert(const int &u) { return (float)u; }
+};
 template<> struct convertor<float, half> {
     static __host__ __device__ inline float convert(const half & u) {
         return __half2float(u);
@@ -484,6 +638,28 @@ template<> struct convertor<fp8e5m2, float> {
 template<> struct convertor<float, fp8e5m2> {
     static __host__ __device__ inline float convert(const fp8e5m2 & u) {
         return float(u);
+    }
+};
+/*
+ * float -> int8 rounds to nearest-even and saturates, rather than doing what a
+ * C cast does. Both halves of that matter for a quantizer and neither is the
+ * default: a cast truncates toward zero, which biases every value toward the
+ * origin by up to half a step, and a cast of an out-of-range float to a narrow
+ * integer is undefined -- in practice it wraps, so the outliers, which are the
+ * only elements the scale was chosen to accommodate, are exactly the ones that
+ * come back with the wrong sign. v_rndne_f32 plus two v_med3 is three
+ * instructions; a silently wrong outlier is not worth saving them.
+ */
+template<> struct convertor<int8, float> {
+    static __host__ __device__ inline int8 convert(const float & u) {
+        float r = __builtin_rintf(u);
+        r = r < -128.f ? -128.f : (r > 127.f ? 127.f : r);
+        return static_cast<int8>(r);
+    }
+};
+template<> struct convertor<float, int8> {
+    static __host__ __device__ inline float convert(const int8 & u) {
+        return static_cast<float>(u);
     }
 };
 }
