@@ -135,8 +135,13 @@ __device__ inline static void load(RT &dst, const ST &src) {
                 #pragma unroll
                 for(int e = 0; e < E; e++) {
                     const int2 c = rt_base_coord<T, L>(e, lane);
-                    const T val = base_types::convertor<T, U>::convert(
-                        src[{row_base + c.x, col_base + c.y}]);
+                    // Through an LDS (address_space 3) pointer: src[{r, c}] is a
+                    // generic one, which is a FLAT load with a 64-bit address pair
+                    // an element -- on an fp32 tile, register pressure enough that
+                    // clang 23 spilled the decode GEMM's combine (vgpr 256 -> 264).
+                    typedef __attribute__((address_space(3))) U lds_U;
+                    const U raw = *(const lds_U *)(src.idx(src_ptr, {row_base + c.x, col_base + c.y}));
+                    const T val = base_types::convertor<T, U>::convert(raw);
                     reinterpret_cast<T *>(&dst.tiles[i][j].data[0])[e] = val;   // any packing (int8_4: four a word)
                 }
             }
@@ -215,7 +220,8 @@ __device__ inline static void store(ST &dst, const RT &src) {
                 for(int e = 0; e < E; e++) {
                     const int2 c = rt_base_coord<T, L>(e, lane);
                     const T val = reinterpret_cast<const T *>(&src.tiles[i][j].data[0])[e];
-                    dst[{row_base + c.x, col_base + c.y}] =
+                    typedef __attribute__((address_space(3))) U lds_U;
+                    *(lds_U *)(dst.idx(dst_ptr, {row_base + c.x, col_base + c.y})) =
                         base_types::convertor<U, T>::convert(val);
                 }
             }
