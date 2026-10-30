@@ -22,9 +22,29 @@
 #define HK_RT_HALF_SPLIT 0
 #endif
 
+/*
+ * HK_RT_GLOBAL_BUFFERED: the element-by-element paths of load() and store_at() -- the fallback of the
+ * wide and widening paths for unaligned rows, and the only path for the layouts that do not
+ * vectorize -- address 16- and 32-bit elements through a buffer resource at the tile's first element,
+ * each at a 32-bit byte offset, instead of a 64-bit pointer each. Clang 24 (ROCm 10.1) kept a whole
+ * tile's 64-bit addresses live: an fp16/bf16 RMSNorm that needs 79 VGPRs under clang 22 took 256 and
+ * spilled, the fallback never even running (139 gfx1100 kernels refused). On by default for clang 24
+ * and later only: under clang 22 / 23 the pointer path is the one measured, and the buffer path there
+ * raises VGPRs (median +30 over the gfx1100 catalog) and lowers occupancy.
+ */
+#ifndef HK_RT_GLOBAL_BUFFERED
+#if defined(__clang_major__) && __clang_major__ >= 24
+#define HK_RT_GLOBAL_BUFFERED 1
+#else
+#define HK_RT_GLOBAL_BUFFERED 0
+#endif
+#endif
+
 namespace kittens {
 
 namespace detail {
+template<typename U> __device__ inline U buffer_load_elem(i32x4 srsrc, uint32_t off, uint32_t soff);
+template<typename U> __device__ inline void buffer_store_elem(i32x4 srsrc, uint32_t off, U v);
 /// The 16 bytes this lane loaded, and its partner's, as the run's low and
 /// high halves: half 0 loaded the low 16 bytes, half 1 the high.
 __device__ inline void join_run_halves(const __uint128_t &mine, int half,
@@ -198,12 +218,18 @@ __device__ inline static void load(RT &dst, const GL &src, const COORD &idx) {
     const bool wide = vectorizable && aligned;
     const int  half = lane >> 4;
 
+    // Element by element: 16- and 32-bit elements through a buffer resource (HK_RT_GLOBAL_BUFFERED).
+    constexpr bool buffered = HK_RT_GLOBAL_BUFFERED && (sizeof(U) == 2 || sizeof(U) == 4);
+    const i32x4 esrsrc = make_srsrc(src_ptr, 0xFFFFFFFFu);
     auto elementwise = [&](int i, int j, int row_base, int col_base) {
         #pragma unroll
         for(int e = 0; e < E; e++) {
             const int2 c = rt_base_coord<T, L>(e, lane);
-            const T val = base_types::convertor<T, U>::convert(
-                src_ptr[(row_base + c.x)*row_stride + col_base + c.y]);
+            const int at = (row_base + c.x)*row_stride + col_base + c.y;
+            U raw;
+            if constexpr (buffered) raw = detail::buffer_load_elem<U>(esrsrc, uint32_t(at) * uint32_t(sizeof(U)), 0);
+            else raw = src_ptr[at];
+            const T val = base_types::convertor<T, U>::convert(raw);
             reinterpret_cast<T *>(&dst.tiles[i][j].data[0])[e] = val;   // any packing (int8_4: four a word)
         }
     };
@@ -348,13 +374,22 @@ __device__ inline static void store_at(U *dst_ptr, int row_stride, const RT &src
     // Lanes l and l+16 of an operand tile write the same bytes with the same
     // values. That redundancy is exactly the WMMA mirroring invariant, so the
     // write is benign whichever lane lands last.
+    // Element by element: 16- and 32-bit stores through a buffer resource (HK_RT_GLOBAL_BUFFERED); NT
+    // stores keep the pointer.
+    constexpr bool buffered = HK_RT_GLOBAL_BUFFERED && !NT && (sizeof(U) == 2 || sizeof(U) == 4);
+    const i32x4 esrsrc = make_srsrc(dst_ptr, 0xFFFFFFFFu);
     auto elementwise = [&](int i, int j, int row_base, int col_base) {
         #pragma unroll
         for(int e = 0; e < E; e++) {
             const int2 c = rt_base_coord<T, L>(e, lane);
             const T val = reinterpret_cast<const T *>(&src.tiles[i][j].data[0])[e];
-            U *p = &dst_ptr[(row_base + c.x)*row_stride + col_base + c.y];
+            const int at = (row_base + c.x)*row_stride + col_base + c.y;
+            U *p = &dst_ptr[at];
             const U cv = base_types::store_convertor<U, T>::convert(val);
+            if constexpr (buffered) {
+                detail::buffer_store_elem<U>(esrsrc, uint32_t(at) * uint32_t(sizeof(U)), cv);
+                continue;
+            }
             // __builtin_nontemporal_store only accepts native scalar/vector
             // types, and U is a class (__hip_bfloat16), so go through an
             // integer of the same width. Pure bit shuffling, no conversion.
