@@ -538,9 +538,12 @@ __device__ inline i32x4 row_bounded_srsrc(const GL &g, const COORD &unit, const 
 
 template<typename U>
 __device__ inline U buffer_load_elem(i32x4 srsrc, uint32_t off, uint32_t soff) {
-    static_assert(sizeof(U) == 2 || sizeof(U) == 4, "16- or 32-bit elements");
+    static_assert(sizeof(U) == 1 || sizeof(U) == 2 || sizeof(U) == 4, "8-, 16- or 32-bit elements");
     U v;
-    if constexpr (sizeof(U) == 2) {
+    if constexpr (sizeof(U) == 1) {
+        const uint8_t raw = llvm_amdgcn_raw_buffer_load_b8(srsrc, off, soff, 0);
+        __builtin_memcpy(&v, &raw, 1);
+    } else if constexpr (sizeof(U) == 2) {
         const uint16_t raw = llvm_amdgcn_raw_buffer_load_b16(srsrc, off, soff, 0);
         __builtin_memcpy(&v, &raw, 2);
     } else {
