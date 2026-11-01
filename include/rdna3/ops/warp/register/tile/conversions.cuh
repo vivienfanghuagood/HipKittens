@@ -397,10 +397,21 @@ __device__ static inline void copy(rt_base<T, layout> &dst, const rt_base<U, lay
     using T2 = typename base_types::packing<T>::packed_type;
     using U2 = typename base_types::packing<U>::packed_type;
 
-    if constexpr (D::replication == S::replication) {
+    if constexpr (D::replication == S::replication
+                  && base_types::packing<T2>::num() == base_types::packing<U2>::num()) {
         #pragma unroll
         for(int k = 0; k < D::packed_per_thread; k++) {
             dst.data[k] = base_types::convertor<T2, U2>::convert(src.data[k]);
+        }
+    }
+    else if constexpr (D::replication == S::replication) {
+        // Same shape, different packings (int8_4 <-> half_2 / bf16_2): element by element. A
+        // lane holds its row's elements in the same order whatever the type (the operand
+        // layout), and the indices are constants, so this stays in registers.
+        #pragma unroll
+        for(int e = 0; e < D::elements_per_thread; e++) {
+            reinterpret_cast<T *>(&dst.data[0])[e] = base_types::convertor<T, U>::convert(
+                reinterpret_cast<const U *>(&src.data[0])[e]);
         }
     }
     else if constexpr (S::replication == 1) {
