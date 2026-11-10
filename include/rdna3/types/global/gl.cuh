@@ -78,8 +78,12 @@ struct gl {
     __host__ __device__ inline gl(const gl &other) :
             raw_ptr(other.raw_ptr), batch_internal(other.batch_internal), depth_internal(other.depth_internal), rows_internal(other.rows_internal), cols_internal(other.cols_internal),
             row_stride_internal(other.row_stride_internal), tma_descs(other.tma_descs) {}
+    // The element index is formed in 64 bits: in 32-bit int it wraps at 2^31 elements (4 GiB of
+    // bf16), and a tile of a larger tensor -- a paged KV cache of many GB -- was read from the wrong
+    // place or faulted. Loads base their buffer resource at this address, so with it right a
+    // tensor of any size is addressed a tile at a time.
     __device__ inline T& operator[](const coord<ducks::default_type> &idx) const { // yes I am abusing the const qualifier here a bit.
-        return raw_ptr[((idx.b*depth() + idx.d)*rows() + idx.r)*row_stride() + idx.c];
+        return raw_ptr[((int64_t(idx.b)*depth() + idx.d)*rows() + idx.r)*int64_t(row_stride()) + idx.c];
     }
     template<int axis> __device__ inline size_t shape() const {
         static_assert(axis==0 || axis==1 || axis==2 || axis==3, "Axis must be 0, 1, 2, or 3.");
@@ -90,8 +94,8 @@ struct gl {
     }
     template<int axis> __device__ inline size_t stride() const { 
         static_assert(axis==0 || axis==1 || axis==2 || axis==3, "Axis must be 0, 1, 2, or 3.");
-        if      constexpr (axis==0) { return depth()*rows()*row_stride(); }
-        else if constexpr (axis==1) { return rows()*row_stride(); }
+        if      constexpr (axis==0) { return size_t(depth())*rows()*row_stride(); }   // 64-bit, as operator[]
+        else if constexpr (axis==1) { return size_t(rows())*row_stride(); }
         else if constexpr (axis==2) { return row_stride(); }
         else if constexpr (axis==3) { return 1; }
     }
