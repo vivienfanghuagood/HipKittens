@@ -558,5 +558,19 @@ template<> struct convertor<float, int8> {
         return static_cast<float>(u);
     }
 };
+/**
+ * int8 -> half / bf16: exact (|q| <= 128 fits either mantissa), through float. An int8 KV cache's
+ * tile is cast to the query's type this way and its scale applied in fp32 afterwards.
+ */
+template<> struct convertor<half, int8> {
+    static __host__ __device__ inline half convert(const int8 & u) {
+        return __float2half(static_cast<float>(u));
+    }
+};
+template<> struct convertor<bf16, int8> {
+    static __host__ __device__ inline bf16 convert(const int8 & u) {
+        return __float2bfloat16(static_cast<float>(u));
+    }
+};
 }
 }
